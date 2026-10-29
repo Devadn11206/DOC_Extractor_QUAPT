@@ -74,6 +74,17 @@ class ModuleAHandoffPayload:
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent)
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ModuleAHandoffPayload":
+        pages_data = data.get("pages", [])
+        pages = [
+            PageHandoffRecord(**p) if isinstance(p, dict) else p
+            for p in pages_data
+        ]
+        clean_data = dict(data)
+        clean_data["pages"] = pages
+        return cls(**clean_data)
+
 
 class CoordinateTransform:
     """

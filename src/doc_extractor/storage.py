@@ -96,6 +96,16 @@ class StorageBackend(ABC):
         """Looks up existing document within the current tenant by SHA-256 hash."""
         pass
 
+    @abstractmethod
+    def save_handoff_payload(self, payload: Any) -> None:
+        """Persists the terminal Module A handoff payload."""
+        pass
+
+    @abstractmethod
+    def get_handoff_payload(self, document_id: str) -> Optional[dict]:
+        """Retrieves the persisted Module A handoff payload if available."""
+        pass
+
 
 class LocalDiskStorage(StorageBackend):
     """
@@ -315,8 +325,10 @@ class LocalDiskStorage(StorageBackend):
                 details={"storage_uri": storage_uri},
             )
         resolved = (self.base_dir / storage_uri).resolve()
-        expected_prefix = (self.base_dir / self.tenant_id).resolve()
-        if not str(resolved).startswith(str(expected_prefix)):
+        expected_tenant_dir = (self.base_dir / self.tenant_id).resolve()
+        try:
+            resolved.relative_to(expected_tenant_dir)
+        except ValueError:
             raise StorageError(
                 message="Cross-tenant access or path escape forbidden.",
                 details={"storage_uri": storage_uri, "tenant_id": self.tenant_id},
@@ -375,4 +387,39 @@ class LocalDiskStorage(StorageBackend):
                     except Exception:
                         continue
         return None
+
+    def save_handoff_payload(self, payload: Any) -> None:
+        doc_dir = self._get_document_dir(payload.document_id)
+        doc_dir.mkdir(parents=True, exist_ok=True)
+        target_file = doc_dir / "module_a_handoff.json"
+        temp_file = doc_dir / f".tmp_handoff_{uuid.uuid4().hex}"
+
+        payload_dict = payload.to_dict() if hasattr(payload, "to_dict") else dict(payload)
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                import json
+                json.dump(payload_dict, f, indent=2)
+            temp_file.replace(target_file)
+        except Exception as exc:
+            if temp_file.exists():
+                temp_file.unlink(missing_ok=True)
+            raise StorageError(
+                message=f"Failed to persist handoff payload: {str(exc)}",
+                details={"document_id": payload.document_id},
+            ) from exc
+
+    def get_handoff_payload(self, document_id: str) -> Optional[dict]:
+        doc_dir = self._get_document_dir(document_id)
+        target_file = doc_dir / "module_a_handoff.json"
+        if not target_file.exists():
+            return None
+        try:
+            import json
+            with open(target_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            raise StorageError(
+                message=f"Failed to read handoff payload: {str(exc)}",
+                details={"document_id": document_id},
+            ) from exc
 
