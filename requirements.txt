@@ -11,4 +11,6 @@ Pillow>=9.0.0
 # Preprocessing & Computer Vision (Phase 4)
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
-
+# Module C: Schema-Guided Extraction & Normalization
+instructor>=1.0.0
+litellm>=1.40.0
