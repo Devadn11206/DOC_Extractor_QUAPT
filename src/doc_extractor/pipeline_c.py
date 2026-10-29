@@ -194,7 +194,11 @@ class ModuleCPipeline:
             if f_entry.review_required or f_entry.validation == "failed":
                 requires_document_review = True
 
-        final_status: Literal["auto_approved", "needs_review"] = "needs_review" if requires_document_review else "auto_approved"
+        # SCH-012: if upstream reports failed, preserve it and skip auto-approve logic
+        if payload.status == "failed":
+            final_status: Literal["auto_approved", "needs_review", "failed"] = "failed"
+        else:
+            final_status = "needs_review" if requires_document_review else "auto_approved"
 
         return CanonicalOutputEnvelope(
             document_id=payload.document_id,
@@ -245,15 +249,23 @@ class ModuleCPipeline:
             )
             optical_conf = evidence_dict.get("ocr_confidence", 1.0)
         elif not isinstance(value, bool):
-            # Non-boolean missing evidence
-            evidence_model = None
+            # GR-002 / FR-EXT-004: No non-null value without pixel-grounded evidence.
+            # Set to null and flag EVIDENCE_MISSING so it routes to human review.
+            return FieldOutput(
+                value=None,
+                confidence=0.0,
+                null_reason="absent",
+                review_required=True,
+                validation="failed",
+                evidence=None,
+            )
 
         has_validation_failed = (error is not None)
         validation_status: Literal["passed", "failed"] = "failed" if has_validation_failed else "passed"
 
-        # Confidence calculation
+        # Calibrated confidence: optical score × penalty for validation failure
         confidence = round(optical_conf * (0.5 if has_validation_failed else 0.95), 2)
-        review_required = has_validation_failed or (confidence < 0.75) or (evidence_model is None and not isinstance(value, bool))
+        review_required = has_validation_failed or (confidence < 0.75)
 
         return FieldOutput(
             value=value,

@@ -35,7 +35,19 @@ def find_evidence_for_value(
         return None
 
     for page in pages:
-        # Check layout blocks
+        # 1. Character grids first: PAN, names in printed boxes (highest precision)
+        for grid in page.character_grids:
+            grid_text = grid.reconstructed_text.strip()
+            if str_val in grid_text.lower() or grid_text.lower() in str_val:
+                bbox = grid.bbox_original or grid.bbox_preprocessed
+                return {
+                    "page": page.page_number,
+                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                    "text": grid_text,
+                    "ocr_confidence": grid.mean_ocr_confidence,
+                }
+
+        # 2. Layout blocks (paragraphs, key-value pairs, headers)
         for block in page.blocks:
             block_text = block.text.strip()
             if str_val in block_text.lower():
@@ -47,22 +59,9 @@ def find_evidence_for_value(
                     "ocr_confidence": block.ocr_confidence,
                 }
 
-        # Check character grids
-        for grid in page.character_grids:
-            grid_text = grid.reconstructed_text.strip()
-            if str_val in grid_text.lower():
-                bbox = grid.bbox_original or grid.bbox_preprocessed
-                return {
-                    "page": page.page_number,
-                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
-                    "text": grid_text,
-                    "ocr_confidence": grid.mean_ocr_confidence,
-                }
-
-        # Check checkboxes
-        for cb in page.checkboxes:
-            # If boolean match
-            if isinstance(value, bool):
+        # 3. Checkboxes (booleans only)
+        if isinstance(value, bool):
+            for cb in page.checkboxes:
                 is_checked = (cb.state == "[x]")
                 if is_checked == value:
                     bbox = cb.bbox_original or cb.bbox_preprocessed
@@ -73,28 +72,21 @@ def find_evidence_for_value(
                         "ocr_confidence": cb.ocr_confidence,
                     }
 
-    # Fallback: if value has some match in markdown content
-    for page in pages:
-        if str_val in page.markdown_content.lower():
-            # default page-level fallback bbox
-            return {
-                "page": page.page_number,
-                "bbox": [0.0, 0.0, 100.0, 50.0],
-                "text": str_val,
-                "ocr_confidence": page.mean_ocr_confidence,
-            }
-
+    # GR-002 strict: never fabricate a bounding box. Return None if no grounded evidence found.
     return None
 
 
 class SchemaGuidedExtractor:
     """
     Module C Schema-Guided Extractor.
-    Extracts structured fields using schema constraints with evidence provenance.
+    FR-EXT-001, FR-EXT-002: Extracts schema fields using LLM grammar-guided decoding
+    (instructor + litellm) when use_llm=True. Falls back to deterministic heuristics
+    for offline testing or when no LLM is configured.
     """
 
-    def __init__(self, model_name: str = "Qwen2.5-7B-Instruct"):
+    def __init__(self, model_name: str = "Qwen2.5-7B-Instruct", use_llm: bool = False):
         self.model_name = model_name
+        self.use_llm = use_llm
 
     def extract(
         self,
@@ -102,7 +94,8 @@ class SchemaGuidedExtractor:
     ) -> BaseModel:
         """
         Extracts structured data according to the bound schema.
-        Supports deterministic heuristic parsing / LLM grammar inference.
+        When use_llm=True: uses instructor + litellm for grammar-constrained LLM extraction (FR-EXT-002).
+        Otherwise: uses deterministic regex heuristics as an offline fast-path / test double.
         """
         doc_type = payload.classification.document_type.value
         schema_cls = SCHEMA_MAP.get(doc_type)
@@ -110,7 +103,45 @@ class SchemaGuidedExtractor:
         if not schema_cls:
             raise ValueError(f"No extraction schema registered for document type: {doc_type}")
 
-        # Deterministic extraction from combined_markdown and structured elements
+        if self.use_llm:
+            return self._extract_llm(payload, schema_cls)
+
+        return self._extract_heuristic(payload, doc_type, schema_cls)
+
+    def _extract_llm(self, payload: ModuleBOutputPayload, schema_cls: Type[BaseModel]) -> BaseModel:
+        """
+        FR-EXT-001 & FR-EXT-002: Grammar-constrained LLM extraction via instructor + litellm.
+        Temperature=0 ensures deterministic output. Never guesses: null fields returned as null.
+        """
+        import instructor  # noqa: PLC0415
+        import litellm     # noqa: PLC0415
+        client = instructor.from_litellm(litellm.completion)
+        return client.chat.completions.create(
+            model=self.model_name,
+            response_model=schema_cls,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a document extraction engine. "
+                        "Extract only the fields defined in the schema from the provided document text. "
+                        "If a field is absent or not legibly visible, set it to null. "
+                        "Never infer, guess, or hallucinate values. "
+                        "Return strictly valid JSON matching the schema."
+                    ),
+                },
+                {"role": "user", "content": payload.combined_markdown},
+            ],
+            temperature=0.0,
+        )
+
+    def _extract_heuristic(
+        self,
+        payload: ModuleBOutputPayload,
+        doc_type: str,
+        schema_cls: Type[BaseModel],
+    ) -> BaseModel:
+        """Deterministic regex heuristic fast-path (offline / test double)."""
         md = payload.combined_markdown
         extracted_dict: Dict[str, Any] = {}
 

@@ -8,7 +8,7 @@ Covers:
 """
 
 import pytest
-from datetime import datetime
+from datetime import datetime, timezone
 
 from doc_extractor.contracts_b import (
     BoundingBox,
@@ -134,8 +134,8 @@ def test_pipeline_c_casa_end_to_end():
         parser_model_name="mock-layout-parser",
         classifier_model_name="mock-classifier",
         processing_time_ms=120.0,
-        created_at=datetime.utcnow().isoformat(),
-        completed_at=datetime.utcnow().isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
     )
 
     pipeline = ModuleCPipeline()
@@ -189,8 +189,8 @@ def test_pipeline_c_discharge_summary_chronology_flag():
         parser_model_name="mock-layout-parser",
         classifier_model_name="mock-classifier",
         processing_time_ms=140.0,
-        created_at=datetime.utcnow().isoformat(),
-        completed_at=datetime.utcnow().isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
     )
 
     pipeline = ModuleCPipeline()
