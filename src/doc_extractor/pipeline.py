@@ -24,7 +24,11 @@ from doc_extractor.handoff import (
 from doc_extractor.idempotency import IdempotencyStore, LocalIdempotencyStore
 from doc_extractor.ingestion import IngestionResult, IngestionService, ProcessingStatus
 from doc_extractor.logging import setup_logging
-from doc_extractor.malware import MalwareScanner, UnconfiguredScanner
+from doc_extractor.malware import (
+    MalwareScanner,
+    UnconfiguredScanner,
+    build_malware_scanner,
+)
 from doc_extractor.models import DocumentStatus, IngestionState
 from doc_extractor.preprocessing import PagePreprocessor, PreprocessingResult
 from doc_extractor.renderer import DocumentRenderResult, PdfRenderer, RenderedPage
@@ -47,7 +51,14 @@ class ModuleAPipeline:
     ) -> None:
         self.settings = settings or Settings()
         self.tenant_id = tenant_id
-        self.scanner = scanner or UnconfiguredScanner()
+        if scanner is not None:
+            self.scanner = scanner
+        else:
+            self.scanner = build_malware_scanner(
+                scanner_type=self.settings.malware_scanner_type,
+                enabled=self.settings.malware_scan_enabled,
+                app_env=self.settings.app_env,
+            )
         self.storage = storage or LocalDiskStorage(self.settings.storage_base_dir, tenant_id=self.tenant_id)
         self.idempotency_store = idempotency_store or LocalIdempotencyStore(self.settings.storage_base_dir)
         self.queue_adapter = queue_adapter
@@ -125,6 +136,13 @@ class ModuleAPipeline:
 
         doc_id = ingest_res.document_id
 
+        # If idempotent replay and existing handoff payload is stored, return it directly
+        # to avoid repeating PDF rendering, storage, or OpenCV preprocessing (FR-ING-006).
+        if ingest_res.idempotent_replay:
+            saved_handoff = self.storage.get_handoff_payload(doc_id)
+            if saved_handoff:
+                return ModuleAHandoffPayload.from_dict(saved_handoff)
+
         # Step 3: Page Rendering / Ingestion to 200 DPI
         try:
             # Re-open stream or pass path
@@ -138,7 +156,10 @@ class ModuleAPipeline:
                 render_result = self.renderer.render_pdf(render_input, document_id=doc_id)
                 rendered_pages = render_result.pages
             else:
-                # Standalone image (PNG, JPEG, TIFF): store directly as page 1
+                # Standalone or multi-frame raster images (PNG, JPEG, TIFF)
+                from PIL import Image
+                import io
+
                 if isinstance(render_input, (str, Path)):
                     with open(render_input, "rb") as f:
                         img_bytes = f.read()
@@ -146,29 +167,65 @@ class ModuleAPipeline:
                     render_input.seek(0)
                     img_bytes = render_input.read()
 
-                stored = self.storage.store_page_image(
-                    document_id=doc_id,
-                    page_number=1,
-                    image_data=img_bytes,
-                    format_extension=Path(claimed_filename).suffix.lstrip(".").lower() or "png",
-                )
-                import cv2
-                import numpy as np
-                decoded = cv2.imdecode(np.frombuffer(img_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-                h, w = decoded.shape[:2] if decoded is not None else (0, 0)
+                rendered_pages = []
+                with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                    n_frames = getattr(pil_img, "n_frames", 1)
+                    for frame_idx in range(n_frames):
+                        pil_img.seek(frame_idx)
+                        p_num = frame_idx + 1
 
-                rendered_pages = [
-                    RenderedPage(
-                        document_id=doc_id,
-                        page_number=1,
-                        width_px=w,
-                        height_px=h,
-                        dpi=self.settings.target_render_dpi,
-                        image_format="PNG",
-                        image_path=stored.file_path,
-                        file_size_bytes=stored.file_size_bytes,
-                    )
-                ]
+                        # Convert frame to standard RGB
+                        frame_rgb = pil_img.convert("RGB")
+
+                        # PRD SCH-013 & FR-ING-004: Ensure 200 DPI coordinate consistency
+                        # If the raster image has embedded DPI metadata different from target 200 DPI,
+                        # resample to match the 200 DPI coordinate space without unnecessary quality loss.
+                        raw_dpi = pil_img.info.get("dpi")
+                        target_dpi = self.settings.target_render_dpi
+                        if raw_dpi is not None:
+                            try:
+                                if isinstance(raw_dpi, (tuple, list)) and len(raw_dpi) >= 2:
+                                    x_dpi, y_dpi = float(raw_dpi[0]), float(raw_dpi[1])
+                                else:
+                                    x_dpi = y_dpi = float(raw_dpi)
+
+                                if x_dpi > 10.0 and y_dpi > 10.0 and (abs(x_dpi - target_dpi) > 1.0 or abs(y_dpi - target_dpi) > 1.0):
+                                    scale_x = target_dpi / x_dpi
+                                    scale_y = target_dpi / y_dpi
+                                    new_w = max(1, round(frame_rgb.width * scale_x))
+                                    new_h = max(1, round(frame_rgb.height * scale_y))
+                                    resample = (
+                                        Image.Resampling.LANCZOS
+                                        if (scale_x < 1.0 or scale_y < 1.0)
+                                        else Image.Resampling.BICUBIC
+                                    )
+                                    frame_rgb = frame_rgb.resize((new_w, new_h), resample=resample)
+                            except Exception:
+                                pass
+
+                        frame_buf = io.BytesIO()
+                        frame_rgb.save(frame_buf, format="PNG", dpi=(target_dpi, target_dpi))
+                        frame_png_bytes = frame_buf.getvalue()
+
+                        stored = self.storage.store_page_image(
+                            document_id=doc_id,
+                            page_number=p_num,
+                            image_data=frame_png_bytes,
+                            format_extension="png",
+                        )
+
+                        rendered_pages.append(
+                            RenderedPage(
+                                document_id=doc_id,
+                                page_number=p_num,
+                                width_px=frame_rgb.width,
+                                height_px=frame_rgb.height,
+                                dpi=self.settings.target_render_dpi,
+                                image_format="PNG",
+                                image_path=stored.file_path,
+                                file_size_bytes=stored.file_size_bytes,
+                            )
+                        )
 
             # Step 4: Page Preprocessing
             prep_results = self.preprocessor.preprocess_document_pages(
@@ -227,6 +284,9 @@ class ModuleAPipeline:
                 created_at=created_at,
                 completed_at=completed_at,
             )
+
+            # Persist handoff payload for idempotency replay and downstream audit
+            self.storage.save_handoff_payload(payload)
 
             # Step 6: Publish message if queue adapter attached
             if self.queue_adapter is not None:
