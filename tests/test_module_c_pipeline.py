@@ -21,17 +21,31 @@ from doc_extractor.contracts_b import (
     MVPDocumentType,
     PageLayoutOutput,
 )
+from doc_extractor.contracts_c import (
+    CanonicalExtractionEnvelope,
+    CanonicalOutputEnvelope,
+    EvidenceSnippet,
+    ExtractedField,
+    FlagItem,
+    DocumentMetadata,
+    RunMetadata,
+)
 from doc_extractor.schemas import CASASchema, InsuranceApplicationSchema, DischargeSummarySchema
 from doc_extractor.validation_rules import (
     validate_pan,
     validate_aadhaar_checksum,
+    validate_aadhaar,
+    generate_valid_aadhaar,
+    validate_ifsc,
     normalize_date_to_iso,
     normalize_phone_number,
+    normalize_currency_amount,
     validate_chronology,
     validate_arithmetic,
+    calculate_calibrated_confidence,
 )
 from doc_extractor.extractor import SchemaGuidedExtractor, find_evidence_for_value
-from doc_extractor.pipeline_c import ModuleCPipeline, CanonicalOutputEnvelope
+from doc_extractor.pipeline_c import ModuleCPipeline
 
 
 def test_validation_pan():
@@ -201,3 +215,254 @@ def test_pipeline_c_discharge_summary_chronology_flag():
     assert any(flag.code == "CHRONOLOGY_MISMATCH" for flag in envelope.flags)
     assert envelope.fields["admission_date"].review_required is True
     assert envelope.fields["discharge_date"].review_required is True
+
+
+def test_validation_ifsc():
+    valid, err = validate_ifsc("HDFC0001234")
+    assert valid == "HDFC0001234"
+    assert err is None
+
+    valid2, err2 = validate_ifsc("SBIN0000300")
+    assert valid2 == "SBIN0000300"
+    assert err2 is None
+
+    invalid, err_inv = validate_ifsc("HDFC1001234")
+    assert err_inv == "INVALID_IFSC_FORMAT"
+
+    none_val, err_none = validate_ifsc(None)
+    assert none_val is None
+    assert err_none is None
+
+
+def test_validation_currency_amounts():
+    amt, curr, err = normalize_currency_amount("10,000 INR")
+    assert amt == 10000.0
+    assert curr == "INR"
+    assert err is None
+
+    amt2, curr2, err2 = normalize_currency_amount("Rs. 45,250.75")
+    assert amt2 == 45250.75
+    assert curr2 == "INR"
+    assert err2 is None
+
+    amt3, curr3, err3 = normalize_currency_amount("$1,200.00")
+    assert amt3 == 1200.0
+    assert curr3 == "USD"
+    assert err3 is None
+
+    amt4, curr4, err4 = normalize_currency_amount(5000)
+    assert amt4 == 5000.0
+    assert curr4 == "INR"
+
+
+def test_verhoeff_aadhaar_generation_and_validation():
+    # Generate a mathematically valid Aadhaar number with Verhoeff check digit
+    valid_aadhaar = generate_valid_aadhaar("23456789012")
+    assert len(valid_aadhaar) == 12
+    assert validate_aadhaar_checksum(valid_aadhaar) is True
+
+    cleaned, err = validate_aadhaar(f"{valid_aadhaar[:4]} {valid_aadhaar[4:8]} {valid_aadhaar[8:]}")
+    assert cleaned == valid_aadhaar
+    assert err is None
+
+    # Corrupt last digit to ensure check digit detects single digit errors
+    corrupted_last = valid_aadhaar[:-1] + str((int(valid_aadhaar[-1]) + 1) % 10)
+    assert validate_aadhaar_checksum(corrupted_last) is False
+    _, bad_err = validate_aadhaar(corrupted_last)
+    assert bad_err == "INVALID_AADHAAR_CHECKSUM"
+
+
+def test_calibrated_confidence_calculation():
+    # Normal optical confidence with passing validation
+    conf = calculate_calibrated_confidence(ocr_confidence=0.98, model_confidence=1.0, validation_passed=True)
+    assert conf == 0.98
+
+    # Validation failed penalty
+    conf_failed = calculate_calibrated_confidence(ocr_confidence=0.98, model_confidence=1.0, validation_passed=False)
+    assert conf_failed == 0.49
+
+    # Handwriting penalty
+    conf_hw = calculate_calibrated_confidence(ocr_confidence=0.90, model_confidence=1.0, validation_passed=True, is_handwritten=True)
+    assert conf_hw < 0.90
+
+    # No evidence score
+    conf_no_ev = calculate_calibrated_confidence(ocr_confidence=0.90, has_evidence=False)
+    assert conf_no_ev == 0.0
+
+
+def test_evidence_missing_enforcement():
+    # Create payload where markdown claims a PAN, but NO block or grid contains it
+    page = PageLayoutOutput(
+        page_number=1,
+        markdown_content="Applicant Name: SURESH KUMAR RAMAN\nPAN: ABCDE1234F",
+        blocks=[
+            LayoutBlock(
+                block_id="b_name",
+                element_type=LayoutElementType.PARAGRAPH,
+                text="Applicant Name: SURESH KUMAR RAMAN",
+                ocr_confidence=0.95,
+                bbox_preprocessed=BoundingBox(x0=10, y0=10, x1=200, y1=30),
+                bbox_original=BoundingBox(x0=10, y0=10, x1=200, y1=30),
+                reading_order_index=0,
+            )
+            # Notice: block with PAN is completely missing from blocks/grids
+        ],
+        mean_ocr_confidence=0.95,
+    )
+
+    payload = ModuleBOutputPayload(
+        run_id="run_test_missing_ev",
+        document_id="doc_test_missing_ev",
+        tenant_id="tenant_default",
+        status="processing",
+        classification=ClassificationOutput(
+            domain=MVPClassificationDomain.BFSI,
+            document_type=MVPDocumentType.DOC_01_CASA,
+            classification_confidence=0.98,
+            schema_id="DOC-01",
+            schema_version="1.0.0",
+        ),
+        pages=[page],
+        combined_markdown=page.markdown_content,
+        parser_model_name="mock-parser",
+        classifier_model_name="mock-classifier",
+        processing_time_ms=100.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    pipeline = ModuleCPipeline()
+    envelope = pipeline.process(payload)
+
+    # PAN without evidence must be forced to null, null_reason='absent', review_required=True
+    pan_field = envelope.fields["applicant.pan_card_number"]
+    assert pan_field.value is None
+    assert pan_field.null_reason == "absent"
+    assert pan_field.review_required is True
+    assert pan_field.validation == "failed"
+    assert pan_field.evidence is None
+    assert any(flag.code == "EVIDENCE_MISSING" for flag in envelope.flags)
+    assert envelope.document_metadata.status == "needs_review"
+
+
+def test_pipeline_c_doc_02_insurance_repeating_groups():
+    # Construct DOC-02 Insurance payload with nominees and medical declarations
+    page = PageLayoutOutput(
+        page_number=1,
+        markdown_content=(
+            "Proposer Name: ANITA VERMA\n"
+            "Sum Insured: 500,000 INR\n"
+            "Policy Term: 15 years\n"
+            "Nominee: ROHIT VERMA (Spouse), 100%\n"
+            "Diabetes: [ ]\n"
+            "Hypertension: [x]"
+        ),
+        blocks=[
+            LayoutBlock(
+                block_id="b1",
+                element_type=LayoutElementType.PARAGRAPH,
+                text="Proposer Name: ANITA VERMA",
+                ocr_confidence=0.96,
+                bbox_preprocessed=BoundingBox(x0=10, y0=10, x1=200, y1=30),
+                bbox_original=BoundingBox(x0=10, y0=10, x1=200, y1=30),
+                reading_order_index=0,
+            ),
+            LayoutBlock(
+                block_id="b2",
+                element_type=LayoutElementType.PARAGRAPH,
+                text="Sum Insured: 500,000 INR",
+                ocr_confidence=0.95,
+                bbox_preprocessed=BoundingBox(x0=10, y0=40, x1=200, y1=60),
+                bbox_original=BoundingBox(x0=10, y0=40, x1=200, y1=60),
+                reading_order_index=1,
+            ),
+            LayoutBlock(
+                block_id="b3",
+                element_type=LayoutElementType.PARAGRAPH,
+                text="Nominee: ROHIT VERMA (Spouse), 100%",
+                ocr_confidence=0.97,
+                bbox_preprocessed=BoundingBox(x0=10, y0=70, x1=300, y1=90),
+                bbox_original=BoundingBox(x0=10, y0=70, x1=300, y1=90),
+                reading_order_index=2,
+            ),
+        ],
+        mean_ocr_confidence=0.96,
+    )
+
+    payload = ModuleBOutputPayload(
+        run_id="run_test_ins",
+        document_id="doc_test_ins",
+        tenant_id="tenant_default",
+        status="processing",
+        classification=ClassificationOutput(
+            domain=MVPClassificationDomain.BFSI,
+            document_type=MVPDocumentType.DOC_02_INSURANCE_APP,
+            classification_confidence=0.99,
+            schema_id="DOC-02",
+            schema_version="1.0.0",
+        ),
+        pages=[page],
+        combined_markdown=page.markdown_content,
+        parser_model_name="mock-parser",
+        classifier_model_name="mock-classifier",
+        processing_time_ms=110.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    pipeline = ModuleCPipeline()
+    envelope = pipeline.process(payload)
+
+    assert envelope.fields["proposer_name"].value == "ANITA VERMA"
+    assert envelope.fields["sum_insured"].value == 500000.0
+    assert envelope.fields["nominees.0.name"].value == "ROHIT VERMA"
+    assert envelope.fields["nominees.0.relationship"].value == "Spouse"
+    assert envelope.fields["nominees.0.share_percentage"].value == 100.0
+    assert envelope.fields["medical_declaration.has_diabetes"].value is False
+    assert envelope.fields["medical_declaration.has_hypertension"].value is True
+
+
+def test_canonical_envelope_json_serialization():
+    # Verify serialization adheres to PRD §6.3 JSON Schema
+    envelope = CanonicalExtractionEnvelope(
+        document_id="d_01HZX123",
+        document_metadata=DocumentMetadata(
+            document_type="CASA_ACCOUNT_OPENING",
+            schema_id="casa_account_opening",
+            schema_version=3,
+            classification_confidence=0.96,
+            status="auto_approved",
+            page_count=1,
+        ),
+        fields={
+            "applicant.full_name": ExtractedField(
+                value="SURESH KUMAR RAMAN",
+                confidence=0.97,
+                null_reason=None,
+                review_required=False,
+                validation="passed",
+                evidence=EvidenceSnippet(page=1, bbox=[112.0, 240.0, 610.0, 281.0], text="S U R E S H ..."),
+            ),
+            "applicant.pan_card_number": ExtractedField(
+                value=None,
+                confidence=0.0,
+                null_reason="absent",
+                review_required=False,
+                validation="not_applicable",
+                evidence=None,
+            ),
+        },
+        flags=[FlagItem(code="TEST_FLAG", fields=["applicant.full_name"])],
+        run=RunMetadata(
+            run_id="r_01HZX",
+            model_versions={"parser": "mock-parser", "extractor": "Qwen2.5-7B-Instruct"},
+            prompt_version="1.0.0",
+        ),
+    )
+
+    json_dict = envelope.model_dump()
+    assert json_dict["document_id"] == "d_01HZX123"
+    assert json_dict["document_metadata"]["status"] == "auto_approved"
+    assert json_dict["fields"]["applicant.full_name"]["value"] == "SURESH KUMAR RAMAN"
+    assert json_dict["fields"]["applicant.pan_card_number"]["null_reason"] == "absent"
+    assert json_dict["flags"][0]["code"] == "TEST_FLAG"

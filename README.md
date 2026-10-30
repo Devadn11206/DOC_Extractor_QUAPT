@@ -77,7 +77,17 @@ Module A represents Stage 1 of the decoupled pipeline. It is responsible for:
   - Versioned, serializable handoff envelope `ModuleAHandoffPayload` (v1.0.0) satisfying PRD `ARC-003` and `SCH-011`.
   - Coordinate transform inversion utility `CoordinateTransform.map_bbox_preprocessed_to_original()` mapping downstream bounding boxes back to original 200-DPI top-left coordinates per PRD `SCH-013`.
   - Queue broker adapter abstraction `QueueAdapter` and `LocalMemoryQueueAdapter` for inter-stage communication.
-  - Full end-to-end integration and failure recovery test suite (79 passing tests across all modules).
+- [x] **Phase 7 — Module C: Extraction, Validation & Canonical Output Envelope**:
+  - `FR-EXT-001` & `FR-EXT-002`: Schema-constrained extraction for launch MVP types: DOC-01 (CASA), DOC-02 (Insurance Application), and DOC-03 (Hospital Discharge Summary).
+  - `FR-EXT-003` & `GR-003`: Null-if-absent logic returning `value: null` with `null_reason: "absent"` or `"illegible"` without hallucination.
+  - `FR-EXT-004` & `GR-002`: Evidence grounding linking non-null values to 200-DPI pixel bounding box `[x0, y0, x1, y1]`, 1-based page, and raw snippet. Enforces `EVIDENCE_MISSING` flag and null fallback when evidence is ungrounded.
+  - `FR-EXT-005`: Repeating groups support (nominees, medications).
+  - `FR-EXT-007`: Checkbox mapping (`[x]` -> `True`, `[ ]` -> `False`).
+  - `FR-VAL-001` & `FR-VAL-002`: Field normalization (ISO 8601 dates, E.164 phone numbers, decimal currency amounts) and format validation (PAN regex, Aadhaar Verhoeff checksum, IFSC code format).
+  - `FR-VAL-003` & `FR-VAL-004`: Business logic checks: Arithmetic reconciliation (`ARITHMETIC_MISMATCH`) and chronological sequencing (`CHRONOLOGY_MISMATCH`).
+  - `FR-CNF-001` & `FR-CNF-002`: Field confidence calibration and threshold review flagging (< 0.75 -> `review_required: true`).
+  - `FR-CNF-003` & `GR-027`: Document status gating (`auto_approved` vs `needs_review`).
+  - `SCH-011`..`SCH-013`: Canonical JSON Output Envelope (`CanonicalExtractionEnvelope`).
 
 ---
 
