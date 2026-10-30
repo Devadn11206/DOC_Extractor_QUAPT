@@ -25,6 +25,24 @@ SCHEMA_MAP: Dict[str, Type[BaseModel]] = {
 }
 
 
+def format_indian_currency(n: int) -> str:
+    """Formats an integer according to the Indian numbering system (e.g. 500000 -> 5,00,000)."""
+    s = str(abs(n))
+    if len(s) <= 3:
+        res = s
+    else:
+        last_three = s[-3:]
+        rest = s[:-3]
+        parts = []
+        while len(rest) > 2:
+            parts.insert(0, rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            parts.insert(0, rest)
+        res = ",".join(parts) + "," + last_three
+    return f"-{res}" if n < 0 else res
+
+
 def find_evidence_for_value(
     value: Any,
     pages: List[PageLayoutOutput],
@@ -32,20 +50,43 @@ def find_evidence_for_value(
     """
     FR-EXT-004 & GR-002: Evidence Bounding Boxes.
     Queries LayoutBlocks, CharacterGrids, HTMLTables, and Checkboxes to find
-    page, bbox [x0, y0, x1, y1] in 200-DPI pixel space, and supporting text snippet.
+    page, bbox (x0, y0, x1, y1) in 200-DPI pixel space, and supporting text snippet.
+    Supports Western (500,000) and Indian (5,00,000) comma numbering systems.
     """
+    if value is None:
+        return None
+
     candidates = [str(value).strip().lower()]
+    clean_numeric_targets: List[str] = []
+
     if isinstance(value, (int, float)):
         num = float(value)
         if num.is_integer():
             int_val = int(num)
-            candidates.extend([str(int_val), f"{int_val:,}", f"{int_val:,}".replace(",", " ")])
+            indian_fmt = format_indian_currency(int_val).lower()
+            western_fmt = f"{int_val:,}".lower()
+            candidates.extend([
+                str(int_val),
+                western_fmt,
+                indian_fmt,
+                western_fmt.replace(",", " "),
+                indian_fmt.replace(",", " "),
+            ])
+            clean_numeric_targets.append(str(int_val))
         else:
             candidates.extend([f"{num:,.2f}", f"{num:.2f}"])
+            clean_numeric_targets.append(f"{num:.2f}")
 
     def matches_text(text: str) -> bool:
         t_low = text.lower()
-        return any(c in t_low for c in candidates if c)
+        if any(c in t_low for c in candidates if c):
+            return True
+        if clean_numeric_targets:
+            # Strip commas and spaces to match numbers across different grouping conventions
+            t_clean = re.sub(r"[,\s]", "", t_low)
+            if any(target in t_clean for target in clean_numeric_targets if target):
+                return True
+        return False
 
     for page in pages:
         # 1. Character grids first: PAN, names in printed boxes (highest precision)
@@ -55,7 +96,7 @@ def find_evidence_for_value(
                 bbox = grid.bbox_original or grid.bbox_preprocessed
                 return {
                     "page": page.page_number,
-                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                    "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
                     "text": grid_text,
                     "ocr_confidence": grid.mean_ocr_confidence,
                 }
@@ -67,7 +108,7 @@ def find_evidence_for_value(
                 bbox = block.bbox_original or block.bbox_preprocessed
                 return {
                     "page": page.page_number,
-                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                    "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
                     "text": block_text[:120],
                     "ocr_confidence": block.ocr_confidence,
                 }
@@ -78,7 +119,7 @@ def find_evidence_for_value(
                 bbox = table.bbox_original
                 return {
                     "page": page.page_number,
-                    "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                    "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
                     "text": table.html_content[:120],
                     "ocr_confidence": table.ocr_confidence,
                 }
@@ -91,7 +132,7 @@ def find_evidence_for_value(
                     bbox = cb.bbox_original or cb.bbox_preprocessed
                     return {
                         "page": page.page_number,
-                        "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+                        "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
                         "text": cb.state,
                         "ocr_confidence": 0.5 if cb.is_uncertain else cb.ocr_confidence,
                     }

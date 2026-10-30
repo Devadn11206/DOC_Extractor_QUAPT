@@ -254,6 +254,22 @@ def test_validation_currency_amounts():
     assert amt4 == 5000.0
     assert curr4 == "INR"
 
+    # Negative currency normalization
+    neg_amt1, neg_curr1, neg_err1 = normalize_currency_amount("-500.00")
+    assert neg_amt1 == -500.0
+    assert neg_curr1 == "INR"
+    assert neg_err1 is None
+
+    neg_amt2, neg_curr2, neg_err2 = normalize_currency_amount("Rs. -1200")
+    assert neg_amt2 == -1200.0
+    assert neg_curr2 == "INR"
+    assert neg_err2 is None
+
+    neg_amt3, neg_curr3, neg_err3 = normalize_currency_amount("-$1,200.00")
+    assert neg_amt3 == -1200.0
+    assert neg_curr3 == "USD"
+    assert neg_err3 is None
+
 
 def test_verhoeff_aadhaar_generation_and_validation():
     # Generate a mathematically valid Aadhaar number with Verhoeff check digit
@@ -466,3 +482,109 @@ def test_canonical_envelope_json_serialization():
     assert json_dict["fields"]["applicant.full_name"]["value"] == "SURESH KUMAR RAMAN"
     assert json_dict["fields"]["applicant.pan_card_number"]["null_reason"] == "absent"
     assert json_dict["flags"][0]["code"] == "TEST_FLAG"
+
+
+def test_evidence_snippet_bbox_strict_validation():
+    # Valid bounding box tuple
+    valid_snippet = EvidenceSnippet(
+        page=1,
+        bbox=(10.0, 20.0, 100.0, 50.0),
+        text="Valid text",
+    )
+    assert valid_snippet.bbox == (10.0, 20.0, 100.0, 50.0)
+
+    # Valid bounding box passed as list (coerced to tuple and validated)
+    list_snippet = EvidenceSnippet(
+        page=1,
+        bbox=[15.0, 25.0, 115.0, 55.0],
+        text="List bbox",
+    )
+    assert list_snippet.bbox == (15.0, 25.0, 115.0, 55.0)
+
+    # Invalid: x1 < x0
+    with pytest.raises(ValueError, match="x1 .* must be >= x0"):
+        EvidenceSnippet(
+            page=1,
+            bbox=(100.0, 20.0, 50.0, 50.0),
+            text="Invalid x bounds",
+        )
+
+    # Invalid: y1 < y0
+    with pytest.raises(ValueError, match="y1 .* must be >= y0"):
+        EvidenceSnippet(
+            page=1,
+            bbox=(10.0, 80.0, 100.0, 40.0),
+            text="Invalid y bounds",
+        )
+
+    # Invalid coordinate count
+    with pytest.raises(ValueError, match="must contain exactly 4 coordinates"):
+        EvidenceSnippet(
+            page=1,
+            bbox=(10.0, 20.0, 30.0),  # only 3 coordinates
+            text="Incomplete bbox",
+        )
+
+
+def test_evidence_matching_indian_currency_comma_system():
+    # Page with text in Indian numbering format: "5,00,000 INR" and "10,00,000 INR"
+    page = PageLayoutOutput(
+        page_number=1,
+        markdown_content="Initial Deposit: 5,00,000 INR\nSum Assured: 10,00,000 INR",
+        blocks=[
+            LayoutBlock(
+                block_id="blk_dep",
+                element_type=LayoutElementType.PARAGRAPH,
+                text="Initial Deposit: 5,00,000 INR",
+                ocr_confidence=0.97,
+                bbox_preprocessed=BoundingBox(x0=10, y0=20, x1=250, y1=45),
+                bbox_original=BoundingBox(x0=10, y0=20, x1=250, y1=45),
+                reading_order_index=0,
+            ),
+            LayoutBlock(
+                block_id="blk_sum",
+                element_type=LayoutElementType.PARAGRAPH,
+                text="Sum Assured: 10,00,000 INR",
+                ocr_confidence=0.98,
+                bbox_preprocessed=BoundingBox(x0=10, y0=50, x1=300, y1=75),
+                bbox_original=BoundingBox(x0=10, y0=50, x1=300, y1=75),
+                reading_order_index=1,
+            ),
+        ],
+        mean_ocr_confidence=0.975,
+    )
+
+    # Test float value matching against Indian numbering string "5,00,000"
+    ev1 = find_evidence_for_value(500000.0, [page])
+    assert ev1 is not None
+    assert ev1["page"] == 1
+    assert ev1["bbox"] == (10.0, 20.0, 250.0, 45.0)
+
+    # Test integer value matching against Indian numbering string "10,00,000"
+    ev2 = find_evidence_for_value(1000000, [page])
+    assert ev2 is not None
+    assert ev2["page"] == 1
+    assert ev2["bbox"] == (10.0, 50.0, 300.0, 75.0)
+
+
+def test_document_metadata_schema_version_typing():
+    # Test that DocumentMetadata accepts both int and str schema_version per PRD SCH-011
+    meta_int = DocumentMetadata(
+        document_type="DOC-01",
+        schema_id="casa_account_opening",
+        schema_version=3,
+        classification_confidence=0.98,
+        status="auto_approved",
+        page_count=2,
+    )
+    assert meta_int.schema_version == 3
+
+    meta_str = DocumentMetadata(
+        document_type="DOC-01",
+        schema_id="casa_account_opening",
+        schema_version="1.0.0",
+        classification_confidence=0.98,
+        status="auto_approved",
+        page_count=2,
+    )
+    assert meta_str.schema_version == "1.0.0"

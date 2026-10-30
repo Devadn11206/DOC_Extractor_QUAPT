@@ -4,7 +4,7 @@ Strictly adheres to PRD §6.3 (SCH-011, SCH-012, SCH-013) and §5.4..5.6 (FR-EXT
 """
 
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EvidenceSnippet(BaseModel):
@@ -13,8 +13,24 @@ class EvidenceSnippet(BaseModel):
     Evidence provenance bounding box and source text snippet.
     """
     page: int = Field(ge=1, description="1-based page number")
-    bbox: List[float] = Field(description="[x0, y0, x1, y1] in pixels of 200 DPI page image (SCH-013)")
+    bbox: Tuple[float, float, float, float] = Field(
+        description="(x0, y0, x1, y1) in pixels of 200 DPI page image (SCH-013)"
+    )
     text: str = Field(description="Raw text snippet providing evidence")
+
+    @field_validator("bbox", mode="before")
+    @classmethod
+    def validate_bbox(cls, v: Any) -> Tuple[float, float, float, float]:
+        if not isinstance(v, (list, tuple)) or len(v) != 4:
+            raise ValueError(
+                f"Bounding box must contain exactly 4 coordinates (x0, y0, x1, y1), got {len(v) if isinstance(v, (list, tuple)) else v}."
+            )
+        x0, y0, x1, y1 = v
+        if float(x1) < float(x0):
+            raise ValueError(f"Invalid bounding box: x1 ({x1}) must be >= x0 ({x0}).")
+        if float(y1) < float(y0):
+            raise ValueError(f"Invalid bounding box: y1 ({y1}) must be >= y0 ({y0}).")
+        return (float(x0), float(y0), float(x1), float(y1))
 
 
 # Alias for backward compatibility
@@ -61,7 +77,7 @@ class DocumentMetadata(BaseModel):
     """PRD §6.3 document metadata envelope."""
     document_type: str = Field(description="Document type identifier (e.g. CASA_ACCOUNT_OPENING, DOC-01)")
     schema_id: str = Field(description="Bound schema identifier")
-    schema_version: Any = Field(description="Version of bound schema")
+    schema_version: Union[str, int] = Field(description="Version of bound schema (PRD SCH-011)")
     classification_confidence: float = Field(ge=0.0, le=1.0)
     status: Literal["processing", "auto_approved", "needs_review", "reviewed", "rejected", "failed"] = Field(
         description="Terminal document status (SCH-012)"

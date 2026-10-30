@@ -203,11 +203,14 @@ def normalize_currency_amount(
     elif "GBP" in raw.upper() or "£" in raw:
         currency = "GBP"
 
-    # Extract numeric part (handles currency prefix with dots like Rs.)
-    match = re.search(r"(\d+(?:\.\d+)?)", raw.replace(",", ""))
+    # Extract numeric part (handles negative amounts, currency prefixes with dots like Rs.)
+    has_leading_minus = raw.strip().startswith("-")
+    match = re.search(r"(-?\d+(?:\.\d+)?)", raw.replace(",", ""))
     if match:
         try:
             val = float(match.group(1))
+            if has_leading_minus and val > 0:
+                val = -val
             return val, currency, None
         except ValueError:
             pass

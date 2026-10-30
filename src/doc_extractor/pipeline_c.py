@@ -349,7 +349,7 @@ class ModuleCPipeline:
         if evidence_dict:
             evidence_model = EvidenceSnippet(
                 page=evidence_dict["page"],
-                bbox=evidence_dict["bbox"],
+                bbox=tuple(evidence_dict["bbox"]),
                 text=evidence_dict["text"],
             )
             optical_conf = evidence_dict.get("ocr_confidence", 1.0)
