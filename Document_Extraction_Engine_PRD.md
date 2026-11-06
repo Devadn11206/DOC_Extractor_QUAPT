@@ -1,8 +1,8 @@
 # Document Extraction Engine: Product Requirements Document (PRD)
 ## Product Requirements Document for Spec-Driven Development
 
-**Version:** 1.2 (Architecture Evolution: 1-Stage Multimodal Extraction with Qwen2.5-VL-7B-Instruct; aligned to the ICXBee PRD and mockup conventions)  
-**Date:** 2026-11-06  
+**Version:** 1.3 (Architecture Evolution: 1-Stage Multimodal Extraction with Qwen3-VL-8B-Instruct / Qwen2.5-VL; aligned to the ICXBee PRD and mockup conventions)  
+**Date:** 2026-11-07  
 **Author:** Praveen (Updated for 1-Stage Multimodal Architecture)  
 **Scope:** Schema-driven extraction of 7 BFSI and healthcare document types into validated, evidence-grounded JSON; SaaS (AWS Mumbai) and customer-controlled deployments from one build  
 **Flows:** Upload and intake, Document tracking, Review (queue and workbench), Schema authoring and approval, Results and export, Developer console, Audit, Security and policy, Operations dashboard  
@@ -15,15 +15,15 @@
 > `DOCX-SCR-*`. The requirement families already in this document (`FR-ING`, `FR-CLS`, `SCH`, `API`, `GR`, `SEC`,
 > `NFR`, `MOCK`, …) keep their IDs unchanged (see 3.3). Items marked **[Proposed]** are this PRD's recommendation
 > where neither the source documents nor the ICXBee PRDs give an answer; each is tracked in 15.6.  
-> **Architecture Evolution Notation:** Throughout this document, requirements and specifications undergoing evolution from the initial Technical Approach to the modern 1-Stage Multimodal Engine are labeled with **[OLD]** (Legacy 2-stage decoupled pipeline with OCR and text LLM) and **[NEW]** (1-Stage Multimodal visual extraction with Qwen2.5-VL-7B-Instruct and deterministic Python normalization) so differences are unambiguous.
+> **Architecture Evolution Notation:** Throughout this document, requirements and specifications undergoing evolution from the initial Technical Approach to the modern 1-Stage Multimodal Engine are labeled with **[OLD]** (Legacy 2-stage decoupled pipeline with OCR and text LLM) and **[NEW]** (1-Stage Multimodal visual extraction with non-thinking `Qwen3-VL-8B-Instruct` / `Qwen2.5-VL-7B-Instruct` and deterministic Python normalization) so differences are unambiguous.
 
-Oct 28, 2026 · @Praveen (original draft v1.0) · updated 2026-10-29 (v1.1) · updated 2026-11-06 (v1.2: 1-Stage Multimodal Architecture)
+Oct 28, 2026 · @Praveen (original draft v1.0) · updated 2026-10-29 (v1.1) · updated 2026-11-06 (v1.2) · updated 2026-11-07 (v1.3: Qwen3-VL-8B-Instruct Adoption)
 
 This PRD defines a schema-driven engine, deployable as SaaS or on-premise, that turns scanned BFSI and healthcare documents into validated, evidence-grounded JSON, written so each requirement can be built and tested as a spec. It merges the Technical Approach document (architecture, models, 7 document types) with the Product Requirements Outline (personas, F1–F21, roadmap), incorporating the architectural transition from legacy two-stage OCR+LLM text parsing to direct single-stage multimodal visual extraction with deterministic Python normalization, and adds mock-screen, guardrail, security and NIST CSF 2.0 requirements.
 
 ## 1. Decisions taken in this PRD
 
-The original inputs disagreed in five places, resolved on 2026-10-29 (D1 to D5). An additional key architectural decision (D6) was resolved on 2026-11-06 transitioning the extraction core from a brittle two-stage pipeline to a robust single-stage multimodal architecture.
+The original inputs disagreed in five places, resolved on 2026-10-29 (D1 to D5). An additional key architectural decision (D6) was resolved transitioning the extraction core from a brittle two-stage pipeline to a robust single-stage multimodal architecture powered by `Qwen3-VL-8B-Instruct` (non-thinking SOTA; OCR Arena ELO 1542, 66.7% win rate over GLM-OCR).
 
 | # | Conflict / Area | Approach document [OLD] | Outline / Proposal | PRD decision [NEW] (Confirmed) |
 | --- | --- | --- | --- | --- |
@@ -32,7 +32,7 @@ The original inputs disagreed in five places, resolved on 2026-10-29 (D1 to D5).
 | D3 | Accuracy bar | Field F1 > 92% (structured/semi), CER < 3%, WER < 6% | 95%+ key-field accuracy; STP "80% above" | **Two bars:** F1 ≥ 92% on all fields and ≥ 95% on schema-marked key fields for structured and semi-structured types. **STP targets are deferred** until the first paying customer defines them; the escape rule is fixed now: 0 wrong key fields in auto-approved documents (GR-027). Handwritten prescriptions always route to review below the confidence threshold. |
 | D4 | Latency | < 3.0 s/page on GPU | < 10 s/page | **p95 ≤ 3.0 s/page with local models on the recommended GPU profile; ≤ 10 s/page on CPU-only fallback.** Cloud-provider latency is reported, not gated. |
 | D5 | MVP scope | 7 types, but prototype on CASA + Discharge Summary first | 2–3 types across InsurTech, FinTech, Healthcare | **MVP = CASA Account Opening, Insurance Application, Discharge Summary** (one per domain). The other four types are schema-only additions in v1. |
-| D6 | **Extraction Core Architecture** | **[OLD] 2-Stage Decoupled Pipeline:** Stage 3 visual parser (PaddleOCR-VL-1.6 / GLM-OCR) converts page image to Markdown/HTML tables; Stage 4 local text LLM (Qwen2.5-7B-Instruct) extracts fields from markdown using regex/prompts. | Line-by-line regex parsing on OCR text strings; separate OCR bounding box index. | **[NEW] 1-Stage Multimodal Extraction Architecture:** Direct vision-to-JSON extraction powered by `Qwen2.5-VL-7B-Instruct` (`Qwen2_5_VLForConditionalGeneration` + `AutoProcessor`), returning structured JSON with inline `[ymin, xmin, ymax, xmax]` normalized bounding boxes, coupled with deterministic Python normalizers for financial/BFSI domain rules (ARC-002, ARC-005, FR-EXT-001, FR-VAL-001). Eliminates layout loss and fragile regex. |
+| D6 | **Extraction Core Architecture** | **[OLD] 2-Stage Decoupled Pipeline:** Stage 3 visual parser (PaddleOCR-VL-1.6 / GLM-OCR) converts page image to Markdown/HTML tables; Stage 4 local text LLM (Qwen2.5-7B-Instruct) extracts fields from markdown using regex/prompts. | Line-by-line regex parsing on OCR text strings; separate OCR bounding box index. | **[NEW] 1-Stage Multimodal Extraction Architecture:** Direct vision-to-JSON extraction powered by `Qwen3-VL-8B-Instruct` (non-thinking instruct VLM; ELO 1542, 66.7% win rate over GLM-OCR on OCR Arena) with `Qwen2.5-VL-7B-Instruct` as compatible baseline, returning structured JSON with inline `[ymin, xmin, ymax, xmax]` normalized bounding boxes, coupled with deterministic Python normalizers for financial/BFSI domain rules (ARC-002, ARC-005, FR-EXT-001, FR-VAL-001). Eliminates layout loss and fragile regex. |
 
 Two further inputs from the outline's answers are adopted as stated: pricing is per page, and launch languages are English, Hindi, Telugu, Tamil and Malayalam, with handwriting reading in English only at first. Malayalam is not covered by the approach document's model selection, so it is a validated-or-not gate in Section 14 rather than an assumption.
 
@@ -143,7 +143,7 @@ This document is the source of truth that code, tests and mock screens are gener
 
 ### 4.1 Architecture Evolution: [OLD] 2-Stage Pipeline vs. [NEW] 1-Stage Multimodal Extraction
 
-The Document Extraction Engine has evolved from a legacy 2-stage decoupled pipeline into a modern, robust **1-Stage Multimodal Extraction Architecture** powered by `Qwen2.5-VL-7B-Instruct` and paired with deterministic Python domain normalizers.
+The Document Extraction Engine has evolved from a legacy 2-stage decoupled pipeline into a modern, robust **1-Stage Multimodal Extraction Architecture** powered by non-thinking **`Qwen3-VL-8B-Instruct`** (with `Qwen2.5-VL-7B-Instruct` as compatible baseline) and paired with deterministic Python domain normalizers.
 
 ```
 ========================================================================================================
@@ -173,8 +173,9 @@ Page Image (200 DPI from Module A Handoff)
        │  • Hands off clean preprocessed image path directly to Module C
        ▼
 [Module C: 1-Stage Multimodal Extractor (SchemaGuidedExtractor)]
-       │  • Model: Qwen2.5-VL-7B-Instruct (Qwen2_5_VLForConditionalGeneration + AutoProcessor)
-       │  • Direct image-to-JSON visual comprehension (no intermediate markdown)
+       │  • Model: Qwen3-VL-8B-Instruct (or Qwen2.5-VL-7B-Instruct) via Hugging Face AutoProcessor
+       │  • Non-Thinking Instruct Mode: zero-latency immediate structured JSON output (no <think> loops)
+       │  • Direct image-to-JSON visual comprehension (no intermediate markdown serialization loss)
        │  • Single-pass structured output with inline normalized bounding boxes [0-1000]:
        │    "field_name": {"value": "extracted_string", "bbox": [ymin, xmin, ymax, xmax]}
        │  • Robust JSON cleaning: re.sub strips markdown backticks (```json ... ```)
@@ -200,8 +201,8 @@ Page Image (200 DPI from Module A Handoff)
 
 | Dimension | [OLD] Legacy 2-Stage Pipeline | [NEW] 1-Stage Multimodal Architecture |
 | --- | --- | --- |
-| **Extraction Paradigm** | Two separate stages: Visual OCR parser outputs Markdown; Text LLM parses Markdown text. | **Single-stage direct multimodal extraction:** Visual tokens fed directly into `Qwen2.5-VL-7B-Instruct`. |
-| **Model Serving** | PaddleOCR-VL-1.6 / GLM-OCR (Stage 3) + Qwen2.5-7B-Instruct via Ollama/vLLM (Stage 4). | **`Qwen2.5-VL-7B-Instruct`** via Hugging Face `transformers>=4.49.0`, `accelerate>=0.26.0`, `bitsandbytes>=0.43.0`, `qwen-vl-utils>=0.0.8`. |
+| **Extraction Paradigm** | Two separate stages: Visual OCR parser outputs Markdown; Text LLM parses Markdown text. | **Single-stage direct multimodal extraction:** Visual tokens fed directly into non-thinking `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`). |
+| **Model Serving** | PaddleOCR-VL-1.6 / GLM-OCR (Stage 3) + Qwen2.5-7B-Instruct via Ollama/vLLM (Stage 4). | **`Qwen3-VL-8B-Instruct`** (Non-Thinking 8B VLM; OCR Arena ELO 1542, Rank #10, 66.7% win rate over GLM-OCR) with `Qwen2.5-VL-7B` compatibility via `transformers>=4.49.0`, `accelerate>=0.26.0`, `bitsandbytes>=0.43.0`, `qwen-vl-utils>=0.0.8`. |
 | **Intermediate Representation** | Brittle Markdown text and HTML tables. Loses geometric coordinates, character grids, and cell alignments. | **None (Zero serialization loss).** The model operates directly on the 200 DPI preprocessed image pixels. |
 | **Evidence Grounding (GR-002)** | Post-hoc matching: attempts to find extracted text strings inside OCR token spans. Fails on numbers, dates, abbreviations. | **Native visual grounding:** Model returns `"bbox": [ymin, xmin, ymax, xmax]` in `[0, 1000]` coordinate grid alongside `"value"`. Transformed to original 200 DPI pixels. |
 | **Extraction Logic** | Fragile line-by-line regex parsing (`re.search`) over generated markdown. Fails on layout variations. | **Schema-guided JSON extraction:** System prompt constrains output to target Pydantic schema structure; sanitized with `re.sub` markdown backtick stripping. |
@@ -215,10 +216,10 @@ Page Image (200 DPI from Module A Handoff)
 | ID | Architectural requirement | Status & Specification | Pri |
 | --- | --- | --- | --- |
 | ARC-001 | Deployment boundary | All components SHALL run inside the deployment boundary (SaaS tenant environment or customer site); calls to external services SHALL go only to providers the policy allows (see GR-013, SEC-011). | P0 |
-| ARC-002 | **Pipeline & Extractor Decoupling** | **[OLD]** The parser and the extractor SHALL be separate services behind versioned interfaces so that either can be replaced by configuration (NFR-008).<br>**[NEW]** The engine SHALL execute extraction via a unified 1-stage multimodal visual extractor (`Qwen2.5-VL-7B-Instruct`) that emits schema-structured JSON and normalized bounding boxes directly from preprocessed page images, followed by a deterministic post-extraction Python normalization engine. The extractor interface SHALL abstract model weights behind `SchemaGuidedExtractor`. | P0 |
+| ARC-002 | **Pipeline & Extractor Decoupling** | **[OLD]** The parser and the extractor SHALL be separate services behind versioned interfaces so that either can be replaced by configuration (NFR-008).<br>**[NEW]** The engine SHALL execute extraction via a unified 1-stage multimodal visual extractor (`Qwen3-VL-8B-Instruct` or `Qwen2.5-VL-7B-Instruct`) that emits schema-structured JSON and normalized bounding boxes directly from preprocessed page images, followed by a deterministic post-extraction Python normalization engine. The extractor interface SHALL abstract model weights behind `SchemaGuidedExtractor`. | P0 |
 | ARC-003 | Queue and statelessness | Stages SHALL communicate through a durable queue; workers SHALL be stateless, and each stage SHALL store its output under the run ID. | P0 |
 | ARC-004 | Local model isolation | Local model serving SHALL run in network-isolated containers with access only to the stage's input and output (GR-007). | P0 |
-| ARC-005 | **Reference Technology Stack** | **[OLD]** The reference stack from the approach document: Python, pypdfium2, OpenCV, Pydantic, instructor or Outlines, Ollama or vLLM, PaddleOCR-VL-1.6 or GLM-OCR, quantised Qwen2.5-7B-Instruct.<br>**[NEW]** The modern 1-stage multimodal stack: Python 3.10+, `transformers>=4.49.0`, `accelerate>=0.26.0`, `bitsandbytes>=0.43.0`, `qwen-vl-utils>=0.0.8`, `torch`, `pypdfium2`, `OpenCV`, `Pydantic v2`, with deterministic BFSI normalizers. Local weights load via `Qwen2_5_VLForConditionalGeneration` and `AutoProcessor` with optional 4-bit/8-bit quantization. | P0 |
+| ARC-005 | **Reference Technology Stack** | **[OLD]** The reference stack from the approach document: Python, pypdfium2, OpenCV, Pydantic, instructor or Outlines, Ollama or vLLM, PaddleOCR-VL-1.6 or GLM-OCR, quantised Qwen2.5-7B-Instruct.<br>**[NEW]** The modern 1-stage multimodal stack: Python 3.10+, `transformers>=4.49.0`, `accelerate>=0.26.0`, `bitsandbytes>=0.43.0`, `qwen-vl-utils>=0.0.8`, `torch`, `pypdfium2`, `OpenCV`, `Pydantic v2`, with deterministic BFSI normalizers. Local weights load via `Qwen3-VL-8B-Instruct` or `Qwen2.5-VL-7B-Instruct` with optional 4-bit/8-bit quantization. | P0 |
 | ARC-006 | Deployment profiles | One container build SHALL support three deployment profiles selected by configuration: SaaS (vendor-hosted, multi-tenant, AWS Mumbai ap-south-1), private cloud or VPC (single-tenant), and on-premise (sovereign: cloud providers disabled, outbound traffic denied). The profile SHALL set default provider policy, egress rules and key management. | P0 |
 | ARC-007 | Provider adapter | External model providers SHALL be reached only through a provider adapter that implements the same multimodal extraction interface as the local model, applies provider policy (Section 9.2), records every call without document content, and falls back to the local model when policy disallows or the provider fails. | P0 |
 
@@ -250,12 +251,12 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 
 ### 5.3 Visual layout parsing
 
-> **Architecture Status:** Under the **[OLD]** 2-stage decoupled pipeline, visual layout parsing was an independent stage (Stage 3 using PaddleOCR-VL-1.6 or GLM-OCR) producing intermediate Markdown with HTML tables. Under the **[NEW]** 1-Stage Multimodal Architecture, visual layout parsing is performed directly by the vision encoder of `Qwen2.5-VL-7B-Instruct`, eliminating serialization loss while preserving spatial coordinates natively.
+> **Architecture Status:** Under the **[OLD]** 2-stage decoupled pipeline, visual layout parsing was an independent stage (Stage 3 using PaddleOCR-VL-1.6 or GLM-OCR) producing intermediate Markdown with HTML tables. Under the **[NEW]** 1-Stage Multimodal Architecture, visual layout parsing is performed directly by the vision encoder of `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`), eliminating serialization loss while preserving spatial coordinates natively.
 
 | ID | Requirement | Mode | Specification & Acceptance criteria | Source |
 | --- | --- | --- | --- | --- |
 | FR-PRS-001 | Page to structured layout | **[OLD]** | The system SHALL convert each page to layout-faithful Markdown with HTML tables, using a local OCR model (PaddleOCR-VL-1.6 / GLM-OCR), with per-block bounding boxes. Benchmark CER < 3%, WER < 6% (M2). | A §3 stage 3, F6 |
-| | | **[NEW]** | The system SHALL ingest 200 DPI preprocessed page images directly into `Qwen2.5-VL-7B-Instruct`, extracting layout semantics and spatial geometries in a single forward pass without intermediate Markdown or HTML table serialization. | ARC-002 |
+| | | **[NEW]** | The system SHALL ingest 200 DPI preprocessed page images directly into `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`), extracting layout semantics and spatial geometries in a single forward pass without intermediate Markdown or HTML table serialization. | ARC-002 |
 | FR-PRS-002 | Checkbox and tick state | **[OLD]** | Render checkboxes as `[x]` or `[ ]` markdown text with bounding boxes; state accuracy ≥ 98%. | A §4.1, F6 |
 | | | **[NEW]** | Directly resolve checkbox and toggle mark visual semantics into target schema boolean or enumerated values with source bounding box coordinates `[ymin, xmin, ymax, xmax]`. | F6, GR-002 |
 | FR-PRS-003 | Character grids | **[OLD]** | Merge segmented character grid markdown tokens (e.g., `\|J\|O\|H\|N\|`) into a single string before LLM extraction. | A §4.1 |
@@ -269,12 +270,12 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 
 ### 5.4 Extraction
 
-> **Architecture Status:** Under the **[OLD]** pipeline, extraction was performed by a text-only LLM (Qwen2.5-7B) using fragile regex searches (`re.search`) or grammar decoding over OCR-generated Markdown. Under the **[NEW]** 1-Stage Multimodal Architecture, extraction is orchestrated by `SchemaGuidedExtractor` using `Qwen2_5_VLForConditionalGeneration` and `AutoProcessor`, producing schema-bound JSON with inline bounding boxes directly from preprocessed page images.
+> **Architecture Status:** Under the **[OLD]** pipeline, extraction was performed by a text-only LLM (Qwen2.5-7B) using fragile regex searches (`re.search`) or grammar decoding over OCR-generated Markdown. Under the **[NEW]** 1-Stage Multimodal Architecture, extraction is orchestrated by `SchemaGuidedExtractor` using `Qwen3-VL-8B-Instruct` (non-thinking instruct mode) or `Qwen2.5-VL-7B-Instruct`, producing schema-bound JSON with inline bounding boxes directly from preprocessed page images.
 
 | ID | Requirement | Mode | Specification & Acceptance criteria | Source |
 | --- | --- | --- | --- | --- |
 | FR-EXT-001 | Schema-guided extraction | **[OLD]** | The system SHALL extract schema fields from parsed Markdown text using text LLM prompts and line-by-line regex parsing. | A §3 stage 4, F8 |
-| | | **[NEW]** | The system SHALL extract schema fields directly from preprocessed page images using `Qwen2.5-VL-7B-Instruct` guided by target Pydantic schema classes (e.g., `CASASchema`), without line-by-line regex parsing or intermediate text representations. | A §3, F8 |
+| | | **[NEW]** | The system SHALL extract schema fields directly from preprocessed page images using `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`) guided by target Pydantic schema classes (e.g., `CASASchema`), without line-by-line regex parsing or intermediate text representations. | A §3, F8 |
 | FR-EXT-002 | Structured JSON output | **[OLD]** | Model output constrained using grammar-guided decoding (e.g., outlines or instructor). | A §3 stage 4 |
 | | | **[NEW]** | The system SHALL prompt the multimodal model to output a valid JSON object matching the requested schema. The orchestrator SHALL use regex sanitization (`re.sub(r"^```json\s*\|\s*```$", "", text)`) to strip markdown code blocks before robust `json.loads` parsing. | M3, GR-005 |
 | FR-EXT-003 | Null by default (GR-003) | **Both** | IF a field is absent or not legible, THEN the system SHALL return `null` with `null_reason` of `absent` or `illegible`; it SHALL NOT infer, guess, or hallucinate a value. | A §7.2, F11 |
@@ -409,7 +410,7 @@ Every value is wrapped with its confidence and evidence. The envelope below is t
   "run": {
     "run_id": "r_...",
     "model_versions": {
-      "multimodal_extractor": "Qwen2.5-VL-7B-Instruct",
+      "multimodal_extractor": "Qwen3-VL-8B-Instruct",
       "normalizer": "deterministic-v1"
     },
     "prompt_version": "v2.1"
@@ -419,14 +420,14 @@ Every value is wrapped with its confidence and evidence. The envelope below is t
 
 > **Model Versions Evolution:**  
 > - **[OLD]** `model_versions`: `{"parser": "PaddleOCR-VL-1.6", "extractor": "Qwen2.5-7B-Instruct"}`  
-> - **[NEW]** `model_versions`: `{"multimodal_extractor": "Qwen2.5-VL-7B-Instruct", "normalizer": "deterministic-v1"}`
+> - **[NEW]** `model_versions`: `{"multimodal_extractor": "Qwen3-VL-8B-Instruct", "normalizer": "deterministic-v1"}` (or `Qwen2.5-VL-7B-Instruct` compatible baseline)
 
 | ID | Requirement | Mode | Specification | Pri |
 | --- | --- | --- | --- | --- |
 | SCH-011 | Envelope schema versioning | Both | The envelope SHALL be published as JSON Schema and versioned with semantic versioning; breaking changes SHALL bump major version. | P0 |
 | SCH-012 | Document status gating | Both | `status` SHALL be one of `processing`, `auto_approved`, `needs_review`, `reviewed`, `rejected`, `failed`. IF any required schema field is missing or fails validation, THEN status SHALL be set to `needs_review`; otherwise `auto_approved` (GR-027). | P0 |
 | SCH-013 | Bounding box coordinates | **[OLD]** | `bbox` extracted from token-level OCR spans on markdown text. | P0 |
-| | | **[NEW]** | `Qwen2.5-VL-7B-Instruct` generates normalized coordinates `[ymin, xmin, ymax, xmax]` in range `[0, 1000]`. In Module C, `CoordinateTransform.map_bbox_preprocessed_to_original()` transforms them into `[x0, y0, x1, y1]` pixels of the original 200 DPI page image (origin top-left), correcting for preprocessed scaling, deskew angle, and rotation. If no bounding box is returned or evidence cannot be formed, the value is forced to `null` and flagged `EVIDENCE_MISSING` (GR-002). | P0 |
+| | | **[NEW]** | `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`) generates normalized coordinates `[ymin, xmin, ymax, xmax]` in range `[0, 1000]`. In Module C, `CoordinateTransform.map_bbox_preprocessed_to_original()` transforms them into `[x0, y0, x1, y1]` pixels of the original 200 DPI page image (origin top-left), correcting for preprocessed scaling, deskew angle, and rotation. If no bounding box is returned or evidence cannot be formed, the value is forced to `null` and flagged `EVIDENCE_MISSING` (GR-002). | P0 |
 | SCH-014 | PII masking | Both | Fields marked PII in schema SHALL be maskable in API responses by caller permission (SEC-007). | P0 |
 
 ## 7. API and integration specification
@@ -748,8 +749,8 @@ In lending and clinical settings an unverified guess is worse than a missing val
 | ID | Point | Guardrail | Mechanism | Acceptance test | Pri |
 | --- | --- | --- | --- | --- | --- |
 | GR-001 | Input | Only supported, clean files enter the pipeline. | Magic-byte check, size and page limits, malware scan, decompression-bomb limit. | Fuzz corpus of malformed files: 0 crashes, 100% rejected with a code. | P0 |
-| GR-002 | Output | No value without evidence. | **[OLD]** Substring search against OCR word tokens.<br>**[NEW]** `Qwen2.5-VL-7B-Instruct` emits inline `[ymin, xmin, ymax, xmax]` normalized coordinates for every value (`"field": {"value": ..., "bbox": [...]}`). Transformed to 200 DPI pixels via `CoordinateTransform.map_bbox_preprocessed_to_original()`. Any non-null value lacking an evidence bounding box is forced to `null` with `null_reason: "absent"` and flagged `EVIDENCE_MISSING`. | Seeded test: model returns a value with fake or missing evidence; result is forced to null and flagged `EVIDENCE_MISSING`. | P0 |
-| GR-003 | Generation | Null by default. | **[OLD]** Text prompt: "If not visible, return null."<br>**[NEW]** Multimodal system prompt instructs Qwen2.5-VL: "If not legibly visible in the document image, return null. Never guess or hallucinate." Absent and illegible are kept as distinct reasons. | Blank-field benchmark: false-fill rate ≤ 0.5% of blank fields. | P0 |
+| GR-002 | Output | No value without evidence. | **[OLD]** Substring search against OCR word tokens.<br>**[NEW]** `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`) emits inline `[ymin, xmin, ymax, xmax]` normalized coordinates for every value (`"field": {"value": ..., "bbox": [...]}`). Transformed to 200 DPI pixels via `CoordinateTransform.map_bbox_preprocessed_to_original()`. Any non-null value lacking an evidence bounding box is forced to `null` with `null_reason: "absent"` and flagged `EVIDENCE_MISSING`. | Seeded test: model returns a value with fake or missing evidence; result is forced to null and flagged `EVIDENCE_MISSING`. | P0 |
+| GR-003 | Generation | Null by default. | **[OLD]** Text prompt: "If not visible, return null."<br>**[NEW]** Multimodal system prompt instructs Qwen3-VL: "If not legibly visible in the document image, return null. Never guess or hallucinate." Absent and illegible are kept as distinct reasons. | Blank-field benchmark: false-fill rate ≤ 0.5% of blank fields. | P0 |
 | GR-004 | Input | No forced classification. | Below-threshold or no matching schema yields `UNKNOWN` and review; extraction does not run. | Out-of-domain set: ≥ 98% routed to `UNKNOWN`. | P0 |
 | GR-005 | Generation | Output must conform to the schema. | **[OLD]** Grammar-guided decoding on text LLM.<br>**[NEW]** Target Pydantic schema compiled into multimodal prompt; response cleaned via `re.sub(r"^```json\s*\|\s*```$", "", ...)` and validated through Pydantic model envelopes and deterministic normalizers. | 1,000 runs, 0 exceptions (M3). | P0 |
 | GR-006 | Input | Document content is data, never instructions. | Document text is passed only inside delimited data fields; the prompt states that instructions inside documents are ignored; output is limited to schema fields so an injected instruction has no channel. | Injection test set ("ignore previous instructions…", hidden white text, instructions in stamps): 0 schema deviations, 0 behaviour changes. | P0 |
@@ -886,7 +887,7 @@ Performance targets are measured with local models on hardware profile P2 in 12.
 | NFR-004 | Availability | Service availability for a single-site deployment; high-availability option documented. | 99.5% monthly (HA: 99.9%) | P0 |
 | NFR-005 | Scalability | Add worker nodes to scale throughput linearly up to 4 nodes; queue absorbs month-end bursts. | ≥ 85% scaling efficiency | P1 |
 | NFR-006 | Reliability | Retries and idempotency on all mutating calls; at-least-once processing with no lost documents on node failure. | 0 lost documents in failure-injection test | P0 |
-| NFR-007 | **Model footprint** | **[OLD]** Parser stage VRAM < 2 GB; extractor stage VRAM within 8 to 16 GB (two separate models loaded simultaneously).<br>**[NEW]** Single unified multimodal model (`Qwen2.5-VL-7B-Instruct`): ~16 GB VRAM unquantized (bfloat16), or ~6 to 8 GB VRAM with 4-bit / 8-bit quantization (`bitsandbytes`), comfortably fitting single 24 GB GPU instances (L4, A10, RTX 3090/4090). | Single GPU footprint ≤ 16 GB | P0 |
+| NFR-007 | **Model footprint** | **[OLD]** Parser stage VRAM < 2 GB; extractor stage VRAM within 8 to 16 GB (two separate models loaded simultaneously).<br>**[NEW]** Single unified multimodal model (`Qwen3-VL-8B-Instruct` or `Qwen2.5-VL-7B-Instruct`): ~16 GB VRAM unquantized (bfloat16), or ~6 to 8 GB VRAM with 4-bit / 8-bit quantization (`bitsandbytes`), comfortably fitting single 24 GB GPU instances (L4, A10, RTX 3090/4090). | Single GPU footprint ≤ 16 GB | P0 |
 | NFR-008 | **Model flexibility** | **[OLD]** Parser and extractor sit behind separate interfaces.<br>**[NEW]** Unified `SchemaGuidedExtractor` multimodal interface; swapping model checkpoints requires only configuration and regression run, without multi-stage pipeline coupling. | Swap demonstrated for multimodal backbone | P0 |
 | NFR-009 | Deployment | One container build deploys to SaaS, private cloud or VPC, and on-premise with Helm or Compose; offline installation bundle. | Install with no internet in under 1 day | P0 |
 | NFR-010 | Observability | Dashboards for accuracy, STP, confidence distribution, error patterns, latency, GPU use and cost per page; no PII. | All listed panels live | P1 |
@@ -914,7 +915,7 @@ The 1-Stage Multimodal Extraction Architecture requires the following pinned dep
 | `opencv-python-headless` | `>=4.8.0` | Skew detection, rotation, contrast normalization | Module A Preprocessing |
 
 > **Legacy Dependencies Removed:**  
-> - **[OLD]** `paddlepaddle`, `paddleocr`, `glm-ocr`, `ollama`, `vllm` are superseded by direct Hugging Face transformers serving for `Qwen2.5-VL-7B-Instruct`.
+> - **[OLD]** `paddlepaddle`, `paddleocr`, `glm-ocr`, `ollama`, `vllm` are superseded by direct Hugging Face transformers serving for `Qwen3-VL-8B-Instruct` / `Qwen2.5-VL-7B-Instruct`.
 
 ### 12.2 Recommended hardware
 
@@ -1042,7 +1043,7 @@ Phases are gated by evidence, not dates. Durations are set after capacity planni
 - Access to policy-administration, loan-origination and claims systems (sandbox) is available for connector work in v1.
 - **Extraction Models Selection:**  
   - **[OLD] Initial Candidate Stack:** PaddleOCR-VL-1.6 or GLM-OCR for parsing; quantized Qwen2.5-7B-Instruct for extraction, served by Ollama or vLLM.  
-  - **[NEW] Adopted Standard Stack:** Unified multimodal `Qwen2.5-VL-7B-Instruct` loaded via Hugging Face (`transformers>=4.49.0`, `accelerate>=0.26.0`, `bitsandbytes>=0.43.0`, `qwen-vl-utils>=0.0.8`) with deterministic Python normalizers for financial/BFSI rules (PAN, Aadhaar, ISO 8601 dates, currency). Removes OCR-to-LLM cascading errors and brittle regex parsing.
+  - **[NEW] Adopted Standard Stack:** Unified multimodal non-thinking `Qwen3-VL-8B-Instruct` (OCR Arena ELO 1542, 66.7% win rate over GLM-OCR) with `Qwen2.5-VL-7B-Instruct` compatibility, loaded via Hugging Face (`transformers>=4.49.0`, `accelerate>=0.26.0`, `bitsandbytes>=0.43.0`, `qwen-vl-utils>=0.0.8`) with deterministic Python normalizers for financial/BFSI rules (PAN, Aadhaar, ISO 8601 dates, currency). Removes OCR-to-LLM cascading errors and brittle regex parsing.
 - Legal review of DPDP, HIPAA, GDPR, RBI and IRDAI obligations is done per customer outside this PRD.
 
 ### 15.3 Answers carried over from the outline
@@ -1152,7 +1153,7 @@ Each slice ends with something demonstrable and passing its tests. Slices 1 to 6
 | 1 | Upload to preprocessed pages with idempotency and file safety (Module A) | FR-ING-001 to 006, GR-001 |
 | 2 | **[OLD]** Layout parsing to Markdown, tables, checkboxes, with bounding boxes (PaddleOCR-VL / GLM-OCR).<br>**[NEW]** Direct visual feature and token preparation for multimodal vision ingestion. | FR-PRS-001 to 005 |
 | 3 | Classification, schema binding, schema service with lifecycle (Module B Simplified) | FR-CLS, SCH-001 to 007 |
-| 4 | **[OLD]** Guided extraction with evidence, null handling and guardrails from OCR text.<br>**[NEW]** 1-Stage Multimodal Extraction (`Qwen2.5-VL-7B-Instruct`), schema-guided JSON, inline `[ymin, xmin, ymax, xmax]` bbox extraction, markdown strip (`re.sub`), coordinate transform to 200 DPI pixels (`CoordinateTransform`), evidence snippet wrapping. | FR-EXT-001 to 007, GR-002, GR-003, GR-005 |
+| 4 | **[OLD]** Guided extraction with evidence, null handling and guardrails from OCR text.<br>**[NEW]** 1-Stage Multimodal Extraction (`Qwen3-VL-8B-Instruct` / `Qwen2.5-VL-7B-Instruct`), schema-guided JSON, inline `[ymin, xmin, ymax, xmax]` bbox extraction, markdown strip (`re.sub`), coordinate transform to 200 DPI pixels (`CoordinateTransform`), evidence snippet wrapping. | FR-EXT-001 to 007, GR-002, GR-003, GR-005 |
 | 5 | **[OLD]** Ad-hoc validation, normalisation, confidence, routing.<br>**[NEW]** Deterministic Python normalizer (`normalize_and_format` for currency, ISO 8601 dates, PAN, Aadhaar, string identifiers), status gating (`auto_approved` vs `needs_review`), and canonical output envelope (§6.3). | FR-VAL-001 to 004, FR-CNF, SCH-011 to 014 |
 | 6 | API, webhooks, audit and reproducibility | API-001 to 014, FR-AUD-001 |
 | 7 | Review queue and workbench, results and export screens | SCR-03, 04, 06; FR-REV |
@@ -1303,7 +1304,7 @@ Feature: Classification
 Feature: Extraction
 
   Scenario: Evidence on every value ([NEW] Multimodal 1-Stage)
-    Given an extracted non-null field from Qwen2.5-VL-7B-Instruct
+    Given an extracted non-null field from Qwen3-VL-8B-Instruct (or Qwen2.5-VL-7B-Instruct)
     Then it carries native normalized bbox [ymin, xmin, ymax, xmax]
     And is mapped to 200 DPI pixel coordinates [x0, y0, x1, y1] on the original page image
     And carries the supporting text snippet
