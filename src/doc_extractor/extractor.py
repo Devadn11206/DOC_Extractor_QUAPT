@@ -544,10 +544,11 @@ class SchemaGuidedExtractor:
         return raw_dict, prov
 
     def _load_model(self):
-        """Lazily load Qwen2.5-VL / Qwen3-VL model and processor."""
+        """Lazily load Qwen-VL model and processor using official AutoModelForMultimodalLM."""
         if self._model is None or self._processor is None:
             import torch
-            from transformers import AutoModelForVision2Seq, AutoProcessor
+            import transformers
+            from transformers import AutoProcessor
 
             self._processor = AutoProcessor.from_pretrained(
                 self.model_name,
@@ -569,25 +570,23 @@ class SchemaGuidedExtractor:
             else:
                 kwargs["torch_dtype"] = torch.bfloat16
 
-            # Use AutoModelForVision2Seq to dynamically match Qwen3-VL or Qwen2.5-VL architecture
-            try:
-                self._model = AutoModelForVision2Seq.from_pretrained(
-                    self.model_name,
-                    **kwargs,
-                )
-            except Exception:
-                try:
-                    from transformers import Qwen3VLForConditionalGeneration
-                    self._model = Qwen3VLForConditionalGeneration.from_pretrained(
-                        self.model_name,
-                        **kwargs,
-                    )
-                except Exception:
-                    from transformers import Qwen2_5_VLForConditionalGeneration
-                    self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                        self.model_name,
-                        **kwargs,
-                    )
+            # Official class for Qwen3-VL in transformers is Qwen3VLForConditionalGeneration
+            model_cls = (
+                getattr(transformers, "Qwen3VLForConditionalGeneration", None)
+                or getattr(transformers, "AutoModelForImageTextToText", None)
+                or getattr(transformers, "AutoModelForMultimodalLM", None)
+                or getattr(transformers, "AutoModelForCausalLM", None)
+                or getattr(transformers, "AutoModel", None)
+            )
+
+            if model_cls is None:
+                from transformers import AutoModel
+                model_cls = AutoModel
+
+            self._model = model_cls.from_pretrained(
+                self.model_name,
+                **kwargs,
+            )
             self._model.eval()
         return self._model, self._processor
 
