@@ -452,6 +452,7 @@ class SchemaGuidedExtractor:
             videos=video_inputs,
             padding=True,
             return_tensors="pt",
+        )
         device = "cuda" if torch.cuda.is_available() else model.device
         inputs = inputs.to(device)
 
