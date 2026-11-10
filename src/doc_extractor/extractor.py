@@ -200,7 +200,7 @@ class SchemaGuidedExtractor:
 
     def __init__(
         self,
-        model_name: str = "Qwen2.5-7B-Instruct",
+        model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
         use_llm: bool = False,
         allow_fallback: bool = True,
         prompt_version: str = "1.0.0",
@@ -211,6 +211,7 @@ class SchemaGuidedExtractor:
         max_new_tokens: int = 2048,
         temperature: float = 0.0,
         trust_remote_code: bool = True,
+        load_in_4bit: bool = True,
     ):
         self.model_name = model_name
         self.use_llm = use_llm

@@ -93,13 +93,16 @@ def process_document(
     doc_type_override: str,
     use_qwen_vl: bool,
 ) -> Tuple[Optional[Image.Image], str, str]:
-    """Processes document and returns (annotated_page_image, status_text, json_output)."""
+    """Processes document and returns (annotated_page_image, status_text, json_output).
+    use_qwen_vl=True  → live Qwen3-VL-8B inference (needs GPU/vLLM)
+    use_qwen_vl=False → heuristic regex fast-path (CPU, for quick local testing without GPU)
+    """
     if file_obj is None:
         return None, "No file uploaded", "{}"
 
     pipe_a, pipe_b, pipe_c = get_pipeline()
 
-    # Toggle Qwen-VL model usage
+    # Wire model mode: True = real Qwen3-VL inference, False = deterministic regex heuristic
     pipe_c.extractor.use_llm = use_qwen_vl
 
     # Handle file path
@@ -164,8 +167,8 @@ def create_demo() -> "gr.Blocks":
                     label="Document Type Hint",
                 )
                 use_vlm_checkbox = gr.Checkbox(
-                    value=False,
-                    label="Enable Live Qwen-VL Model (Checked = GPU/vLLM, Unchecked = Heuristic fast-path)",
+                    value=True,
+                    label="🤖 Use Qwen3-VL-8B (uncheck for CPU heuristic fallback — no GPU needed)",
                 )
                 submit_btn = gr.Button("Extract Document", variant="primary")
 
