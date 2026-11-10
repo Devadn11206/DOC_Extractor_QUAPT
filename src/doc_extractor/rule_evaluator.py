@@ -15,8 +15,7 @@ from doc_extractor.validation_rules import (
     validate_arithmetic,
     validate_chronology,
 )
-from schema_lifecycle.enums import RuleOnFail
-from schema_lifecycle.metamodel import RuleDefinition
+from doc_extractor.schema_lifecycle import RuleDefinition, RuleOnFail
 
 
 
