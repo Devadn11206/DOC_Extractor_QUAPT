@@ -436,7 +436,13 @@ class SchemaGuidedExtractor:
                 "role": "user",
                 "content": [
                     {"type": "image", "image": str(image_input) if isinstance(image_input, (str, Path)) else image_input},
-                    {"type": "text", "text": "Extract all fields from this document page."},
+                    {
+                        "type": "text",
+                        "text": (
+                            "Carefully transcribe all real filled values from this document image into the requested JSON schema. "
+                            "Read the handwritten applicant name, PAN card number, and filled bank details directly from the image."
+                        ),
+                    },
                 ],
             },
         ]
@@ -622,22 +628,20 @@ class SchemaGuidedExtractor:
             )
         fields_json = ",\n".join(field_lines)
 
-        return f"""You are an expert document extraction engine specialized in BFSI and Healthcare documents.
+        return f"""You are a high-precision document OCR and extraction engine specialized in Indian BFSI forms.
 
-TASK: Read the provided document image and extract all fields defined in the target schema below. Output a SINGLE valid JSON object only.
+TASK:
+Examine this document image with extreme precision. Extract the actual handwritten and printed text corresponding to the target fields.
 
 TARGET SCHEMA FIELDS:
 {fields_json}
 
-OUTPUT FORMAT (STRICT):
-- Return a flat JSON object where each key is a field name from the schema.
-- Each field value must be an object with exactly two keys: "value" and "bbox".
-- "value": The extracted string or numeric value, or null if the field is absent or illegible.
-- "bbox": Bounding box in [ymin, xmin, ymax, xmax] format, normalized to [0-1000] range.
-- GR-002: NO value without a grounded bounding box. If you cannot visually locate the text, set value to null and bbox to null.
-- GR-003: null by default; absent or illegible fields get null value with null bbox.
-- Do NOT include markdown code fences (```json ... ```). Return raw JSON only.
-- Preserve leading zeros on account numbers and IDs.
+CRITICAL RULES:
+1. TRANSCRIBE ACTUAL INK: Read the real handwritten and printed letters on the page (character boxes, handwriting, checkboxes). Do NOT invent, assume, or hallucinate placeholder names (e.g. NEVER output dummy names like "GOPAL SINGH" or dummy PANs like "ABCD12345C").
+2. CHARACTER BOXES: For names, PAN, Aadhaar, read the individual letters written in the character grid boxes carefully (e.g. R-U-P-E-S-H -> RUPESH).
+3. ABSENT FIELDS: If a field is not filled or not present on this document, set "value": null and "bbox": null.
+4. BOUNDING BOXES: "bbox" must be [ymin, xmin, ymax, xmax] in normalized 0-1000 scale surrounding the exact text or checked box.
+5. STRICT FORMAT: Return raw valid JSON only. No markdown fences.
 """
 
     def _extract_heuristic(

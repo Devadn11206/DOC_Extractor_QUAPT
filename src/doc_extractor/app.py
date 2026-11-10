@@ -91,13 +91,6 @@ def draw_bounding_boxes(
             continue
 
         x0, y0, x1, y1 = bbox
-        # Convert if normalized [0, 1000] space
-        if max(x0, y0, x1, y1) <= 1000 and (img_w > 1000 or img_h > 1000):
-            x0 = int(x0 * img_w / 1000.0)
-            y0 = int(y0 * img_h / 1000.0)
-            x1 = int(x1 * img_w / 1000.0)
-            y1 = int(y1 * img_h / 1000.0)
-
         color = colors[idx % len(colors)]
 
         # Draw rectangle
