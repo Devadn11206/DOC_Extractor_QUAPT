@@ -169,7 +169,7 @@ def process_document(
 
 def create_demo() -> "gr.Blocks":
     """Constructs Gradio UI layout."""
-    with gr.Blocks(title="Document Extraction Engine — Qwen-VL Demo", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Document Extraction Engine — Qwen-VL Demo") as demo:
         gr.Markdown(
             "# 📄 Document Extraction Engine\n"
             "**Single-Stage Multimodal Extraction (Qwen3-VL / Qwen2.5-VL)** with deterministic financial normalization and pixel evidence grounding."
@@ -212,5 +212,6 @@ if __name__ == "__main__":
         demo = create_demo()
         # In Kaggle or remote server, share=True generates a public gradio.live URL
         share_mode = os.environ.get("GRADIO_SHARE", "True").lower() == "true"
-        demo.launch(share=share_mode, server_port=7860)
+        port = int(os.environ.get("GRADIO_SERVER_PORT", 0)) or None
+        demo.launch(share=share_mode, server_port=port)
 
