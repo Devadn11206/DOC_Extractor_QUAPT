@@ -9,7 +9,24 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Optional, Tuple
+
+# Ensure src/ is on sys.path and clean out doc_extractor directory from sys.path
+# to prevent local files (logging.py, etc.) from shadowing stdlib and sibling packages.
+_src_dir = str(Path(__file__).resolve().parent.parent)
+_current_dir = str(Path(__file__).resolve().parent)
+
+while "" in sys.path:
+    sys.path.remove("")
+while _current_dir in sys.path:
+    sys.path.remove(_current_dir)
+while "." in sys.path:
+    sys.path.remove(".")
+
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
 from PIL import Image, ImageDraw, ImageFont
 
 from doc_extractor.config import Settings
