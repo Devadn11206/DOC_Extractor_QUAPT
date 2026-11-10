@@ -224,6 +224,7 @@ class SchemaGuidedExtractor:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.trust_remote_code = trust_remote_code
+        self.load_in_4bit = load_in_4bit
         self._model = None
         self._processor = None
         self._local = threading.local()
@@ -536,29 +537,67 @@ class SchemaGuidedExtractor:
         return raw_dict, prov
 
     def _load_model(self):
-        """Lazily load Qwen2.5-VL model and processor."""
+        """Lazily load Qwen2.5-VL / Qwen3-VL model and processor."""
         if self._model is None or self._processor is None:
             import torch
             from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
             self._processor = AutoProcessor.from_pretrained(
                 self.model_name,
+                min_pixels=256 * 28 * 28,
+                max_pixels=1280 * 28 * 28,
                 trust_remote_code=self.trust_remote_code,
             )
+            kwargs = {
+                "device_map": self.device,
+                "trust_remote_code": self.trust_remote_code,
+            }
+            if getattr(self, "load_in_4bit", True):
+                try:
+                    from transformers import BitsAndBytesConfig
+                    kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                    )
+                except Exception:
+                    kwargs["torch_dtype"] = torch.bfloat16
+            else:
+                kwargs["torch_dtype"] = torch.bfloat16
+
             self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_name,
-                torch_dtype=torch.bfloat16,
-                device_map=self.device,
-                trust_remote_code=self.trust_remote_code,
+                **kwargs,
             )
             self._model.eval()
         return self._model, self._processor
 
     def _build_system_prompt(self, schema_cls: Type[BaseModel]) -> str:
-        """Constructs schema-bound system prompt."""
+        """Constructs schema-bound system prompt with full leaf field paths."""
+        def get_leaf_fields(cls: Type[BaseModel], prefix: str = "") -> List[Tuple[str, str]]:
+            fields: List[Tuple[str, str]] = []
+            for name, info in cls.model_fields.items():
+                full_name = f"{prefix}.{name}" if prefix else name
+                ann = info.annotation
+                args = getattr(ann, "__args__", ())
+                target_cls = None
+                if isinstance(ann, type) and issubclass(ann, BaseModel):
+                    target_cls = ann
+                elif args:
+                    for a in args:
+                        if isinstance(a, type) and issubclass(a, BaseModel):
+                            target_cls = a
+                            break
+
+                if target_cls:
+                    fields.extend(get_leaf_fields(target_cls, full_name))
+                else:
+                    desc = info.description or ""
+                    fields.append((full_name, desc))
+            return fields
+
+        leaf_fields = get_leaf_fields(schema_cls)
         field_lines: List[str] = []
-        for field_name, field_info in schema_cls.model_fields.items():
-            desc = field_info.description or ""
+        for field_name, desc in leaf_fields:
             field_lines.append(
                 f'  "{field_name}": {{"value": "<extracted_string_or_null>", "bbox": [ymin, xmin, ymax, xmax]}}  # {desc}'
             )
