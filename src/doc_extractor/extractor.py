@@ -452,14 +452,20 @@ class SchemaGuidedExtractor:
             videos=video_inputs,
             padding=True,
             return_tensors="pt",
-        ).to(model.device)
+        device = "cuda" if torch.cuda.is_available() else model.device
+        inputs = inputs.to(device)
+
+        gen_kwargs = {"max_new_tokens": self.max_new_tokens}
+        if self.temperature > 0:
+            gen_kwargs["temperature"] = self.temperature
+            gen_kwargs["do_sample"] = True
+        else:
+            gen_kwargs["do_sample"] = False
 
         with torch.no_grad():
             generated_ids = model.generate(
                 **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                do_sample=self.temperature > 0,
+                **gen_kwargs,
             )
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -540,12 +546,10 @@ class SchemaGuidedExtractor:
         """Lazily load Qwen2.5-VL / Qwen3-VL model and processor."""
         if self._model is None or self._processor is None:
             import torch
-            from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+            from transformers import AutoModelForVision2Seq, AutoProcessor
 
             self._processor = AutoProcessor.from_pretrained(
                 self.model_name,
-                min_pixels=256 * 28 * 28,
-                max_pixels=1280 * 28 * 28,
                 trust_remote_code=self.trust_remote_code,
             )
             kwargs = {
@@ -564,10 +568,25 @@ class SchemaGuidedExtractor:
             else:
                 kwargs["torch_dtype"] = torch.bfloat16
 
-            self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                self.model_name,
-                **kwargs,
-            )
+            # Use AutoModelForVision2Seq to dynamically match Qwen3-VL or Qwen2.5-VL architecture
+            try:
+                self._model = AutoModelForVision2Seq.from_pretrained(
+                    self.model_name,
+                    **kwargs,
+                )
+            except Exception:
+                try:
+                    from transformers import Qwen3VLForConditionalGeneration
+                    self._model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        self.model_name,
+                        **kwargs,
+                    )
+                except Exception:
+                    from transformers import Qwen2_5_VLForConditionalGeneration
+                    self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        self.model_name,
+                        **kwargs,
+                    )
             self._model.eval()
         return self._model, self._processor
 
