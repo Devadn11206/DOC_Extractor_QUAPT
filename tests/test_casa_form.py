@@ -196,3 +196,32 @@ def test_page_text_goes_through_rules_and_review():
     assert res.fields["pan"].value == "GBLPS8743A"
     assert res.fields["account_type"].review_required is True
     assert res.status == "needs_review"
+
+
+VIKRAM_PAGE_TEXT = """Name: ✓ Mr. □ Mr. ✓ □ I ✓ K ✓ A □ M ✓ R □ A ✓ T ✓ H ✓ O ✓ R ✓ E
+Date of Birth: 2 4 - 0 9 - 1 9 9 1
+PAN No. ✓ PA □ PA □ FN K G T P D 3 2 9 8 F Validation Field
+MOBILE No. 9 8 4 0 1 2 3 4 5 6 Mobile No. Mobie No. SALARIED
+ACCOUNT DETAILS: ✓ SAVINGS □ Safafilat Date of points
+Address: □ Otter: ___ Occupation: SOFTWARE ENGINEER
+INITIAL DEPOSIT: Amount: 12,000.00 Currency: INR Cash dep: ✓ Payment: INR
+OPT-IN SERVICES: ✓ Cheque book ✓ Debit card ✓ Internet banking"""
+
+
+def test_page_text_with_label_values_and_tick_glyphs():
+    f = fields_from_ocr_text(VIKRAM_PAGE_TEXT)
+    assert f["pan"] == "KGTPD3298F"
+    assert f["mobile"] == "9840123456"
+    assert f["initial_deposit_amount"] == "12,000.00"
+    assert f["account_type"] == "SAVINGS"
+    assert f["opt_in_cheque_book"] is True
+    assert f["opt_in_debit_card"] is True
+    assert f["opt_in_internet_banking"] is True
+    assert "RATHORE" in f["applicant_name"]
+    assert "MR" not in f["applicant_name"].split()
+
+
+def test_empty_box_glyph_is_false_and_missing_tick_is_null():
+    f = fields_from_ocr_text("☐ Cheque book\nDebit card\n")
+    assert f["opt_in_cheque_book"] is False
+    assert f["opt_in_debit_card"] is None

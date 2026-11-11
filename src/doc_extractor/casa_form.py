@@ -349,6 +349,7 @@ def ground_fields(result: CasaFormResult, tokens: list) -> CasaFormResult:
 # type are not in the text, so they stay null and go to review.
 # ---------------------------------------------------------------------------
 
+_HONORIFICS = {"MR", "MRS", "MS", "MISS", "DR", "COR"}
 _LABEL_WORDS = {"APPLICANT", "NAME", "MR", "MR.", "COR", "COR.", "PA", "VALIDATION", "FIELD", "APPLICANT NAME"}
 
 
@@ -356,13 +357,46 @@ def _lines(text: str) -> list:
     return [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines() if ln.strip()]
 
 
+def _label_tail(line: str, label_re: str) -> str:
+    """Text after the label keyword on the same line (the value is often printed there)."""
+    m = re.search(label_re, line, re.IGNORECASE)
+    return line[m.end():].lstrip(" :") if m else ""
+
+
 def _after(lines: list, label_re: str, span: int = 1) -> list:
-    """Lines following the first line that matches label_re (the label's own line is included after the colon)."""
+    """The label's own line after the keyword, then the following lines."""
     for i, ln in enumerate(lines):
         if re.search(label_re, ln, re.IGNORECASE):
-            tail = re.split(r":", ln, maxsplit=1)[1].strip() if ":" in ln else ""
+            tail = _label_tail(ln, label_re)
             return ([tail] if tail else []) + lines[i + 1:i + 1 + span]
     return []
+
+
+def _name_from_lines(name_lines: list) -> Optional[str]:
+    """Joins the printed name from its lines: checkbox glyphs, honorifics and label words are dropped;
+    spaced single letters ("P R I Y A") are joined into one word."""
+    words: list = []
+    for ln in name_lines:
+        cleaned = re.sub(r"\s+", " ", re.sub(r"[^A-Za-z .]", " ", ln)).strip()
+        if not cleaned or re.search(r"VALIDATION|FIELD", cleaned, re.IGNORECASE):
+            continue
+        tokens = [t.replace(".", "") for t in cleaned.split(" ") if t.replace(".", "")]
+        tokens = [t for t in tokens if t.upper() not in _HONORIFICS and t.upper() not in _LABEL_WORDS]
+        if len(tokens) == 1 and tokens[0].islower():  # a stray checkbox letter such as "v"
+            continue
+        run: list = []
+        for t in tokens:
+            if len(t) == 1 and t.isalpha():
+                run.append(t.upper())
+                continue
+            if run:
+                words.append("".join(run))
+                run = []
+            words.append(t.upper())
+        if run:
+            words.append("".join(run))
+    name = " ".join(words)
+    return name or None
 
 
 def fields_from_ocr_text(text: str) -> Dict[str, Any]:
@@ -376,29 +410,9 @@ def fields_from_ocr_text(text: str) -> Dict[str, Any]:
         idx_dob = next(i for i, ln in enumerate(lines) if "DATE OF BIRTH" in ln.upper())
         start = next((i for i, ln in enumerate(lines[:idx_dob]) if "APPLICANT" in ln.upper() or re.search(r"\bNAME\b", ln, re.IGNORECASE)), None)
         if start is not None:
-            words = []  # each entry is one printed word; spaced letters ("P R I Y A") join into one
-            for ln in lines[start + 1:idx_dob]:
-                cleaned = re.sub(r"[^A-Za-z .]", " ", ln)  # drop checkbox glyphs and symbols
-                cleaned = re.sub(r"\s+", " ", cleaned).strip()
-                if not cleaned or cleaned.upper() in _LABEL_WORDS:
-                    continue
-                if re.search(r"VALIDATION|FIELD", cleaned, re.IGNORECASE):
-                    continue
-                tokens = [t for t in cleaned.split(" ") if t]
-                if len(tokens) == 1 and tokens[0].islower():  # stray checkbox letter such as "v"
-                    continue
-                run: list = []
-                for t in tokens:
-                    if len(t) == 1 and t.isalpha():
-                        run.append(t.upper())
-                    else:
-                        if run:
-                            words.append("".join(run)); run = []
-                        words.append(t.upper().replace(".", ""))
-                if run:
-                    words.append("".join(run))
-            name = " ".join(w for w in words if len(w) >= 2 or w.isalpha())
-            out["applicant_name"] = name or None
+            out["applicant_name"] = _name_from_lines(
+                [_label_tail(lines[start], r"NAME|APPLICANT")] + lines[start + 1:idx_dob]
+            )
 
     # Date of birth: a dd-mm-yyyy shape after the label, spaces allowed inside.
     dob_text = re.sub(r"\s", "", " ".join(_after(lines, r"DATE OF BIRTH", span=1)))
@@ -417,6 +431,19 @@ def fields_from_ocr_text(text: str) -> Dict[str, Any]:
     m = re.search(r"\d{10}", mob_text)
     if m:
         out["mobile"] = m.group(0)
+
+    # Account type and opt-ins: a tick glyph before the label means ticked; an empty box glyph means not ticked.
+    tick = r"(?:✓|☑|✔|√)"
+    empty = r"(?:☐|□)"
+    if re.search(tick + r"\s*SAVINGS", joined, re.IGNORECASE):
+        out["account_type"] = "SAVINGS"
+    elif re.search(tick + r"\s*CURRENT", joined, re.IGNORECASE):
+        out["account_type"] = "CURRENT"
+    for field, label in (("opt_in_cheque_book", "Cheque\s*book"), ("opt_in_debit_card", "Debit\s*card"), ("opt_in_internet_banking", "Internet\s*banking")):
+        if re.search(tick + r"\s*" + label, joined, re.IGNORECASE):
+            out[field] = True
+        elif re.search(empty + r"\s*" + label, joined, re.IGNORECASE):
+            out[field] = False
 
     # Initial deposit: number after "Amount:".
     dep = " ".join(_after(lines, r"^Amount\s*:?$|Amount:", span=1))
