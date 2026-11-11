@@ -91,6 +91,49 @@ def trim_repeated_lines(text: str) -> tuple:
     return "\n".join(kept), trimmed
 
 
+
+class QwenVLCasaReader:
+    """
+    Instruction-following vision-language model (Qwen2.5-VL-Instruct). Unlike PaddleOCR-VL it
+    follows the DOC-01 JSON prompt. Fits the free Colab T4 GPU in fp16. Same interface as
+    PaddleVLCasaReader, so read_casa_form works with either.
+    """
+
+    def __init__(self, model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct", max_new_tokens: int = 400) -> None:
+        self.model_id = model_id
+        self.max_new_tokens = max_new_tokens
+        self._processor = None
+        self._model = None
+        self._device = None
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if self._device == "cuda" else torch.float32
+        self._processor = AutoProcessor.from_pretrained(self.model_id)
+        self._model = AutoModelForImageTextToText.from_pretrained(self.model_id, dtype=dtype).to(self._device).eval()
+        logger.info("Qwen2.5-VL loaded on %s", self._device)
+
+    def generate_text(self, image: Image.Image, prompt: str = PROMPT) -> str:
+        import torch
+
+        self._load()
+        messages = [{
+            "role": "user",
+            "content": [{"type": "image", "image": image.convert("RGB")}, {"type": "text", "text": prompt}],
+        }]
+        inputs = self._processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt",
+        ).to(self._device)
+        with torch.no_grad():
+            out = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        trimmed = out[:, inputs["input_ids"].shape[1]:]
+        return self._processor.batch_decode(trimmed, skip_special_tokens=True)[0]
+
 def ocr_tokens(image: Image.Image) -> list:
     """Printed-text tokens with boxes, from RapidOCR (CPU). Used only as evidence (FR-EXT-004)."""
     import numpy as np
