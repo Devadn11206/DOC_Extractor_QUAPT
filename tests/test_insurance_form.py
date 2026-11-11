@@ -56,3 +56,17 @@ def test_unparseable_model_output_sends_fields_to_review():
     res = normalise_insurance_fields("no json here")
     assert res.status == "needs_review"
     assert res.flags[0]["code"] == "MODEL_OUTPUT_UNPARSEABLE"
+
+
+def test_nominee_age_is_kept_and_out_of_range_is_not_guessed():
+    data = dict(BASE, nominees=[{"name": "Eleanor Pendelton", "relationship": "Spouse", "age": 42, "share_percentage": 70},
+                                {"name": "Thomas Pendelton", "relationship": "Son", "age": 400, "share_percentage": 30}])
+    res = normalise_insurance_fields(data)
+    assert [n["age"] for n in res.nominees] == [42, None]
+
+
+def test_doc02_never_auto_approves_without_evidence_check():
+    data = dict(BASE, has_diabetes=None, has_hypertension=None, has_tobacco_use=None)
+    res = normalise_insurance_fields(data)
+    assert res.status == "needs_review"
+    assert any(f["code"] == "EVIDENCE_NOT_CHECKED" for f in res.flags)

@@ -118,9 +118,11 @@ def normalise_insurance_fields(model_output: Any) -> InsuranceResult:
             continue
         nm = _text(item.get("name"))
         share = _money(item.get("share_percentage"))
+        age = _money(item.get("age"))
         nominees.append({
             "name": nm.upper() if nm else None,
             "relationship": _text(item.get("relationship")),
+            "age": int(age) if age is not None and float(age).is_integer() and 0 < age < 120 else None,
             "share_percentage": share,
         })
     res.nominees = nominees
@@ -134,7 +136,7 @@ def normalise_insurance_fields(model_output: Any) -> InsuranceResult:
     flagged = [k for k, f in res.fields.items() if f.review_required]
     if flagged or any(f["code"] in ("NOMINEE_NAME_MISSING", "NOMINEE_SHARE_MISMATCH") for f in res.flags):
         res.flags.append({"code": "FIELDS_REQUIRE_REVIEW", "fields": flagged})
-        res.status = "needs_review"
-    else:
-        res.status = "auto_approved"
+    # No evidence check exists for DOC-02 yet (PRD FR-EXT-004), so it never auto-approves.
+    res.flags.append({"code": "EVIDENCE_NOT_CHECKED", "fields": ["all"]})
+    res.status = "needs_review"
     return res
