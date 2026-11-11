@@ -105,15 +105,22 @@ def test_grounded_values_get_evidence_and_keep_their_value():
     assert res.fields["initial_deposit_amount"].evidence is not None
 
 
-def test_value_not_printed_on_page_is_removed_and_routed_to_review():
+def test_value_not_printed_on_page_is_kept_as_text_evidence_and_sent_to_review():
     tokens = [t for t in PRINTED_TOKENS if t["text"] != "BPWPS8491K"]
     res = ground_fields(normalise_casa_fields(FORM_PRIYA), tokens)
     pan = res.fields["pan"]
-    assert pan.value is None
-    assert pan.error == "EVIDENCE_MISSING"
+    assert pan.value == "BPWPS8491K"  # kept: model text, no printed match
+    assert pan.error == "EVIDENCE_TEXT_ONLY"
+    assert pan.evidence["source"] == "model_text" and pan.evidence["bbox"] is None
     assert pan.review_required is True
     assert res.status == "needs_review"
-    assert any(f["code"] == "EVIDENCE_MISSING" and "pan" in f["fields"] for f in res.flags)
+    assert any(f["code"] == "EVIDENCE_TEXT_ONLY" and "pan" in f["fields"] for f in res.flags)
+
+
+def test_printed_match_keeps_box_evidence():
+    res = ground_fields(normalise_casa_fields(FORM_PRIYA), PRINTED_TOKENS)
+    assert res.fields["pan"].evidence["source"] == "ocr_box"
+    assert res.fields["pan"].evidence["bbox"] is not None
 
 
 def test_checkbox_values_are_not_auto_approved_without_checkbox_evidence():
@@ -225,3 +232,12 @@ def test_empty_box_glyph_is_false_and_missing_tick_is_null():
     f = fields_from_ocr_text("☐ Cheque book\nDebit card\n")
     assert f["opt_in_cheque_book"] is False
     assert f["opt_in_debit_card"] is None
+
+
+def test_looping_model_output_is_trimmed_and_flagged():
+    from doc_extractor.casa_reader import trim_repeated_lines
+    looped = "Name: ✓ Mr.\n" + "[ ] No\n[X] No\n[X] Yes\n" * 40
+    clean, trimmed = trim_repeated_lines(looped)
+    assert trimmed is True
+    assert clean.count("[X] Yes") == 3
+    assert "Name: ✓ Mr." in clean

@@ -308,7 +308,7 @@ def ground_fields(result: CasaFormResult, tokens: list) -> CasaFormResult:
         owners.extend([idx] * len(norm))
     haystack = "".join(chars)
 
-    missing = []
+    text_only = []
     for name, f in result.fields.items():
         if name in _CHECKBOX_FIELDS:
             if f.value is not None:
@@ -319,11 +319,13 @@ def ground_fields(result: CasaFormResult, tokens: list) -> CasaFormResult:
             continue
         pos, needle = _find_printed(haystack, name, f.value)
         if pos < 0:
-            f.value = None
-            f.null_reason = "absent"
+            # No printed match (typical for handwriting). Keep the model's value, but only as
+            # text evidence with no box, and always send it to review (accepted deviation from
+            # FR-EXT-004 until bounding boxes exist for handwriting). It is never auto-approved.
             f.review_required = True
-            f.error = "EVIDENCE_MISSING"
-            missing.append(name)
+            f.error = "EVIDENCE_TEXT_ONLY"
+            f.evidence = {"source": "model_text", "page": 1, "bbox": None, "text": str(f.value)}
+            text_only.append(name)
             continue
         hit = sorted(set(owners[pos:pos + len(needle)]))
         boxes = [tokens[i]["bbox"] for i in hit if tokens[i].get("bbox")]
@@ -331,13 +333,14 @@ def ground_fields(result: CasaFormResult, tokens: list) -> CasaFormResult:
             x0 = min(b[0] for b in boxes); y0 = min(b[1] for b in boxes)
             x1 = max(b[2] for b in boxes); y1 = max(b[3] for b in boxes)
             f.evidence = {
+                "source": "ocr_box",
                 "page": tokens[hit[0]].get("page", 1),
                 "bbox": [x0, y0, x1, y1],
                 "text": " ".join(tokens[i]["text"] for i in hit),
             }
 
-    if missing:
-        result.flags.append({"code": "EVIDENCE_MISSING", "fields": missing})
+    if text_only:
+        result.flags.append({"code": "EVIDENCE_TEXT_ONLY", "fields": text_only})
     if any(f.review_required for f in result.fields.values()):
         result.status = "needs_review"
     return result

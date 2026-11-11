@@ -60,9 +60,79 @@ class PaddleVLCasaReader:
         chat = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self._processor(text=[chat], images=[image.convert("RGB")], return_tensors="pt").to(self._device)
         with torch.no_grad():
-            out = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+            out = self._model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                repetition_penalty=1.05,  # discourages the model from looping on repeated boxes
+            )
         return self._processor.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
 
+
+MAX_LINE_REPEATS = 3
+
+
+def trim_repeated_lines(text: str) -> tuple:
+    """
+    Drops lines that repeat more than MAX_LINE_REPEATS times (the model sometimes loops on a
+    checkbox pattern until it hits the token limit). Returns (clean_text, was_trimmed).
+    """
+    seen: dict = {}
+    kept = []
+    trimmed = False
+    for line in text.splitlines():
+        key = line.strip()
+        if key:
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] > MAX_LINE_REPEATS:
+                trimmed = True
+                continue
+        kept.append(line)
+    return "\n".join(kept), trimmed
+
+
+
+class QwenVLCasaReader:
+    """
+    Instruction-following vision-language model (Qwen2.5-VL-Instruct). Unlike PaddleOCR-VL it
+    follows the DOC-01 JSON prompt. Fits the free Colab T4 GPU in fp16. Same interface as
+    PaddleVLCasaReader, so read_casa_form works with either.
+    """
+
+    def __init__(self, model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct", max_new_tokens: int = 400) -> None:
+        self.model_id = model_id
+        self.max_new_tokens = max_new_tokens
+        self._processor = None
+        self._model = None
+        self._device = None
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if self._device == "cuda" else torch.float32
+        self._processor = AutoProcessor.from_pretrained(self.model_id)
+        self._model = AutoModelForImageTextToText.from_pretrained(self.model_id, dtype=dtype).to(self._device).eval()
+        logger.info("Qwen2.5-VL loaded on %s", self._device)
+
+    def generate_text(self, image: Image.Image, prompt: str = PROMPT) -> str:
+        import torch
+
+        self._load()
+        messages = [{
+            "role": "user",
+            "content": [{"type": "image", "image": image.convert("RGB")}, {"type": "text", "text": prompt}],
+        }]
+        inputs = self._processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt",
+        ).to(self._device)
+        with torch.no_grad():
+            out = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+        trimmed = out[:, inputs["input_ids"].shape[1]:]
+        return self._processor.batch_decode(trimmed, skip_special_tokens=True)[0]
 
 def ocr_tokens(image: Image.Image) -> list:
     """Printed-text tokens with boxes, from RapidOCR (CPU). Used only as evidence (FR-EXT-004)."""
@@ -107,6 +177,7 @@ def read_casa_form(
 
     # The model may answer with JSON (if it follows the prompt) or with plain page text
     # (the PaddleOCR-VL "OCR:" behaviour). Use JSON when present, otherwise read the labels.
+    raw_text, looped = trim_repeated_lines(raw_text)
     model_fields = parse_model_json(raw_text)
     if model_fields is None and raw_text.strip():
         model_fields = fields_from_ocr_text(raw_text)
@@ -126,6 +197,9 @@ def read_casa_form(
     out = result.to_dict()
     out["timing"] = {"model_seconds": model_secs}
     out["raw_model_output"] = raw_text
+    if looped:
+        out["flags"].append({"code": "MODEL_OUTPUT_LOOPED", "message": "repeated lines removed"})
+        out["status"] = "needs_review"
     if model_error:
         out["flags"].append({"code": "MODEL_ERROR", "message": model_error})
         out["status"] = "needs_review"
