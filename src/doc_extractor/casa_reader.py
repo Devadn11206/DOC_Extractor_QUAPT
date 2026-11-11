@@ -15,7 +15,14 @@ from typing import Any, Dict, Optional, Union
 
 from PIL import Image
 
-from doc_extractor.casa_form import CasaFormResult, PROMPT, ground_fields, normalise_casa_fields
+from doc_extractor.casa_form import (
+    CasaFormResult,
+    PROMPT,
+    fields_from_ocr_text,
+    ground_fields,
+    normalise_casa_fields,
+    parse_model_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +105,12 @@ def read_casa_form(
         model_error = str(exc)
     model_secs = round(time.perf_counter() - started, 2)
 
-    result: CasaFormResult = normalise_casa_fields(raw_text)
+    # The model may answer with JSON (if it follows the prompt) or with plain page text
+    # (the PaddleOCR-VL "OCR:" behaviour). Use JSON when present, otherwise read the labels.
+    model_fields = parse_model_json(raw_text)
+    if model_fields is None and raw_text.strip():
+        model_fields = fields_from_ocr_text(raw_text)
+    result: CasaFormResult = normalise_casa_fields(model_fields if model_fields is not None else raw_text)
     try:
         result = ground_fields(result, ocr_tokens(image))
     except Exception as exc:  # no OCR evidence means no value can be trusted

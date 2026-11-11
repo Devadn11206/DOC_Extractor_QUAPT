@@ -128,3 +128,100 @@ def test_underage_applicant_is_routed_to_review():
     assert dob.review_required is True
     assert dob.error == "UNDERAGE_APPLICANT"
     assert res.status == "needs_review"
+
+
+from doc_extractor.casa_form import fields_from_ocr_text  # noqa: E402
+
+RAHUL_PAGE_TEXT = """Name
+Mr.
+Cor.
+Applicant
+Name
+RAHUL
+SHARMA
+DATE OF BIRTH
+15 - 08- 1995
+PA
+Validation Field
+PAN NO.
+GBLPS8743A
+(Validation Field)
+MOBILE NO.
+9876543210
+Mobilee No.
+SALARIED
+Amount:
+5000.00
+Currency:
+INR
+Signature of Applicant:
+Rahul Sharma"""
+
+PRIYA_PAGE_TEXT = """NAME:
+☑ Mr.
+☐ v
+☐ P R I Y A
+S E N G U P T A
+DATE OF BIRTH:
+2 8 - 1 1 - 1 9 9 2
+PAN NO.
+PA
+B P W P S 8 4 9 1 K
+MOBILE NO.
+9 8 3 0 1 5 4 6 7 2
+Amount: 10,000.00 Currency: INR Cash dep: ☑ Payment: INR"""
+
+
+def test_page_text_from_rahul_form_is_read_correctly():
+    f = fields_from_ocr_text(RAHUL_PAGE_TEXT)
+    assert f["applicant_name"] == "RAHUL SHARMA"
+    assert f["date_of_birth"] == "15-08-1995"
+    assert f["pan"] == "GBLPS8743A"
+    assert f["mobile"] == "9876543210"
+    assert f["initial_deposit_amount"] == "5000.00"
+    assert f["account_type"] is None  # not in the text: review
+
+
+def test_spaced_letters_and_checkbox_glyphs_are_handled():
+    f = fields_from_ocr_text(PRIYA_PAGE_TEXT)
+    assert f["applicant_name"] == "PRIYA SENGUPTA"
+    assert f["date_of_birth"] == "28-11-1992"
+    assert f["pan"] == "BPWPS8491K"
+    assert f["mobile"] == "9830154672"
+    assert f["initial_deposit_amount"] == "10,000.00"
+
+
+def test_page_text_goes_through_rules_and_review():
+    res = normalise_casa_fields(fields_from_ocr_text(RAHUL_PAGE_TEXT))
+    assert res.fields["pan"].value == "GBLPS8743A"
+    assert res.fields["account_type"].review_required is True
+    assert res.status == "needs_review"
+
+
+VIKRAM_PAGE_TEXT = """Name: ✓ Mr. □ Mr. ✓ □ I ✓ K ✓ A □ M ✓ R □ A ✓ T ✓ H ✓ O ✓ R ✓ E
+Date of Birth: 2 4 - 0 9 - 1 9 9 1
+PAN No. ✓ PA □ PA □ FN K G T P D 3 2 9 8 F Validation Field
+MOBILE No. 9 8 4 0 1 2 3 4 5 6 Mobile No. Mobie No. SALARIED
+ACCOUNT DETAILS: ✓ SAVINGS □ Safafilat Date of points
+Address: □ Otter: ___ Occupation: SOFTWARE ENGINEER
+INITIAL DEPOSIT: Amount: 12,000.00 Currency: INR Cash dep: ✓ Payment: INR
+OPT-IN SERVICES: ✓ Cheque book ✓ Debit card ✓ Internet banking"""
+
+
+def test_page_text_with_label_values_and_tick_glyphs():
+    f = fields_from_ocr_text(VIKRAM_PAGE_TEXT)
+    assert f["pan"] == "KGTPD3298F"
+    assert f["mobile"] == "9840123456"
+    assert f["initial_deposit_amount"] == "12,000.00"
+    assert f["account_type"] == "SAVINGS"
+    assert f["opt_in_cheque_book"] is True
+    assert f["opt_in_debit_card"] is True
+    assert f["opt_in_internet_banking"] is True
+    assert "RATHORE" in f["applicant_name"]
+    assert "MR" not in f["applicant_name"].split()
+
+
+def test_empty_box_glyph_is_false_and_missing_tick_is_null():
+    f = fields_from_ocr_text("☐ Cheque book\nDebit card\n")
+    assert f["opt_in_cheque_book"] is False
+    assert f["opt_in_debit_card"] is None
