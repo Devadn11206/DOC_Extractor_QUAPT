@@ -232,3 +232,12 @@ def test_empty_box_glyph_is_false_and_missing_tick_is_null():
     f = fields_from_ocr_text("☐ Cheque book\nDebit card\n")
     assert f["opt_in_cheque_book"] is False
     assert f["opt_in_debit_card"] is None
+
+
+def test_looping_model_output_is_trimmed_and_flagged():
+    from doc_extractor.casa_reader import trim_repeated_lines
+    looped = "Name: ✓ Mr.\n" + "[ ] No\n[X] No\n[X] Yes\n" * 40
+    clean, trimmed = trim_repeated_lines(looped)
+    assert trimmed is True
+    assert clean.count("[X] Yes") == 3
+    assert "Name: ✓ Mr." in clean
