@@ -341,3 +341,87 @@ def ground_fields(result: CasaFormResult, tokens: list) -> CasaFormResult:
     if any(f.review_required for f in result.fields.values()):
         result.status = "needs_review"
     return result
+
+
+# ---------------------------------------------------------------------------
+# Reading values from the model's plain-text page output (PaddleOCR-VL "OCR:" task).
+# Each value is taken from the text next to its printed label. Checkboxes and account
+# type are not in the text, so they stay null and go to review.
+# ---------------------------------------------------------------------------
+
+_LABEL_WORDS = {"APPLICANT", "NAME", "MR", "MR.", "COR", "COR.", "PA", "VALIDATION", "FIELD", "APPLICANT NAME"}
+
+
+def _lines(text: str) -> list:
+    return [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines() if ln.strip()]
+
+
+def _after(lines: list, label_re: str, span: int = 1) -> list:
+    """Lines following the first line that matches label_re (the label's own line is included after the colon)."""
+    for i, ln in enumerate(lines):
+        if re.search(label_re, ln, re.IGNORECASE):
+            tail = re.split(r":", ln, maxsplit=1)[1].strip() if ":" in ln else ""
+            return ([tail] if tail else []) + lines[i + 1:i + 1 + span]
+    return []
+
+
+def fields_from_ocr_text(text: str) -> Dict[str, Any]:
+    """Maps the model's plain-text page output to DOC-01 field values (or None)."""
+    lines = _lines(text)
+    joined = " ".join(lines)
+    out: Dict[str, Any] = {k: None for k in FIELD_SPEC}
+
+    # Name: the line(s) between "Applicant" and the date-of-birth label, letters only.
+    if "DATE OF BIRTH" in joined.upper():
+        idx_dob = next(i for i, ln in enumerate(lines) if "DATE OF BIRTH" in ln.upper())
+        start = next((i for i, ln in enumerate(lines[:idx_dob]) if "APPLICANT" in ln.upper() or re.search(r"\bNAME\b", ln, re.IGNORECASE)), None)
+        if start is not None:
+            words = []  # each entry is one printed word; spaced letters ("P R I Y A") join into one
+            for ln in lines[start + 1:idx_dob]:
+                cleaned = re.sub(r"[^A-Za-z .]", " ", ln)  # drop checkbox glyphs and symbols
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if not cleaned or cleaned.upper() in _LABEL_WORDS:
+                    continue
+                if re.search(r"VALIDATION|FIELD", cleaned, re.IGNORECASE):
+                    continue
+                tokens = [t for t in cleaned.split(" ") if t]
+                if len(tokens) == 1 and tokens[0].islower():  # stray checkbox letter such as "v"
+                    continue
+                run: list = []
+                for t in tokens:
+                    if len(t) == 1 and t.isalpha():
+                        run.append(t.upper())
+                    else:
+                        if run:
+                            words.append("".join(run)); run = []
+                        words.append(t.upper().replace(".", ""))
+                if run:
+                    words.append("".join(run))
+            name = " ".join(w for w in words if len(w) >= 2 or w.isalpha())
+            out["applicant_name"] = name or None
+
+    # Date of birth: a dd-mm-yyyy shape after the label, spaces allowed inside.
+    dob_text = re.sub(r"\s", "", " ".join(_after(lines, r"DATE OF BIRTH", span=1)))
+    m = re.search(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", dob_text)
+    if m:
+        out["date_of_birth"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # PAN: letters and digits, spaces removed, over the label and the next lines.
+    pan_text = "".join(re.sub(r"[^A-Za-z0-9]", "", s) for s in _after(lines, r"\bPAN\b", span=3)).upper()
+    m = re.search(r"[A-Z]{5}[0-9]{4}[A-Z]", pan_text)
+    if m:
+        out["pan"] = m.group(0)
+
+    # Mobile: 10 digits after the first mobile label.
+    mob_text = "".join(re.sub(r"[^0-9]", "", s) for s in _after(lines, r"MOBILE NO", span=1))
+    m = re.search(r"\d{10}", mob_text)
+    if m:
+        out["mobile"] = m.group(0)
+
+    # Initial deposit: number after "Amount:".
+    dep = " ".join(_after(lines, r"^Amount\s*:?$|Amount:", span=1))
+    m = re.search(r"\d[\d,]*\.?\d*", dep)
+    if m:
+        out["initial_deposit_amount"] = m.group(0)
+
+    return out
