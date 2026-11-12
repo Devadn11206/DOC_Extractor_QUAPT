@@ -52,7 +52,7 @@ class PaddleVLCasaReader:
         self._model = AutoModelForImageTextToText.from_pretrained(self.model_id, dtype=dtype).to(self._device).eval()
         logger.info("PaddleOCR-VL loaded on %s", self._device)
 
-    def generate_text(self, image: Image.Image, prompt: str = PROMPT) -> str:
+    def generate_text(self, image: Image.Image, prompt: str = PROMPT, repetition_penalty: float = 1.05) -> str:
         """One model call on a page image. Returns the raw text the model produced."""
         import torch
 
@@ -65,7 +65,7 @@ class PaddleVLCasaReader:
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=False,
-                repetition_penalty=1.05,  # discourages the model from looping on repeated boxes
+                repetition_penalty=repetition_penalty,  # discourages looping on repeated boxes
             )
         return self._processor.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
 
@@ -129,7 +129,7 @@ class QwenVLCasaReader:
         self._model = AutoModelForImageTextToText.from_pretrained(self.model_id, dtype=dtype).to(self._device).eval()
         logger.info("Qwen2.5-VL loaded on %s", self._device)
 
-    def generate_text(self, image: Image.Image, prompt: str = PROMPT) -> str:
+    def generate_text(self, image: Image.Image, prompt: str = PROMPT, repetition_penalty: float = 1.05) -> str:
         import torch
 
         self._load()
@@ -141,7 +141,12 @@ class QwenVLCasaReader:
             messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt",
         ).to(self._device)
         with torch.no_grad():
-            out = self._model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False)
+            out = self._model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=False,
+                repetition_penalty=repetition_penalty,
+            )
         trimmed = out[:, inputs["input_ids"].shape[1]:]
         return self._processor.batch_decode(trimmed, skip_special_tokens=True)[0]
 
@@ -177,8 +182,13 @@ def read_casa_form(
     reader = reader or PaddleVLCasaReader()
 
     started = time.perf_counter()
+    retried = False
     try:
         raw_text = reader.generate_text(image)
+        if not trim_repeated_lines(raw_text)[0].strip():
+            # Runaway or empty output: retry once with a stronger repetition penalty.
+            raw_text = reader.generate_text(image, repetition_penalty=1.3)
+            retried = True
         model_error = None
     except Exception as exc:  # fail closed: no guessed values
         logger.exception("PaddleOCR-VL failed")
@@ -211,6 +221,10 @@ def read_casa_form(
     if looped:
         out["flags"].append({"code": "MODEL_OUTPUT_LOOPED", "message": "repeated lines removed"})
         out["status"] = "needs_review"
+    if retried:
+        out["flags"].append({"code": "MODEL_RETRIED", "message": "first output unusable; retried with stronger repetition penalty"})
+    if not raw_text.strip() and not model_error:
+        out["flags"].append({"code": "MODEL_FAILED", "message": "model returned no usable text"})
     if model_error:
         out["flags"].append({"code": "MODEL_ERROR", "message": model_error})
         out["status"] = "needs_review"

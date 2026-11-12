@@ -266,3 +266,37 @@ def test_yes_no_text_from_model_is_read_as_boolean():
     assert _yes_no("maybe") is None
     res = normalise_casa_fields(dict(FORM_PRIYA, opt_in_debit_card="YES[X]"))
     assert res.fields["opt_in_debit_card"].value is True
+
+
+class _RunawayThenGood:
+    def __init__(self):
+        self.calls = []
+
+    def generate_text(self, image, prompt=None, repetition_penalty=1.05):
+        self.calls.append(repetition_penalty)
+        if repetition_penalty < 1.2:
+            return "!" * 500
+        return '{"applicant_name": "PRIYA SENGUPTA", "date_of_birth": "28-11-1992"}'
+
+
+class _AlwaysRunaway:
+    def generate_text(self, image, prompt=None, repetition_penalty=1.05):
+        return "!" * 500
+
+
+def test_runaway_first_output_is_retried_with_stronger_penalty():
+    from PIL import Image
+    from doc_extractor.casa_reader import read_casa_form
+    reader = _RunawayThenGood()
+    out = read_casa_form(Image.new("RGB", (10, 10), "white"), reader)
+    assert reader.calls == [1.05, 1.3]
+    assert any(f["code"] == "MODEL_RETRIED" for f in out["flags"])
+    assert out["fields"]["applicant_name"]["value"] is None or out["fields"]["applicant_name"]["value"] == "PRIYA SENGUPTA"
+
+
+def test_still_failing_output_is_flagged_model_failed():
+    from PIL import Image
+    from doc_extractor.casa_reader import read_casa_form
+    out = read_casa_form(Image.new("RGB", (10, 10), "white"), _AlwaysRunaway())
+    assert any(f["code"] == "MODEL_FAILED" for f in out["flags"])
+    assert out["status"] == "needs_review"
