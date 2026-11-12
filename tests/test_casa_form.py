@@ -254,3 +254,15 @@ def test_single_character_runaway_output_is_removed():
 def test_prompt_tells_model_to_null_boxes_not_on_form():
     from doc_extractor.casa_form import PROMPT
     assert "use null" in PROMPT and "ATM Debit Card" in PROMPT
+
+
+def test_yes_no_text_from_model_is_read_as_boolean():
+    from doc_extractor.casa_form import _yes_no
+    assert _yes_no("YES") is True
+    assert _yes_no("YES[X]") is True
+    assert _yes_no("[X] Yes") is True
+    assert _yes_no("NO") is False
+    assert _yes_no("[ ] No") is False
+    assert _yes_no("maybe") is None
+    res = normalise_casa_fields(dict(FORM_PRIYA, opt_in_debit_card="YES[X]"))
+    assert res.fields["opt_in_debit_card"].value is True

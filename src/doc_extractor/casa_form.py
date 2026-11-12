@@ -123,6 +123,24 @@ def _clean_text(value: Any) -> Optional[str]:
     return s or None
 
 
+def _yes_no(raw: Any) -> Optional[bool]:
+    """Reads true/false, YES/NO and tick/empty-box text such as 'YES[X]' or '[ ] No'. None if unclear."""
+    if not isinstance(raw, str):
+        return None
+    s = re.sub(r"\s+", "", raw).upper()
+    if s in ("TRUE", "FALSE"):
+        return s == "TRUE"
+    if "YES" in s:
+        return True
+    if "NO" in s:
+        return False
+    if "[X]" in s:
+        return True
+    if "[]" in s:
+        return False
+    return None
+
+
 # Required fields: if empty, the document goes to review (FR-CNF-003).
 REQUIRED_FIELDS = {"applicant_name", "date_of_birth", "account_type"}
 
@@ -132,10 +150,11 @@ def _normalise_field(name: str, raw: Any) -> FieldResult:
     res = FieldResult(raw=None if raw is None else str(raw))
 
     if kind == "bool":
+        yes_no = _yes_no(raw)
         if isinstance(raw, bool):
             res.value = raw
-        elif isinstance(raw, str) and raw.strip().lower() in ("true", "false"):
-            res.value = raw.strip().lower() == "true"
+        elif yes_no is not None:
+            res.value = yes_no
         else:
             res.null_reason = "absent" if raw is None else "illegible"
             res.review_required = True
