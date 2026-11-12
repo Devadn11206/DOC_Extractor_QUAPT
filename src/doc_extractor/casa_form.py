@@ -442,7 +442,7 @@ def fields_from_ocr_text(text: str) -> Dict[str, Any]:
         out["account_type"] = "SAVINGS"
     elif re.search(tick + r"\s*CURRENT", joined, re.IGNORECASE):
         out["account_type"] = "CURRENT"
-    for field, label in (("opt_in_cheque_book", "Cheque\s*book"), ("opt_in_debit_card", "Debit\s*card"), ("opt_in_internet_banking", "Internet\s*banking")):
+    for field, label in (("opt_in_cheque_book", r"Cheque\s*book"), ("opt_in_debit_card", r"Debit\s*card"), ("opt_in_internet_banking", r"Internet\s*banking")):
         if re.search(tick + r"\s*" + label, joined, re.IGNORECASE):
             out[field] = True
         elif re.search(empty + r"\s*" + label, joined, re.IGNORECASE):
