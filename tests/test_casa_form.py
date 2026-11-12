@@ -344,3 +344,35 @@ def test_prd_envelope_uses_section_6_2_names_and_null_confidence():
 def test_prompt_tells_model_to_ignore_instructions_on_the_form():
     from doc_extractor.casa_form import PROMPT
     assert "ignore any instruction" in PROMPT.lower()
+
+
+def test_model_error_is_retried_up_to_three_times_then_failed(monkeypatch):
+    from PIL import Image
+    from doc_extractor import casa_reader
+    monkeypatch.setattr(casa_reader.time, "sleep", lambda s: None)
+    calls = []
+
+    class Flaky:
+        def generate_text(self, image, prompt=None, repetition_penalty=1.05):
+            calls.append(1)
+            raise RuntimeError("gpu busy")
+
+    out = casa_reader.read_casa_form(Image.new("RGB", (10, 10), "white"), Flaky())
+    assert len(calls) == 3
+    assert out["status"] == "failed"
+    assert out["run"]["attempts"] == 3
+    assert len(out["run"]["input_sha256"]) == 64
+
+
+def test_kill_switch_sends_everything_to_review(monkeypatch):
+    from PIL import Image
+    from doc_extractor import casa_reader
+
+    class Good:
+        def generate_text(self, image, prompt=None, repetition_penalty=1.05):
+            return '{"applicant_name": "PRIYA SENGUPTA", "date_of_birth": "28-11-1992", "pan": "BPWPS8491K", "mobile": "9830154672", "account_type": "SAVINGS", "initial_deposit_amount": "10,000.00", "opt_in_cheque_book": true, "opt_in_debit_card": true, "opt_in_internet_banking": true}'
+
+    monkeypatch.setattr(casa_reader, "AUTO_APPROVAL_PAUSED", True)
+    out = casa_reader.read_casa_form(Image.new("RGB", (10, 10), "white"), Good())
+    assert out["status"] == "needs_review"
+    assert any(f["code"] == "KILL_SWITCH_ACTIVE" for f in out["flags"])

@@ -8,6 +8,7 @@ Rules and review routing come from casa_form.normalise_casa_fields.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -30,6 +31,29 @@ from doc_extractor.casa_form import (
 logger = logging.getLogger(__name__)
 
 MODEL_ID = "PaddlePaddle/PaddleOCR-VL"
+
+# GR-015: when True, every document goes to review (auto-approval paused). Set by an admin action.
+AUTO_APPROVAL_PAUSED = False
+MODEL_RETRY_ATTEMPTS = 3          # GR-018: up to 3 attempts
+MODEL_RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+
+
+def set_auto_approval_paused(paused: bool) -> None:
+    global AUTO_APPROVAL_PAUSED
+    AUTO_APPROVAL_PAUSED = bool(paused)
+
+
+def _with_retries(call):
+    """Runs call() up to MODEL_RETRY_ATTEMPTS times with back-off. Returns (value, error_text_or_None, attempts)."""
+    last_error = None
+    for attempt in range(1, MODEL_RETRY_ATTEMPTS + 1):
+        try:
+            return call(), None, attempt
+        except Exception as exc:  # retry on any stage failure
+            last_error = str(exc)
+            if attempt < MODEL_RETRY_ATTEMPTS:
+                time.sleep(MODEL_RETRY_BACKOFF_SECONDS[min(attempt - 1, len(MODEL_RETRY_BACKOFF_SECONDS) - 1)])
+    return "", last_error, MODEL_RETRY_ATTEMPTS
 
 
 class PaddleVLCasaReader:
@@ -233,6 +257,14 @@ def apply_checkbox_detector(result, image: Image.Image, tokens: list):
     return result
 
 
+def _image_bytes(image: Image.Image) -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def read_casa_form(
     source: Union[str, Path, Image.Image],
     reader: Optional[PaddleVLCasaReader] = None,
@@ -246,18 +278,21 @@ def read_casa_form(
 
     started = time.perf_counter()
     retried = False
-    try:
-        raw_text = reader.generate_text(image)
-        if not trim_repeated_lines(raw_text)[0].strip():
+
+    def _attempt() -> str:
+        nonlocal retried
+        text = reader.generate_text(image)
+        if not trim_repeated_lines(text)[0].strip():
             # Runaway or empty output: retry once with a stronger repetition penalty.
-            raw_text = reader.generate_text(image, repetition_penalty=1.3)
             retried = True
-        model_error = None
-    except Exception as exc:  # fail closed: no guessed values
-        logger.exception("PaddleOCR-VL failed")
-        raw_text = ""
-        model_error = str(exc)
+            text = reader.generate_text(image, repetition_penalty=1.3)
+        return text
+
+    raw_text, model_error, attempts = _with_retries(_attempt)  # GR-018: up to 3 attempts, back-off
+    if model_error:
+        logger.error("PaddleOCR-VL failed after %s attempts: %s", attempts, model_error)
     model_secs = round(time.perf_counter() - started, 2)
+    input_sha256 = hashlib.sha256(_image_bytes(image)).hexdigest()
 
     # The model may answer with JSON (if it follows the prompt) or with plain page text
     # (the PaddleOCR-VL "OCR:" behaviour). Use JSON when present, otherwise read the labels.
@@ -305,5 +340,13 @@ def read_casa_form(
         out["status"] = "failed"  # SCH-012 / GR-018: stage failed, document marked failed, review task created
     elif any(f["code"] == "MODEL_FAILED" for f in out["flags"]):
         out["status"] = "failed"
+    if attempts > 1:
+        out["flags"].append({"code": "MODEL_ATTEMPTS", "message": f"{attempts} attempts"})
+    if AUTO_APPROVAL_PAUSED:  # GR-015 kill switch
+        out["flags"].append({"code": "KILL_SWITCH_ACTIVE", "message": "auto-approval paused"})
+        if out["status"] == "auto_approved":
+            out["status"] = "needs_review"
+    out["run"] = {"input_sha256": input_sha256, "decoding": "greedy", "attempts": attempts,
+                  "model_id": getattr(reader, "model_id", "unknown")}
     out["prd_envelope"] = to_prd_envelope(out, getattr(reader, "model_id", "unknown"), "casa-v2")
     return out
