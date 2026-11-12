@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, Union
 
 from PIL import Image
 
+from doc_extractor.checkbox_detector import read_checkbox
 from doc_extractor.casa_form import (
     CasaFormResult,
     PROMPT,
@@ -189,6 +190,48 @@ def ocr_tokens(image: Image.Image) -> list:
 _RAPID = None
 
 
+# Checkbox labels as printed on the form (letters and digits only, uppercase).
+_BOX_LABELS = {
+    "opt_in_cheque_book": ["CHEQUEBOOK"],
+    "opt_in_debit_card": ["DEBITCARD"],
+    "opt_in_internet_banking": ["INTERNETBANKING"],
+}
+
+
+def apply_checkbox_detector(result, image: Image.Image, tokens: list):
+    """
+    Replaces checkbox values with the image-based reading where the detector finds the box.
+    Values stay in review until the detector is validated on real forms (no auto-approval).
+    """
+    import numpy as np
+    import cv2
+
+    bgr = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    for field_name, labels in _BOX_LABELS.items():
+        reading = read_checkbox(bgr, tokens, labels)
+        if reading is None:
+            continue
+        f = result.fields.get(field_name)
+        if f is None:
+            continue
+        f.value = reading
+        f.null_reason = None
+        f.error = "CHECKBOX_DETECTOR_UNVALIDATED"
+        f.review_required = True
+        f.evidence = {"source": "checkbox_detector", "page": 1, "bbox": None, "text": field_name}
+
+    savings = read_checkbox(bgr, tokens, ["SAVINGS"])
+    current = read_checkbox(bgr, tokens, ["CURRENT"])
+    acc = result.fields.get("account_type")
+    if acc is not None and (savings or current):
+        acc.value = "SAVINGS" if savings else "CURRENT"
+        acc.null_reason = None
+        acc.error = "CHECKBOX_DETECTOR_UNVALIDATED"
+        acc.review_required = True
+        acc.evidence = {"source": "checkbox_detector", "page": 1, "bbox": None, "text": "account_type"}
+    return result
+
+
 def read_casa_form(
     source: Union[str, Path, Image.Image],
     reader: Optional[PaddleVLCasaReader] = None,
@@ -223,7 +266,9 @@ def read_casa_form(
         model_fields = fields_from_ocr_text(raw_text)
     result: CasaFormResult = normalise_casa_fields(model_fields if model_fields is not None else raw_text)
     try:
-        result = ground_fields(result, ocr_tokens(image))
+        tokens = ocr_tokens(image)
+        result = apply_checkbox_detector(result, image, tokens)
+        result = ground_fields(result, tokens)
     except Exception as exc:  # no OCR evidence means no value can be trusted
         logger.exception("Evidence grounding failed")
         result.flags.append({"code": "EVIDENCE_UNAVAILABLE", "message": str(exc)})
