@@ -55,3 +55,6 @@ scratch/
 tmp/
 *.log
 
+
+# Personal labelled data: keep local
+labels/
