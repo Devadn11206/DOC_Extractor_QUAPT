@@ -29,11 +29,17 @@ def _norm(text: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", text.upper())
 
 
+MAX_LABEL_EXTRA_CHARS = 8  # a checkbox label is the word itself, not a sentence that contains it
+
+
 def find_label_bbox(tokens: Sequence[dict], label_words: Sequence[str]) -> Optional[Tuple[int, int, int, int]]:
-    """First OCR token whose normalised text contains one of the label words."""
+    """
+    First short OCR token that is one of the label words (e.g. "Savings", "Cheque book").
+    Long text that merely contains the word (e.g. "Please open a Savings Bank account...") is ignored.
+    """
     for tok in tokens:
         t = _norm(tok.get("text", ""))
-        if any(w in t for w in label_words):
+        if any(w in t and len(t) <= len(w) + MAX_LABEL_EXTRA_CHARS for w in label_words):
             b = tok.get("bbox")
             if b and len(b) == 4:
                 return int(b[0]), int(b[1]), int(b[2]), int(b[3])

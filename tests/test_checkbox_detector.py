@@ -62,3 +62,9 @@ def test_reader_uses_detector_for_account_type_on_real_sample_form():
     acc = out["fields"]["account_type"]
     assert acc["value"] == "SAVINGS"
     assert acc["review_required"] is True  # detector is not validated yet, so still reviewed
+
+
+def test_word_inside_a_sentence_is_not_a_checkbox_label():
+    tokens = [{"text": "Please open a Savings Bank account in the name of Mr/Ms", "bbox": [10, 10, 600, 30], "page": 1}]
+    img = np.full((100, 700, 3), 255, np.uint8)
+    assert detect_checkboxes(img, tokens, {"account": ["SAVINGS"]})["account"] is None
