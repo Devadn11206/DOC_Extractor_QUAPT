@@ -68,3 +68,10 @@ def test_word_inside_a_sentence_is_not_a_checkbox_label():
     tokens = [{"text": "Please open a Savings Bank account in the name of Mr/Ms", "bbox": [10, 10, 600, 30], "page": 1}]
     img = np.full((100, 700, 3), 255, np.uint8)
     assert detect_checkboxes(img, tokens, {"account": ["SAVINGS"]})["account"] is None
+
+
+def test_currency_read_from_ocr_when_model_omits_it():
+    import re
+    joined = re.sub(r"[^A-Z]", "", " ".join(t["text"] for t in [
+        {"text": "Amount:"}, {"text": "15,000.00"}, {"text": "Currency:"}, {"text": "I N R"}]).upper())
+    assert re.search(r"CURRENCY.{0,12}INR", joined)

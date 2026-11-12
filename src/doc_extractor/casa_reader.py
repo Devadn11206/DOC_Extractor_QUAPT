@@ -301,8 +301,12 @@ def read_casa_form(
     if model_fields is None and raw_text.strip():
         model_fields = fields_from_ocr_text(raw_text)
     result: CasaFormResult = normalise_casa_fields(model_fields if model_fields is not None else raw_text)
+    currency_seen = False
     try:
         tokens = ocr_tokens(image)
+        # "Currency" followed closely by "INR" on the page (INR may be printed in boxes: "I N R").
+        joined_ocr = re.sub(r"[^A-Z]", "", " ".join(t.get("text", "") for t in tokens).upper())
+        currency_seen = bool(re.search(r"CURRENCY.{0,12}INR", joined_ocr))
         result = apply_checkbox_detector(result, image, tokens)
         result = ground_fields(result, tokens)
     except Exception as exc:  # no OCR evidence means no value can be trusted
@@ -316,12 +320,13 @@ def read_casa_form(
                 f.error = "EVIDENCE_UNAVAILABLE"
         result.status = "needs_review"
     out = result.to_dict()
-    # Currency is printed on the form ("Currency: INR"); the field is set only when that text appears.
+    # Currency is printed on the form ("Currency: INR"); set only when INR appears in the model text or on the page.
+    inr_seen = bool(re.search(r"INR", raw_text)) or currency_seen
     if out["fields"].get("initial_deposit_amount", {}).get("value") is not None:
         out["fields"]["currency"] = {
-            "value": "INR" if re.search(r"INR", raw_text) else None,
-            "null_reason": None if re.search(r"INR", raw_text) else "absent",
-            "review_required": not re.search(r"INR", raw_text),
+            "value": "INR" if inr_seen else None,
+            "null_reason": None if inr_seen else "absent",
+            "review_required": not inr_seen,
             "validation": "not_applicable",
             "error": None,
             "evidence": None,
