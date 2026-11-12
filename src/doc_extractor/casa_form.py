@@ -285,6 +285,12 @@ def normalise_casa_fields(model_output: Any) -> CasaFormResult:
 # Booleans come from checkbox marks, not text. Their evidence needs a checkbox detector,
 # which is not part of this module, so they are routed to review until it is.
 _CHECKBOX_FIELDS = {"opt_in_cheque_book", "opt_in_debit_card", "opt_in_internet_banking"}
+# Printed label words for each checkbox (letters and digits only, uppercase).
+_CHECKBOX_LABELS = {
+    "opt_in_cheque_book": ["CHEQUEBOOK"],
+    "opt_in_debit_card": ["DEBITCARD"],
+    "opt_in_internet_banking": ["INTERNETBANKING"],
+}
 
 
 def _alnum_upper(s: str) -> str:
@@ -329,7 +335,17 @@ def ground_fields(result: CasaFormResult, tokens: list) -> CasaFormResult:
         owners.extend([idx] * len(norm))
     haystack = "".join(chars)
 
+    # Checkbox values are kept only when the box's printed label is on the page.
+    for box_field, keywords in _CHECKBOX_LABELS.items():
+        f_box = result.fields.get(box_field)
+        if f_box is not None and f_box.value is not None and not any(k in haystack for k in keywords):
+            f_box.value = None
+            f_box.null_reason = "absent"
+            f_box.review_required = True
+            f_box.error = "CHECKBOX_LABEL_NOT_FOUND"
+
     text_only = []
+    too_short = []
     for name, f in result.fields.items():
         if name in _CHECKBOX_FIELDS:
             if f.value is not None:
@@ -339,6 +355,17 @@ def ground_fields(result: CasaFormResult, tokens: list) -> CasaFormResult:
         if f.value is None:
             continue
         pos, needle = _find_printed(haystack, name, f.value)
+        if pos >= 0 and len(needle) < 3:
+            # One or two characters match almost anywhere (a digit in a date, a PIN code); not evidence.
+            pos, needle = -1, ""
+        if pos < 0 and len(_alnum_upper(str(f.value))) < 3:
+            # Too short to mean anything on its own (for example "3"): drop it rather than keep it.
+            f.value = None
+            f.null_reason = "illegible"
+            f.review_required = True
+            f.error = "EVIDENCE_TOO_SHORT"
+            too_short.append(name)
+            continue
         if pos < 0:
             # No printed match (typical for handwriting). Keep the model's value, but only as
             # text evidence with no box, and always send it to review (accepted deviation from
@@ -362,6 +389,8 @@ def ground_fields(result: CasaFormResult, tokens: list) -> CasaFormResult:
 
     if text_only:
         result.flags.append({"code": "EVIDENCE_TEXT_ONLY", "fields": text_only})
+    if too_short:
+        result.flags.append({"code": "EVIDENCE_TOO_SHORT", "fields": too_short})
     if any(f.review_required for f in result.fields.values()):
         result.status = "needs_review"
     return result

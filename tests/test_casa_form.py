@@ -308,3 +308,23 @@ def test_qwen_reader_can_be_configured_for_7b_4bit_without_loading():
     assert r.model_id.endswith("7B-Instruct")
     assert r.load_in_4bit is True
     assert r._model is None  # nothing downloaded or loaded at construction
+
+
+def test_checkbox_without_printed_label_is_null():
+    tokens = [{"text": "PRIYA DESHMUKH", "bbox": [1, 1, 9, 9], "page": 1}]
+    res = ground_fields(normalise_casa_fields(dict(FORM_PRIYA, opt_in_debit_card=True)), tokens)
+    assert res.fields["opt_in_debit_card"].value is None
+    assert res.fields["opt_in_debit_card"].error == "CHECKBOX_LABEL_NOT_FOUND"
+
+
+def test_checkbox_with_printed_label_keeps_value():
+    tokens = [{"text": "Request for ATM Debit Card", "bbox": [1, 1, 9, 9], "page": 1}]
+    res = ground_fields(normalise_casa_fields(dict(FORM_PRIYA, opt_in_debit_card=True)), tokens)
+    assert res.fields["opt_in_debit_card"].value is True
+
+
+def test_one_digit_match_is_not_evidence_for_deposit():
+    tokens = [{"text": "Date of Birth: 3 years", "bbox": [1, 1, 9, 9], "page": 1}]
+    res = ground_fields(normalise_casa_fields(dict(FORM_PRIYA, initial_deposit_amount="3")), tokens)
+    assert res.fields["initial_deposit_amount"].value is None
+    assert res.fields["initial_deposit_amount"].review_required is True
