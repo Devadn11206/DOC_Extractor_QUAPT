@@ -110,9 +110,15 @@ class QwenVLCasaReader:
     PaddleVLCasaReader, so read_casa_form works with either.
     """
 
-    def __init__(self, model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct", max_new_tokens: int = 400) -> None:
+    def __init__(
+        self,
+        model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct",
+        max_new_tokens: int = 400,
+        load_in_4bit: bool = False,
+    ) -> None:
         self.model_id = model_id
         self.max_new_tokens = max_new_tokens
+        self.load_in_4bit = load_in_4bit
         self._processor = None
         self._model = None
         self._device = None
@@ -126,8 +132,21 @@ class QwenVLCasaReader:
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if self._device == "cuda" else torch.float32
         self._processor = AutoProcessor.from_pretrained(self.model_id)
-        self._model = AutoModelForImageTextToText.from_pretrained(self.model_id, dtype=dtype).to(self._device).eval()
-        logger.info("Qwen2.5-VL loaded on %s", self._device)
+        if self.load_in_4bit and self._device == "cuda":
+            # 4-bit weights let a 7B model fit on a 16 GB T4 (needs bitsandbytes).
+            from transformers import BitsAndBytesConfig
+
+            quant = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+            self._model = AutoModelForImageTextToText.from_pretrained(
+                self.model_id, quantization_config=quant, device_map="cuda"
+            ).eval()
+        else:
+            self._model = AutoModelForImageTextToText.from_pretrained(self.model_id, dtype=dtype).to(self._device).eval()
+        logger.info("Qwen2.5-VL (%s, 4bit=%s) loaded on %s", self.model_id, self.load_in_4bit, self._device)
 
     def generate_text(self, image: Image.Image, prompt: str = PROMPT, repetition_penalty: float = 1.05) -> str:
         import torch

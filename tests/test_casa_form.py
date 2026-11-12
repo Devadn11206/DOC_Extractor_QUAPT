@@ -300,3 +300,11 @@ def test_still_failing_output_is_flagged_model_failed():
     out = read_casa_form(Image.new("RGB", (10, 10), "white"), _AlwaysRunaway())
     assert any(f["code"] == "MODEL_FAILED" for f in out["flags"])
     assert out["status"] == "needs_review"
+
+
+def test_qwen_reader_can_be_configured_for_7b_4bit_without_loading():
+    from doc_extractor.casa_reader import QwenVLCasaReader
+    r = QwenVLCasaReader(model_id="Qwen/Qwen2.5-VL-7B-Instruct", load_in_4bit=True)
+    assert r.model_id.endswith("7B-Instruct")
+    assert r.load_in_4bit is True
+    assert r._model is None  # nothing downloaded or loaded at construction
