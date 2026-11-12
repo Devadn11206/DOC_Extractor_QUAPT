@@ -241,3 +241,16 @@ def test_looping_model_output_is_trimmed_and_flagged():
     assert trimmed is True
     assert clean.count("[X] Yes") == 3
     assert "Name: ✓ Mr." in clean
+
+
+def test_single_character_runaway_output_is_removed():
+    from doc_extractor.casa_reader import trim_repeated_lines
+    clean, trimmed = trim_repeated_lines("Name: RAHUL\n" + "!" * 500)
+    assert trimmed is True
+    assert "!!!!" not in clean
+    assert "Name: RAHUL" in clean
+
+
+def test_prompt_tells_model_to_null_boxes_not_on_form():
+    from doc_extractor.casa_form import PROMPT
+    assert "use null" in PROMPT and "ATM Debit Card" in PROMPT

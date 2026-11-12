@@ -57,7 +57,9 @@ PROMPT = (
     "This is a CASA account opening form. Read it and return only a JSON object with these keys: "
     + ", ".join(FIELD_SPEC)
     + ". For each key use the value written on the form. Use null if the field is blank or unreadable. "
-    "Do not guess. Checkboxes are true when ticked and false when empty. Return only the JSON."
+    "Do not guess. Checkboxes are true when ticked and false when empty. "
+    "If the form has no box for a field (for example no cheque book box), use null for it. "
+    "The debit card field means the 'Request for ATM Debit Card' box. Return only the JSON."
 )
 
 

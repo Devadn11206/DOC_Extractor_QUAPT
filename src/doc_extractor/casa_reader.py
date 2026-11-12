@@ -9,6 +9,7 @@ Rules and review routing come from casa_form.normalise_casa_fields.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -72,6 +73,13 @@ class PaddleVLCasaReader:
 MAX_LINE_REPEATS = 3
 
 
+def _has_character_run(text: str, min_run: int = 30) -> bool:
+    """True if any single character repeats min_run or more times in a row."""
+    from itertools import groupby
+
+    return any(sum(1 for _ in grp) >= min_run for _, grp in groupby(text))
+
+
 def trim_repeated_lines(text: str) -> tuple:
     """
     Drops lines that repeat more than MAX_LINE_REPEATS times (the model sometimes loops on a
@@ -82,6 +90,9 @@ def trim_repeated_lines(text: str) -> tuple:
     trimmed = False
     for line in text.splitlines():
         key = line.strip()
+        if _has_character_run(key):  # one character repeated 30+ times (degenerate output)
+            trimmed = True
+            continue
         if key:
             seen[key] = seen.get(key, 0) + 1
             if seen[key] > MAX_LINE_REPEATS:
