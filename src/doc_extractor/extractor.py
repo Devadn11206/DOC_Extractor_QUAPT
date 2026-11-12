@@ -420,29 +420,78 @@ class SchemaGuidedExtractor:
     def extract_page_image(
         self,
         image_input: Union[str, Path, bytes],
-        schema_cls: Type[BaseModel],
+        schema_cls: Optional[Type[BaseModel]],
+        system_prompt: Optional[str] = None,
+        user_text: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], ExecutionProvenance]:
-        """Direct 1-stage Qwen-VL multimodal extraction from page image."""
+        """Direct 1-stage Qwen-VL multimodal extraction from page image.
+
+        Either ``schema_cls`` (schema-bound prompt) or an explicit ``system_prompt``
+        (category-specific prompt from doc_extractor.routing) must be supplied.
+        """
+        if system_prompt is None:
+            if schema_cls is None:
+                raise ValueError("extract_page_image requires schema_cls or system_prompt")
+            system_prompt = self._build_system_prompt(schema_cls)
+        user_text = user_text or (
+            "Carefully transcribe all real filled values from this document image into the requested JSON schema. "
+            "Read every handwritten and printed value directly from the image; use null for anything not visible."
+        )
+
         vllm_api_base = os.environ.get("OPENAI_API_BASE") or os.environ.get("VLLM_API_BASE")
         if vllm_api_base:
-            return self._extract_via_vllm_api(image_input, schema_cls, vllm_api_base)
+            return self._extract_via_vllm_api(image_input, schema_cls, vllm_api_base, system_prompt=system_prompt)
 
+        output_text = self._generate_from_image(image_input, system_prompt, user_text, self.max_new_tokens)
+        raw_dict = self._parse_json_output(output_text)
+
+        prov = ExecutionProvenance(
+            mode=ExecutionMode.GENUINE_LLM,
+            model_name=self.model_name,
+            provider="transformers_qwen_vl",
+            prompt_version=self.prompt_version,
+            fallback_occurred=False,
+        )
+        self.last_provenance = prov
+        return raw_dict, prov
+
+    def classify_page_image(self, image_input: Union[str, Path, bytes]) -> Dict[str, Any]:
+        """Ask the VLM for document category, language and type (FR-CLS-005, FR-CLS-007).
+
+        Returns a dict with keys category, language, document_type, subtype, confidence.
+        Raises on model or parse failure so the caller can fall back to heuristics.
+        """
+        from doc_extractor.routing import CLASSIFIER_SYSTEM_PROMPT
+
+        text = self._generate_from_image(
+            image_input,
+            CLASSIFIER_SYSTEM_PROMPT,
+            "Classify this document image. Return the JSON object only.",
+            max_new_tokens=128,
+        )
+        return self._parse_json_output(text)
+
+    @staticmethod
+    def _parse_json_output(output_text: str) -> Dict[str, Any]:
+        cleaned = re.sub(r"^```json\s*", "", output_text.strip(), flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+        return json.loads(cleaned) if cleaned else {}
+
+    def _generate_from_image(
+        self,
+        image_input: Union[str, Path, bytes],
+        system_prompt: str,
+        user_text: str,
+        max_new_tokens: int,
+    ) -> str:
         model, processor = self._load_model()
-        system_prompt = self._build_system_prompt(schema_cls)
-
         messages = [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
                     {"type": "image", "image": str(image_input) if isinstance(image_input, (str, Path)) else image_input},
-                    {
-                        "type": "text",
-                        "text": (
-                            "Carefully transcribe all real filled values from this document image into the requested JSON schema. "
-                            "Read the handwritten applicant name, PAN card number, and filled bank details directly from the image."
-                        ),
-                    },
+                    {"type": "text", "text": user_text},
                 ],
             },
         ]
@@ -462,7 +511,7 @@ class SchemaGuidedExtractor:
         device = "cuda" if torch.cuda.is_available() else model.device
         inputs = inputs.to(device)
 
-        gen_kwargs = {"max_new_tokens": self.max_new_tokens}
+        gen_kwargs: Dict[str, Any] = {"max_new_tokens": max_new_tokens}
         if self.temperature > 0:
             gen_kwargs["temperature"] = self.temperature
             gen_kwargs["do_sample"] = True
@@ -470,36 +519,20 @@ class SchemaGuidedExtractor:
             gen_kwargs["do_sample"] = False
 
         with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                **gen_kwargs,
-            )
+            generated_ids = model.generate(**inputs, **gen_kwargs)
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
-        output_text = processor.batch_decode(
+        return processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
-
-        cleaned = re.sub(r"^```json\s*", "", output_text.strip(), flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned.strip())
-        raw_dict = json.loads(cleaned) if cleaned else {}
-
-        prov = ExecutionProvenance(
-            mode=ExecutionMode.GENUINE_LLM,
-            model_name=self.model_name,
-            provider="transformers_qwen_vl",
-            prompt_version=self.prompt_version,
-            fallback_occurred=False,
-        )
-        self.last_provenance = prov
-        return raw_dict, prov
 
     def _extract_via_vllm_api(
         self,
         image_input: Union[str, Path, bytes],
-        schema_cls: Type[BaseModel],
+        schema_cls: Optional[Type[BaseModel]],
         api_base: str,
+        system_prompt: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], ExecutionProvenance]:
         """Calls vLLM OpenAI-compatible vision completions endpoint."""
         if isinstance(image_input, (str, Path)):
@@ -508,7 +541,7 @@ class SchemaGuidedExtractor:
         else:
             b64_img = base64.b64encode(image_input).decode("utf-8")
 
-        prompt = self._build_system_prompt(schema_cls)
+        prompt = system_prompt or self._build_system_prompt(schema_cls)
         req_body = {
             "model": self.model_name,
             "messages": [
