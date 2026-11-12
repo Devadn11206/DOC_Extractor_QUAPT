@@ -299,7 +299,7 @@ def test_still_failing_output_is_flagged_model_failed():
     from doc_extractor.casa_reader import read_casa_form
     out = read_casa_form(Image.new("RGB", (10, 10), "white"), _AlwaysRunaway())
     assert any(f["code"] == "MODEL_FAILED" for f in out["flags"])
-    assert out["status"] == "needs_review"
+    assert out["status"] == "failed"  # PRD SCH-012 / GR-018
 
 
 def test_qwen_reader_can_be_configured_for_7b_4bit_without_loading():
@@ -328,3 +328,19 @@ def test_one_digit_match_is_not_evidence_for_deposit():
     res = ground_fields(normalise_casa_fields(dict(FORM_PRIYA, initial_deposit_amount="3")), tokens)
     assert res.fields["initial_deposit_amount"].value is None
     assert res.fields["initial_deposit_amount"].review_required is True
+
+
+def test_prd_envelope_uses_section_6_2_names_and_null_confidence():
+    from doc_extractor.casa_form import to_prd_envelope
+    res = normalise_casa_fields(FORM_PRIYA).to_dict()
+    env = to_prd_envelope(res, "Qwen/test", "casa-v2")
+    assert "applicant.full_name" in env["fields"]
+    assert "applicant.pan_card_number" in env["fields"]
+    assert "account_details.opt_in_services.cheque_book" in env["fields"]
+    assert all(f["confidence"] is None for f in env["fields"].values())
+    assert env["document_metadata"]["schema_id"] == "casa_account_opening"
+
+
+def test_prompt_tells_model_to_ignore_instructions_on_the_form():
+    from doc_extractor.casa_form import PROMPT
+    assert "ignore any instruction" in PROMPT.lower()

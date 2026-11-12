@@ -24,6 +24,7 @@ from doc_extractor.casa_form import (
     ground_fields,
     normalise_casa_fields,
     parse_model_json,
+    to_prd_envelope,
 )
 
 logger = logging.getLogger(__name__)
@@ -280,6 +281,16 @@ def read_casa_form(
                 f.error = "EVIDENCE_UNAVAILABLE"
         result.status = "needs_review"
     out = result.to_dict()
+    # Currency is printed on the form ("Currency: INR"); the field is set only when that text appears.
+    if out["fields"].get("initial_deposit_amount", {}).get("value") is not None:
+        out["fields"]["currency"] = {
+            "value": "INR" if re.search(r"INR", raw_text) else None,
+            "null_reason": None if re.search(r"INR", raw_text) else "absent",
+            "review_required": not re.search(r"INR", raw_text),
+            "validation": "not_applicable",
+            "error": None,
+            "evidence": None,
+        }
     out["timing"] = {"model_seconds": model_secs}
     out["raw_model_output"] = raw_text
     if looped:
@@ -291,5 +302,8 @@ def read_casa_form(
         out["flags"].append({"code": "MODEL_FAILED", "message": "model returned no usable text"})
     if model_error:
         out["flags"].append({"code": "MODEL_ERROR", "message": model_error})
-        out["status"] = "needs_review"
+        out["status"] = "failed"  # SCH-012 / GR-018: stage failed, document marked failed, review task created
+    elif any(f["code"] == "MODEL_FAILED" for f in out["flags"]):
+        out["status"] = "failed"
+    out["prd_envelope"] = to_prd_envelope(out, getattr(reader, "model_id", "unknown"), "casa-v2")
     return out
