@@ -43,6 +43,21 @@ def result_rows(fields: dict) -> List[List[Any]]:
     return rows
 
 
+def nominee_rows(nominees: list) -> List[List[Any]]:
+    """Insurance nominees (repeating group, FR-EXT-005) as table rows, in page order."""
+    rows = []
+    for i, n in enumerate(nominees, start=1):
+        rows.append([
+            f"nominee {i}",
+            f"{n.get('name') or ''} | {n.get('relationship') or ''} | age {n.get('age') or ''} | share {n.get('share_percentage') or ''}%",
+            "" if n.get("name") else "absent",
+            "REVIEW" if not n.get("name") else "ok",
+            "",
+            "",
+        ])
+    return rows
+
+
 def highlight(image: Image.Image, bbox: Optional[List[int]]) -> Image.Image:
     """Copy of the page with the evidence box drawn in red (FR-REV-001). bbox is in page pixels, top-left origin."""
     page = image.convert("RGB").copy()
@@ -91,7 +106,8 @@ def make_app(reader: Any) -> gr.Blocks:
         envelope = extraction.get("prd_envelope") or {"document_type": cls["doc_type"], "fields": fields}
         state = {"image": image.convert("RGB"), "fields": fields}
         names = list(fields.keys())
-        return (summary, result_rows(fields), envelope, image.convert("RGB"), state,
+        rows = result_rows(fields) + nominee_rows(extraction.get("nominees") or [])
+        return (summary, rows, envelope, image.convert("RGB"), state,
                 gr.update(choices=names, value=None), "")
 
     with gr.Blocks(title="Document extraction") as demo:
