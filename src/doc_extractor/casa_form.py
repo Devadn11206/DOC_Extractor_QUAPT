@@ -114,8 +114,47 @@ def parse_model_json(text: str) -> Optional[Dict[str, Any]]:
     try:
         obj = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return None
+        # The model sometimes writes slightly broken JSON (for example a missing "{" in a list).
+        # Read each value directly from the text instead of discarding the whole answer.
+        return _lenient_json(match.group(0))
     return obj if isinstance(obj, dict) else None
+
+
+_SCALAR_KEY = re.compile(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?|true|false|null)', re.IGNORECASE)
+_NOMINEE_KEYS = ("name", "relationship", "age", "share_percentage")
+
+
+def _lenient_json(text: str) -> Optional[Dict[str, Any]]:
+    """Reads top-level scalar values and a nominees list from broken JSON. Returns None if nothing is found."""
+    result: Dict[str, Any] = {}
+    for key, raw in _SCALAR_KEY.findall(text):
+        if key in _NOMINEE_KEYS:
+            continue  # nominee keys are read below, in order
+        try:
+            result[key] = json.loads(raw.lower() if raw.lower() in ("true", "false", "null") else raw)
+        except json.JSONDecodeError:
+            result[key] = raw.strip('"')
+    # Nominees: a new nominee starts when its "name" key appears again after the previous one's "share_percentage".
+    nominees: list = []
+    current: Dict[str, Any] = {}
+    for key, raw in _SCALAR_KEY.findall(text):
+        if key not in _NOMINEE_KEYS:
+            continue
+        if key == "name" and current and "name" in current:
+            nominees.append(current)
+            current = {}
+        try:
+            current[key] = json.loads(raw)
+        except json.JSONDecodeError:
+            current[key] = raw.strip('"')
+        if key == "share_percentage":
+            nominees.append(current)
+            current = {}
+    if current:
+        nominees.append(current)
+    if nominees:
+        result["nominees"] = nominees
+    return result or None
 
 
 def _clean_text(value: Any) -> Optional[str]:

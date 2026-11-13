@@ -111,3 +111,29 @@ def test_printed_value_gets_its_box_and_handwritten_value_gets_label_box():
     finally:
         cr.ocr_tokens = cr_original
     assert res2["fields"]["proposer_name"]["evidence"]["source"] == "label_box"
+
+
+MISSING_BRACE_JSON = """{
+  "proposer_name": "Marcus O'Connor",
+  "sum_insured": 250000,
+  "policy_term_years": 30,
+  "nominees": [
+    {"name": "Fiona O'Connor", "relationship": "Spouse", "age": 33, "share_percentage": 50},
+    {"name": "Sean O'Connor", "relationship": "Son", "age": 4, "share_percentage": 25},
+      "name": "Ciara O'Connor", "relationship": "Daughter", "age": 2, "share_percentage": 25
+    }
+  ],
+  "has_diabetes": true,
+  "has_hypertension": true,
+  "has_tobacco_use": false
+}"""
+
+
+def test_broken_json_with_missing_brace_keeps_the_values():
+    from doc_extractor.casa_form import parse_model_json
+    parsed = parse_model_json(MISSING_BRACE_JSON)
+    assert parsed is not None
+    assert parsed["proposer_name"] == "Marcus O'Connor"
+    assert parsed["policy_term_years"] == 30
+    assert [n["name"] for n in parsed["nominees"]] == ["Fiona O'Connor", "Sean O'Connor", "Ciara O'Connor"]
+    assert parsed["has_hypertension"] is True
