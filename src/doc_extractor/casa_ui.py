@@ -86,7 +86,7 @@ def make_app(reader: Any) -> gr.Blocks:
 
     def extract(image, choice):
         if image is None:
-            return ("Upload a form image first.", [], None, None, None, gr.update(choices=[], value=None), "")
+            return ("Upload a form image first.", [], None, None, None, gr.update(choices=[], value=None), "", "")
         override = None if choice in (None, AUTO) else choice
         routed = route_document(image, reader, override=override)
         cls = routed["classification"]
@@ -101,14 +101,14 @@ def make_app(reader: Any) -> gr.Blocks:
         )
         if extraction is None:
             return summary, [], None, image.convert("RGB"), None, gr.update(choices=[], value=None), \
-                "No extraction for this document type (see flags)."
+                "No extraction for this document type (see flags).", ""
         fields = extraction.get("fields", {})
         envelope = extraction.get("prd_envelope") or {"document_type": cls["doc_type"], "fields": fields}
         state = {"image": image.convert("RGB"), "fields": fields}
         names = list(fields.keys())
         rows = result_rows(fields) + nominee_rows(extraction.get("nominees") or [])
         return (summary, rows, envelope, image.convert("RGB"), state,
-                gr.update(choices=names, value=None), "")
+                gr.update(choices=names, value=None), "", extraction.get("raw_model_output") or "")
 
     with gr.Blocks(title="Document extraction") as demo:
         gr.Markdown(
@@ -129,7 +129,8 @@ def make_app(reader: Any) -> gr.Blocks:
                 viewer = gr.Image(label="Page with evidence box", type="pil")
                 note = gr.Markdown()
         envelope = gr.JSON(label="PRD envelope (section 6.3)")
+        raw_box = gr.Textbox(label="Model raw answer (for debugging)", lines=12, interactive=False)
         button.click(extract, inputs=[image, choice],
-                     outputs=[summary, table, envelope, viewer, state, pick, note])
+                     outputs=[summary, table, envelope, viewer, state, pick, note, raw_box])
         pick.change(show_field, inputs=[pick, state], outputs=[viewer, note])
     return demo
