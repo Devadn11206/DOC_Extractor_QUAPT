@@ -39,7 +39,7 @@ class InsuranceResult:
             "flags": self.flags,
             "fields": {
                 k: {"value": v.value, "null_reason": v.null_reason, "review_required": v.review_required,
-                    "validation": v.validation, "error": v.error}
+                    "validation": v.validation, "error": v.error, "evidence": v.evidence}
                 for k, v in self.fields.items()
             },
             "nominees": self.nominees,

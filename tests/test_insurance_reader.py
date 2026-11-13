@@ -77,3 +77,37 @@ def test_non_json_answer_uses_text_fallback():
     assert res["fields"]["proposer_name"]["value"] == "ALEXANDER JAMES WRIGHT"
     assert res["fields"]["policy_term_years"]["value"] == 20
     assert res["fields"]["sum_insured"]["value"] == 500000.0
+
+
+def test_printed_value_gets_its_box_and_handwritten_value_gets_label_box():
+    from doc_extractor.insurance_reader import ground_insurance_fields
+    out = {"fields": {
+        "proposer_name": {"value": "ALEXANDER JAMES WRIGHT"},
+        "sum_insured": {"value": 500000.0},
+    }}
+    class Tok(dict): pass
+    fake_tokens = [
+        {"text": "Full Name", "bbox": [70, 330, 170, 350]},
+        {"text": "Alexander James Wright", "bbox": [100, 360, 500, 390]},
+        {"text": "Required Sum Insured", "bbox": [70, 430, 300, 450]},
+        {"text": "$ 500,000", "bbox": [80, 460, 240, 490]},
+    ]
+    import doc_extractor.insurance_reader as ir
+    original = ir.__dict__.get("ocr_tokens")
+    import doc_extractor.casa_reader as cr
+    cr_original = cr.ocr_tokens
+    cr.ocr_tokens = lambda image: fake_tokens
+    try:
+        res = ground_insurance_fields(out, _img())
+    finally:
+        cr.ocr_tokens = cr_original
+    assert res["fields"]["proposer_name"]["evidence"]["source"] == "ocr_box"
+    assert res["fields"]["sum_insured"]["evidence"]["source"] == "ocr_box"
+    # handwritten (not printed): label box
+    out2 = {"fields": {"proposer_name": {"value": "SARAH LINDQVIST"}}}
+    cr.ocr_tokens = lambda image: [{"text": "Full Name", "bbox": [70, 330, 170, 350]}]
+    try:
+        res2 = ground_insurance_fields(out2, _img())
+    finally:
+        cr.ocr_tokens = cr_original
+    assert res2["fields"]["proposer_name"]["evidence"]["source"] == "label_box"

@@ -52,6 +52,50 @@ def insurance_fields_from_text(text: str) -> Dict[str, Any]:
     return out
 
 
+_LABEL_FOR_FIELD = {
+    "proposer_name": "FULLNAME",
+    "sum_insured": "SUMINSURED",
+    "policy_term_years": "POLICYTERM",
+}
+
+
+def ground_insurance_fields(out: Dict[str, Any], image: Image.Image) -> Dict[str, Any]:
+    """
+    Adds page evidence to the scalar fields (PRD FR-REV-001).
+    - Printed value found on the page: its box (source ocr_box).
+    - Value not printed (handwriting): the box of its label, with the snippet, marked source label_box.
+      This is where the value is written, not the handwriting itself.
+    """
+    from doc_extractor.casa_reader import ocr_tokens
+
+    try:
+        tokens = ocr_tokens(image)
+    except Exception:
+        logger.exception("OCR for insurance evidence failed")
+        return out
+    haystack = [(re.sub(r"[^A-Z0-9]", "", t.get("text", "").upper()), t) for t in tokens]
+    for field, label in _LABEL_FOR_FIELD.items():
+        entry = out["fields"].get(field)
+        if not entry or entry.get("value") is None:
+            continue
+        value = str(entry["value"]).upper()
+        needle = re.sub(r"[^A-Z0-9]", "", value)
+        if field == "sum_insured" and isinstance(entry["value"], float):
+            needle = re.sub(r"[^A-Z0-9]", "", f"{entry['value']:,.0f}")  # printed as 500,000
+        hit = next((t for norm, t in haystack if needle and needle in norm), None)
+        if hit is not None and hit.get("bbox"):
+            entry["evidence"] = {"source": "ocr_box", "page": 1, "bbox": hit["bbox"], "text": hit["text"]}
+            continue
+        label_tok = next((t for norm, t in haystack if label in norm), None)
+        if label_tok is not None and label_tok.get("bbox"):
+            x0, y0, x1, y1 = label_tok["bbox"]
+            h = max(1, y1 - y0)
+            entry["evidence"] = {"source": "label_box", "page": 1,
+                                 "bbox": [x0, y1, x1 + 300, y1 + 2 * h],
+                                 "text": f"handwritten value near label: {label_tok['text']}"}
+    return out
+
+
 def read_insurance_form(
     source: Union[str, Path, Image.Image],
     reader: Any,
@@ -71,7 +115,7 @@ def read_insurance_form(
         # The model answered in page text, not JSON: read the scalar fields from the text.
         parsed = insurance_fields_from_text(raw_text)
     result = normalise_insurance_fields(parsed if parsed is not None else raw_text)
-    out = result.to_dict()
+    out = ground_insurance_fields(result.to_dict(), image)
     out["timing"] = {"model_seconds": model_secs}
     out["raw_model_output"] = raw_text
     if looped:
