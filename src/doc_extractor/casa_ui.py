@@ -1,12 +1,15 @@
 """
 Review UI for document extraction (CASA, insurance application, discharge summary).
 
-Upload a form image. The UI shows:
-  - the detected document type and confidence (FR-CLS-001), or a reviewer override (FR-CLS-004),
-  - the document status and flags,
-  - a field table with the routing decision (ok or REVIEW),
-  - the page image, where selecting a field draws its evidence box (FR-REV-001),
-  - the full output in the PRD format (section 6.3).
+Single form tab:
+  - detected document type and confidence (FR-CLS-001), or a reviewer override (FR-CLS-004),
+  - document status and flags,
+  - field table with routing (ok or REVIEW),
+  - page image, where selecting a field draws its evidence box (FR-REV-001),
+  - full output in the PRD format (section 6.3), and the model's raw answer for debugging.
+
+Batch tab:
+  - upload several forms; one summary row per file; full results by file.
 
 Anything marked REVIEW must be checked by a person (FR-CNF-003, GR-008, GR-009).
 
@@ -23,8 +26,10 @@ from PIL import Image, ImageDraw
 from doc_extractor.document_router import TYPE_KEYWORDS, route_document
 
 TABLE_HEADERS = ["field", "value", "null_reason", "routing", "error", "evidence_source"]
+BATCH_HEADERS = ["file", "document type", "confidence", "status", "fields to review", "flags"]
 AUTO = "Auto-detect"
 TYPE_CHOICES = [AUTO] + list(TYPE_KEYWORDS.keys())
+LINE_BREAK = "  \n"
 
 
 def result_rows(fields: dict) -> List[List[Any]]:
@@ -81,12 +86,42 @@ def show_field(name: Optional[str], state: Optional[dict]):
     return highlight(state["image"], bbox), f"**{name}**: evidence box shown. Snippet: {snippet}"
 
 
+def batch_rows_and_results(files, reader: Any):
+    """Runs every uploaded file. Returns (summary rows, full results by file name). One bad file does not stop the batch."""
+    rows, results = [], {}
+    for item in files or []:
+        path = item if isinstance(item, str) else getattr(item, "name", str(item))
+        name = path.replace("\\", "/").split("/")[-1]
+        try:
+            image = Image.open(path)
+            routed = route_document(image, reader)
+            cls = routed["classification"]
+            extraction = routed["extraction"] or {}
+            fields = extraction.get("fields", {})
+            review = sum(1 for f in fields.values() if f.get("review_required"))
+            flags = ", ".join(sorted({f["code"] for f in routed["flags"]})) or "none"
+            rows.append([name, cls["doc_type"], cls["confidence"], routed["status"], review, flags])
+            results[name] = {
+                "classification": cls,
+                "status": routed["status"],
+                "flags": routed["flags"],
+                "fields": fields,
+                "nominees": extraction.get("nominees", []),
+                "envelope": extraction.get("prd_envelope"),
+            }
+        except Exception as exc:
+            rows.append([name, "ERROR", "", "failed", "", str(exc)[:120]])
+            results[name] = {"error": str(exc)}
+    return rows, results
+
+
 def make_app(reader: Any) -> gr.Blocks:
     """Builds the UI. reader is a QwenVLCasaReader or PaddleVLCasaReader (loads on first use)."""
 
     def extract(image, choice):
         if image is None:
-            return ("Upload a form image first.", [], None, None, None, gr.update(choices=[], value=None), "", "")
+            return ("Upload a form image first.", [], None, None, None,
+                    gr.update(choices=[], value=None), "", "")
         override = None if choice in (None, AUTO) else choice
         routed = route_document(image, reader, override=override)
         cls = routed["classification"]
@@ -95,13 +130,15 @@ def make_app(reader: Any) -> gr.Blocks:
         origin = "reviewer override" if cls.get("overridden") else "auto-detected"
         summary = (
             f"**Document type:** {cls['doc_type']} ({cls.get('document_id') or 'no id'}, "
-            f"{cls.get('domain') or 'unknown domain'}) - {origin}, confidence {cls['confidence']}  \n"
-            f"**Status:** {routed['status']}  \n"
-            f"**Flags:** {flags}"
+            f"{cls.get('domain') or 'unknown domain'}) - {origin}, confidence {cls['confidence']}"
+            + LINE_BREAK
+            + f"**Status:** {routed['status']}"
+            + LINE_BREAK
+            + f"**Flags:** {flags}"
         )
         if extraction is None:
-            return summary, [], None, image.convert("RGB"), None, gr.update(choices=[], value=None), \
-                "No extraction for this document type (see flags).", ""
+            return (summary, [], None, image.convert("RGB"), None,
+                    gr.update(choices=[], value=None), "No extraction for this document type (see flags).", "")
         fields = extraction.get("fields", {})
         envelope = extraction.get("prd_envelope") or {"document_type": cls["doc_type"], "fields": fields}
         state = {"image": image.convert("RGB"), "fields": fields}
@@ -110,6 +147,12 @@ def make_app(reader: Any) -> gr.Blocks:
         return (summary, rows, envelope, image.convert("RGB"), state,
                 gr.update(choices=names, value=None), "", extraction.get("raw_model_output") or "")
 
+    def run_batch(files):
+        rows, results = batch_rows_and_results(files, reader)
+        done = sum(1 for r in rows if r[1] != "ERROR" and r[3] != "failed")
+        note = f"**Processed {len(rows)} file(s)**, {done} extracted without error."
+        return note, rows, results
+
     with gr.Blocks(title="Document extraction") as demo:
         gr.Markdown(
             "# Document extraction (CASA, insurance application, discharge summary)\n"
@@ -117,20 +160,30 @@ def make_app(reader: Any) -> gr.Blocks:
             "Fields marked **REVIEW** must be checked by a person before use."
         )
         state = gr.State(None)
-        with gr.Row():
-            with gr.Column():
-                image = gr.Image(type="pil", label="Document image")
-                choice = gr.Dropdown(label="Document type", choices=TYPE_CHOICES, value=AUTO)
-                button = gr.Button("Extract", variant="primary")
-                summary = gr.Markdown()
-                table = gr.Dataframe(headers=TABLE_HEADERS, label="Fields", interactive=False)
-            with gr.Column():
-                pick = gr.Dropdown(label="Select a field to show its evidence on the page", choices=[])
-                viewer = gr.Image(label="Page with evidence box", type="pil")
-                note = gr.Markdown()
-        envelope = gr.JSON(label="PRD envelope (section 6.3)")
-        raw_box = gr.Textbox(label="Model raw answer (for debugging)", lines=12, interactive=False)
-        button.click(extract, inputs=[image, choice],
-                     outputs=[summary, table, envelope, viewer, state, pick, note, raw_box])
-        pick.change(show_field, inputs=[pick, state], outputs=[viewer, note])
+        with gr.Tabs():
+            with gr.Tab("Single form"):
+                with gr.Row():
+                    with gr.Column():
+                        image = gr.Image(type="pil", label="Document image")
+                        choice = gr.Dropdown(label="Document type", choices=TYPE_CHOICES, value=AUTO)
+                        button = gr.Button("Extract", variant="primary")
+                        summary = gr.Markdown()
+                        table = gr.Dataframe(headers=TABLE_HEADERS, label="Fields", interactive=False)
+                    with gr.Column():
+                        pick = gr.Dropdown(label="Select a field to show its evidence on the page", choices=[])
+                        viewer = gr.Image(label="Page with evidence box", type="pil")
+                        note = gr.Markdown()
+                envelope = gr.JSON(label="PRD envelope (section 6.3)")
+                raw_box = gr.Textbox(label="Model raw answer (for debugging)", lines=12, interactive=False)
+                button.click(extract, inputs=[image, choice],
+                             outputs=[summary, table, envelope, viewer, state, pick, note, raw_box])
+                pick.change(show_field, inputs=[pick, state], outputs=[viewer, note])
+            with gr.Tab("Batch (many files)"):
+                gr.Markdown("Upload several forms at once. One row per file. Full results are below.")
+                files = gr.File(file_count="multiple", file_types=["image"], label="Form images")
+                run = gr.Button("Run batch", variant="primary")
+                batch_note = gr.Markdown()
+                batch_table = gr.Dataframe(headers=BATCH_HEADERS, label="Summary", interactive=False)
+                batch_json = gr.JSON(label="Full results by file")
+                run.click(run_batch, inputs=files, outputs=[batch_note, batch_table, batch_json])
     return demo
