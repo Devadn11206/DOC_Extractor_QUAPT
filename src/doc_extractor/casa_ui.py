@@ -180,7 +180,7 @@ def make_app(reader: Any) -> gr.Blocks:
                 pick.change(show_field, inputs=[pick, state], outputs=[viewer, note])
             with gr.Tab("Batch (many files)"):
                 gr.Markdown("Upload several forms at once. One row per file. Full results are below.")
-                files = gr.File(file_count="multiple", file_types=["image"], label="Form images")
+                files = gr.File(file_count="multiple", file_types=[".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"], label="Form images")
                 run = gr.Button("Run batch", variant="primary")
                 batch_note = gr.Markdown()
                 batch_table = gr.Dataframe(headers=BATCH_HEADERS, label="Summary", interactive=False)
