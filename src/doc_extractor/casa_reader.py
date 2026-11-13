@@ -47,10 +47,15 @@ def _with_retries(call):
     """Runs call() up to MODEL_RETRY_ATTEMPTS times with back-off. Returns (value, error_text_or_None, attempts)."""
     last_error = None
     for attempt in range(1, MODEL_RETRY_ATTEMPTS + 1):
+        logger.info("model call: attempt %s of %s started", attempt, MODEL_RETRY_ATTEMPTS)
+        started = time.perf_counter()
         try:
-            return call(), None, attempt
+            value = call()
+            logger.info("model call: attempt %s finished in %.1f s", attempt, time.perf_counter() - started)
+            return value, None, attempt
         except Exception as exc:  # retry on any stage failure
             last_error = str(exc)
+            logger.error("model call: attempt %s failed after %.1f s: %s", attempt, time.perf_counter() - started, exc)
             if attempt < MODEL_RETRY_ATTEMPTS:
                 time.sleep(MODEL_RETRY_BACKOFF_SECONDS[min(attempt - 1, len(MODEL_RETRY_BACKOFF_SECONDS) - 1)])
     return "", last_error, MODEL_RETRY_ATTEMPTS
