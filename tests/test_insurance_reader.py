@@ -41,9 +41,9 @@ def test_good_model_output_is_parsed_and_still_needs_review():
     assert res["status"] == "needs_review"
 
 
-def test_model_error_sends_document_to_review_with_no_values():
+def test_model_error_after_retries_is_failed_with_no_values():
     res = read_insurance_form(_img(), BrokenReader())
-    assert res["status"] == "needs_review"
+    assert res["status"] == "failed"  # PRD SCH-012 / GR-018
     assert any(f["code"] == "MODEL_ERROR" for f in res["flags"])
     assert res["fields"]["proposer_name"]["value"] is None
 
@@ -52,3 +52,28 @@ def test_looping_output_is_trimmed():
     looped = GOOD + "\n" + "[X] Yes\n" * 10
     res = read_insurance_form(_img(), FakeReader(looped))
     assert any(f["code"] == "MODEL_OUTPUT_LOOPED" for f in res["flags"])
+
+
+WRIGHT_PAGE_TEXT = """LIFE INSURANCE FORM
+Proposer Details
+Full Name
+Alexander James Wright
+Coverage Details
+Required Sum Insured (Amount) Policy Term (Years)
+$ 500,000 20
+Home Address"""
+
+
+def test_page_text_fallback_reads_name_sum_and_term():
+    from doc_extractor.insurance_reader import insurance_fields_from_text
+    f = insurance_fields_from_text(WRIGHT_PAGE_TEXT)
+    assert f["proposer_name"] == "Alexander James Wright"
+    assert f["sum_insured"] == "500,000"
+    assert f["policy_term_years"] == "20"
+
+
+def test_non_json_answer_uses_text_fallback():
+    res = read_insurance_form(_img(), FakeReader(WRIGHT_PAGE_TEXT))
+    assert res["fields"]["proposer_name"]["value"] == "ALEXANDER JAMES WRIGHT"
+    assert res["fields"]["policy_term_years"]["value"] == 20
+    assert res["fields"]["sum_insured"]["value"] == 500000.0
