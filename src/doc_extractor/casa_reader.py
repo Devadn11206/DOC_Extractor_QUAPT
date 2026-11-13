@@ -134,6 +134,19 @@ def trim_repeated_lines(text: str) -> tuple:
 
 
 
+MODEL_MAX_SIDE_PX = 1280  # the model reads more tokens for bigger images; large phone photos make it very slow
+
+
+def fit_for_model(image: Image.Image, max_side: int = MODEL_MAX_SIDE_PX) -> Image.Image:
+    """Returns the image scaled so its longest side is at most max_side (keeps the aspect ratio)."""
+    rgb = image.convert("RGB")
+    longest = max(rgb.size)
+    if longest <= max_side:
+        return rgb
+    scale = max_side / float(longest)
+    return rgb.resize((max(1, round(rgb.width * scale)), max(1, round(rgb.height * scale))), Image.LANCZOS)
+
+
 class QwenVLCasaReader:
     """
     Instruction-following vision-language model (Qwen2.5-VL-Instruct). Unlike PaddleOCR-VL it
@@ -185,7 +198,7 @@ class QwenVLCasaReader:
         self._load()
         messages = [{
             "role": "user",
-            "content": [{"type": "image", "image": image.convert("RGB")}, {"type": "text", "text": prompt}],
+            "content": [{"type": "image", "image": fit_for_model(image)}, {"type": "text", "text": prompt}],
         }]
         inputs = self._processor.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt",

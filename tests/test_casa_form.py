@@ -376,3 +376,14 @@ def test_kill_switch_sends_everything_to_review(monkeypatch):
     out = casa_reader.read_casa_form(Image.new("RGB", (10, 10), "white"), Good())
     assert out["status"] == "needs_review"
     assert any(f["code"] == "KILL_SWITCH_ACTIVE" for f in out["flags"])
+
+
+def test_large_photo_is_scaled_down_for_the_model():
+    from PIL import Image
+    from doc_extractor.casa_reader import fit_for_model, MODEL_MAX_SIDE_PX
+    big = Image.new("RGB", (4032, 3024), "white")
+    small = fit_for_model(big)
+    assert max(small.size) == MODEL_MAX_SIDE_PX
+    assert abs(small.size[0] / small.size[1] - 4032 / 3024) < 0.01
+    tiny = Image.new("RGB", (400, 300), "white")
+    assert fit_for_model(tiny).size == (400, 300)
