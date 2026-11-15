@@ -1,8 +1,8 @@
 # Document Extraction Engine: Product Requirements Document (PRD)
 ## Product Requirements Document for Spec-Driven Development
 
-**Version:** 1.4 (Adds category-based model routing: structured / unstructured / handwritten, language dimension, model-and-cost evaluation, training-data strategy and a basic demo upload UI; builds on v1.3 1-Stage Multimodal Extraction with Qwen3-VL-8B-Instruct / Qwen2.5-VL)  
-**Date:** 2026-11-12  
+**Version:** 1.5 (Aligns the spec with the six-layer IDP capability list: adds HEIC and photo clean-up, stitching, zero-shot classification, tables/radio/stamp detection, synonym mapping, prose entities, phone/address normalisation, external verification, document-level exception routing and a corrections feedback loop, plus a coverage table in 3.5; v1.4 added category-based model routing: structured / unstructured / handwritten, language dimension, model-and-cost evaluation, training-data strategy and a basic demo upload UI; builds on v1.3 1-Stage Multimodal Extraction with Qwen3-VL-8B-Instruct / Qwen2.5-VL)  
+**Date:** 2026-11-16  
 **Author:** Praveen (Updated for 1-Stage Multimodal Architecture)  
 **Scope:** Schema-driven extraction of 7 BFSI and healthcare document types into validated, evidence-grounded JSON; SaaS (AWS Mumbai) and customer-controlled deployments from one build  
 **Flows:** Upload and intake, Document tracking, Review (queue and workbench), Schema authoring and approval, Results and export, Developer console, Audit, Security and policy, Operations dashboard  
@@ -17,7 +17,7 @@
 > where neither the source documents nor the ICXBee PRDs give an answer; each is tracked in 15.6.  
 > **Architecture Evolution Notation:** Throughout this document, requirements and specifications undergoing evolution from the initial Technical Approach to the modern 1-Stage Multimodal Engine are labeled with **[OLD]** (Legacy 2-stage decoupled pipeline with OCR and text LLM) and **[NEW]** (1-Stage Multimodal visual extraction with non-thinking `Qwen3-VL-8B-Instruct` / `Qwen2.5-VL-7B-Instruct` and deterministic Python normalization) so differences are unambiguous.
 
-Oct 28, 2026 · @Praveen (original draft v1.0) · updated 2026-10-29 (v1.1) · updated 2026-11-06 (v1.2) · updated 2026-11-07 (v1.3: Qwen3-VL-8B-Instruct Adoption) · updated 2026-11-12 (v1.4: category-based model routing, model/cost evaluation, training strategy, demo UI)
+Oct 28, 2026 · @Praveen (original draft v1.0) · updated 2026-10-29 (v1.1) · updated 2026-11-06 (v1.2) · updated 2026-11-07 (v1.3: Qwen3-VL-8B-Instruct Adoption) · updated 2026-11-12 (v1.4: category-based model routing, model/cost evaluation, training strategy, demo UI) · updated 2026-11-16 (v1.5: six-layer IDP capability alignment, section 1.2 and 3.5)
 
 This PRD defines a schema-driven engine, deployable as SaaS or on-premise, that turns scanned BFSI and healthcare documents into validated, evidence-grounded JSON, written so each requirement can be built and tested as a spec. It merges the Technical Approach document (architecture, models, 7 document types) with the Product Requirements Outline (personas, F1–F21, roadmap), incorporating the architectural transition from legacy two-stage OCR+LLM text parsing to direct single-stage multimodal visual extraction with deterministic Python normalization, and adds mock-screen, guardrail, security and NIST CSF 2.0 requirements.
 
@@ -50,6 +50,19 @@ The product owner reviewed the single-model approach and directed the following.
 | D14 | **Router model and specialist dispatch** | Classification is rule-based and extraction is one model. | **One router model auto-detects the category (and language) from the page image, then dispatches to the specialist model for that category** (FR-RTE-005, FR-RTE-006). Candidates, to be confirmed by the evaluation workbook and benchmark, not decided: digital / printed documents, GLM-OCR (or PaddleOCR-VL) for reading plus a comparable-size pure-text, non-thinking LLM such as Qwen2.5-7B-Instruct for field mapping, with Qwen3-VL-8B as the fallback; handwritten, the highest-accuracy vision model that can be hosted (for example Qwen3-VL-32B or a fine-tuned Qwen3-VL-8B), always with review below threshold. For the demo the router is Qwen3-VL-8B-Instruct. |
 
 Two further inputs from the outline's answers are adopted as stated: pricing is per page, and launch languages are English, Hindi, Telugu, Tamil and Malayalam, with handwriting reading in English only at first. Malayalam is not covered by the approach document's model selection, so it is a validated-or-not gate in Section 14 rather than an assumption.
+
+### 1.2 Changes in v1.5 (capability alignment, 2026-11-16)
+
+The team was told to keep the engine aligned with the standard six-layer capability list for an industry-agnostic IDP engine (ingestion, recognition, classification, extraction, validation, human review and governance). The PRD was checked against that list; most items were already specified (Section 3.5 shows where). The gaps below are now closed. All additions are new IDs; no existing ID changed meaning.
+
+| # | Layer | Gap found | v1.5 addition |
+| --- | --- | --- | --- |
+| D15 | Ingestion | HEIC phone photos, de-noising and shadow removal were not specified; bundles were split but pages were not stitched back into one document. | FR-ING-008 (HEIC), FR-ING-009, FR-ING-010 |
+| D16 | Recognition | Borderless tables, nested grids, radio buttons, and signature or stamp presence were not explicit; headers, footers, margins and sidebars were not named. | FR-PRS-008 to FR-PRS-010 |
+| D17 | Classification | Unseen document types were routed to review only; there was no zero-shot or few-shot path. | FR-CLS-008, FR-CLS-009 |
+| D18 | Extraction | Non-standard labels did not map to one schema field; dense prose had no entity-extraction rule; the box format differed from the common `[x, y, w, h]`. | SCH-015, FR-EXT-009 to FR-EXT-011 |
+| D19 | Validation | Phone (E.164), address clean-up and currency codes were not specified; there was no external verification of IDs or addresses. | FR-VAL-008, FR-VAL-009 |
+| D20 | Review and governance | Routing used per-field thresholds only (no document-level bar); corrections were collected but not wired to prompts or fine-tuning with STP tracking. | FR-CNF-004, FR-REV-005 |
 
 ## 2. Product context
 
@@ -132,7 +145,7 @@ Product brochures and policy wordings from the outline are tracked as DOC-08 (v1
 
 ### 3.2 Inputs, languages and output
 
-- **Input formats:** PDF (native and scanned, multi-page), JPG, PNG, TIFF at MVP; DOCX, XLSX, email and HTML in v1.
+- **Input formats:** PDF (native and scanned, multi-page), JPG, PNG, TIFF at MVP; DOCX, XLSX, HEIC/HEIF, email and HTML in v1.
 - **Languages at launch:** English, Hindi, Telugu, Tamil, Malayalam. Printed text first; handwriting in English only at MVP.
 - **Output:** JSON (canonical), plus CSV and XML renderings in v1. Dates ISO 8601, amounts as decimals with ISO 4217 currency, booleans as true/false.
 
@@ -163,6 +176,36 @@ This document is the source of truth that code, tests and mock screens are gener
 | Architecture Decision Records in `docs/adr/` | ADR 0001 standalone product, Python, `/api/v1`; ADR 0002 internal identity plus SSO; ADR 0003 Spec Kit artefacts in the existing flat `specs/` folder |
 | ICXBee constitution (`icxbee-refactor-services/.specify/memory/constitution.md`) | Quality gates, compliance-first sequencing, data residency (13.5, SEC-019) |
 | `icxbee-mockups` (README, `TEMPLATE-mockup-brief.md`, `TEMPLATE-business-rules.md`, `MOCKUP-ASSUMPTIONS.md`) | Screen IDs, flow folder layout, generator pattern, Stage 0a/0b/0c artefacts (8.6) |
+
+### 3.5 Capability coverage (six-layer IDP list, v1.5)
+
+The engine must handle fixed templates, semi-structured records and fully unstructured documents across domains. This table maps each capability of the standard list to the requirement that covers it. "Demo" says what the Gradio demo does today (not verified on GPU unless stated); "Spec only" means specified but not built.
+
+| Layer | Capability | Requirements | Demo status |
+| --- | --- | --- | --- |
+| 1 Ingestion | PDF, TIFF, JPEG, PNG | FR-ING-001, FR-ING-004 | Built: every page rendered at 200 DPI |
+| | DOCX, XLSX, HEIC, email, HTML | FR-ING-008 | Spec only |
+| | Rotation, deskew, contrast | FR-ING-005 | Rotation fixed from the router's reading; the rest runs in Module A |
+| | De-noising, shadow removal (phone photos) | FR-ING-010 | Spec only |
+| | Bundle splitting and stitching | FR-ING-007, FR-ING-009 | Spec only |
+| 2 Recognition | OCR for typed text plus handwriting reading | FR-PRS-006, FR-RTE-006 | Built: typed pages via GLM-OCR; handwritten via Qwen3-VL |
+| | Layout-aware vision model, boxes | FR-PRS-001, FR-PRS-004, FR-PRS-010 | Built on the vision route; the OCR route returns no boxes |
+| | Tables, nested grids | FR-PRS-008 | Spec only |
+| | Checkboxes, radio buttons, signature and stamp presence | FR-PRS-002, FR-PRS-009 | Checkbox ticks read by the vision model; rest spec only |
+| 3 Classification | Visual and semantic classification | FR-CLS-001, FR-CLS-005, FR-CLS-007 | Built: router reads category, type, sub-type, language |
+| | Zero-shot and few-shot routing for unseen types | FR-CLS-008, FR-CLS-009 | Zero-shot by the router model; few-shot spec only |
+| 4 Extraction | Dynamic target schemas | SCH-001 to SCH-010, FR-DEMO-008 | Dynamic keys in the demo; schema studio spec only |
+| | Synonym label mapping | SCH-015, FR-EXT-009 | Spec only |
+| | Entity extraction from prose | FR-EXT-010, FR-CLS-006 | Partly: unstructured pages return key facts |
+| | Grounding: page, box, confidence | FR-EXT-004, FR-EXT-011, FR-CNF-001 | Page and box built (vision route); confidence not calibrated |
+| 5 Validation | ISO dates, currency, identifiers | FR-VAL-001, FR-VAL-002 | Built for fixed-schema fields |
+| | Phone E.164, address clean-up | FR-VAL-008 | Spec only |
+| | Arithmetic and chronology rules | FR-VAL-003, FR-VAL-004 | Spec only in the demo |
+| | External and master-data verification | FR-VAL-009, SCH-008 | Spec only |
+| 6 Review and governance | Confidence and validation exception routing | FR-CNF-002 to FR-CNF-004 | Demo marks fields `review_required`; never auto-approves |
+| | Side-by-side review workspace | FR-REV-001 to FR-REV-003 | Annotated pages beside the JSON; full workbench spec only |
+| | Continuous learning from corrections | FR-REV-004, FR-REV-005, FR-TRN-004 | Spec only |
+| | SOC 2, HIPAA, GDPR, PII masking, immutable audit | Sections 10 and 11, SEC-007, SEC-008, GR-025 | Spec only |
 
 ## 4. Architecture
 
@@ -264,7 +307,9 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-ING-005 | The system SHALL de-skew, correct rotation and normalise contrast per page, and record the transforms applied. | P0 | Given a benchmark page skewed 5°, Then residual skew ≤ 0.5° and the transform is in the page record. | A §3, F2 |
 | FR-ING-006 | The system SHALL treat a repeated upload of the same file hash within one tenant as idempotent when the client sends the same idempotency key. | P0 | Given two POSTs with one key, Then one document exists and both calls return its ID. | NFR-006 |
 | FR-ING-007 | The system SHOULD split a bundled file into logical documents and group related pages. | P1 | Given a 12-page bundle of 3 documents, Then 3 child documents with correct page ranges, ≥ 95% boundary accuracy on the benchmark. | F3 |
-| FR-ING-008 | The system SHOULD accept DOCX, XLSX, email and HTML by converting to page images or text with layout. | P1 | Each format yields the same output contract as a scanned PDF. | F1 |
+| FR-ING-008 | The system SHOULD accept DOCX, XLSX, HEIC/HEIF (phone photos), email and HTML by converting to page images or text with layout. | P1 | Each format yields the same output contract as a scanned PDF. | F1 |
+| FR-ING-009 | WHEN a bundle is split into logical documents, the system SHOULD stitch each document's pages back in order, including pages that arrive out of order or interleaved with another document, and keep the page-to-source mapping. | P1 | Given a bundle whose pages of two documents are interleaved, Then two documents are produced with pages in reading order and each page keeps its original upload page number. | F3 |
+| FR-ING-010 | The system SHOULD de-noise, remove shadows and flatten perspective on phone-captured pages before parsing, and record each transform in the page record (FR-ING-005). | P1 | Given a phone photo with a shadow and perspective tilt from the benchmark, Then field accuracy on the cleaned page is at least that of a flat scan of the same document minus 2 points (target to confirm). | F2 |
 
 ### 5.2 Classification and routing
 
@@ -277,6 +322,8 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-CLS-005 | The system SHALL first classify each document into a **category** (`structured`, `unstructured`, `handwritten`) with a confidence in \[0, 1\], and only then resolve the document type within that category. The user MAY supply the category and type manually, which skips auto-detection. | P0 | Given a CASA form, a brochure and a prescription, Then categories are structured, unstructured and handwritten respectively; category accuracy ≥ 95% on the benchmark (target to confirm). Given a manual selection, Then it is recorded as `category_source: "user"`. | D7, D8 |
 | FR-CLS-006 | For unstructured documents the system SHALL accept an open document sub-type (brochure, pamphlet, menu card, CASA leaflet, invitation card, other) and SHALL NOT reject a document solely because its sub-type has no pre-defined schema; it SHALL fall back to a generic key-fact schema. | P1 | Given a menu card, Then a generic extraction result with null-by-default is produced and sub-type is recorded. | D8 |
 | FR-CLS-007 | The system SHALL detect the dominant language of the document and record it with a confidence. | P0 | Given English and Hindi samples, Then `language` is `en` and `hi` with confidence recorded. | D10 |
+| FR-CLS-008 | The router SHALL classify a document type it has never been shown (no template, no schema) by describing its purpose from the page image, and SHALL return the category and a free-text type with a confidence. | P0 | Given a document type outside the launch set, Then category and a descriptive type are returned and extraction runs the generic route (FR-CLS-006); no retraining is needed. | D14 |
+| FR-CLS-009 | The system SHOULD accept a few labelled example pages for a new type (few-shot) and use them to improve routing and the extraction prompt for that type, before any fine-tuning. | P1 | Given three example pages of a new type, Then classification accuracy for that type on a held-out set is no lower than zero-shot; examples are stored with the schema version. | D11 |
 
 ### 5.2.1 Model routing (v1.4)
 
@@ -328,6 +375,9 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | | | **[NEW]** | Compute calibrated confidence per field combining multimodal generation log-likelihoods, spatial grounding overlap, and deterministic validation rule outcomes. | A §4.2, M6 |
 | FR-PRS-006 | English handwriting | **Both** | The system SHOULD read English handwriting (hand-filled forms included, routed to the vision model per §3.1) and flag struck-out or overwritten entries. Handwriting fields below threshold are routed to review (`review_required: true`). | F7 |
 | FR-PRS-007 | Multilingual printed text | **Both** | The system SHOULD read Hindi, Telugu, Tamil and Malayalam printed text. Per-language CER reported on benchmark; a language ships only if CER meets M2. | F4 |
+| FR-PRS-008 | Tables and nested grids | **Both** | The system SHALL detect tables including borderless tables and grids nested inside cells, and return cell-level boxes with row and column indexes. Cell text accuracy is measured with the field benchmark (M1). | F6 |
+| FR-PRS-009 | Radio buttons, signatures and stamps | **Both** | The system SHALL resolve radio-button groups to one selected option, and SHALL report whether a signature or company stamp is present (true or false, with box) without reading its content. | F6, GR-002 |
+| FR-PRS-010 | Position-sensitive regions | **Both** | The system SHALL tag text in headers, footers, margins and sidebars with its region, so repeated page furniture is not mistaken for body fields. | F6 |
 
 ### 5.4 Extraction
 
@@ -346,6 +396,9 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-EXT-006 | Multi-column party attribution | **Both** | The system SHALL associate figures with the right party (applicant vs co-applicant) in multi-column tables. | A §2 |
 | FR-EXT-007 | Checkbox mapping | **Both** | The system SHALL map checkbox markers to booleans or enumerated values defined in the schema (`[x]` -> true, `[ ]` -> false, no mark -> null). | A §4.1 |
 | FR-EXT-008 | Reconciliation pass | **Both** | The system MAY run a second reconciliation pass on fields below confidence threshold and keep the result only if it agrees with visual evidence. | F7, outline §7 |
+| FR-EXT-009 | Semantic key-value mapping | **Both** | The system SHALL map non-standard printed labels to the schema field they mean, using the field description and its aliases (SCH-015), for example "Total Due", "Balance Payable" and "Amount to Pay" all fill `amount_due`. The printed label is kept in the evidence. | F8 |
+| FR-EXT-010 | Entities from prose | **Both** | For dense paragraphs (brochures, policy wordings, medical summaries) the system SHALL extract the entities the schema asks for (for example specifications, exclusions, features, diagnoses) as typed values with the sentence's box, using an instruction-tuned model; it SHALL NOT summarise or add facts absent from the text (GR-003). | F8 |
+| FR-EXT-011 | Box format | **Both** | Evidence boxes SHALL be returned as corners `[x0, y0, x1, y1]` in original-page pixels with `bbox_format: "xyxy"`. A request parameter MAY ask for `[x, y, w, h]` (`xywh`); both describe the same box. | F15, GR-002 |
 
 ### 5.5 Normalisation and validation
 
@@ -362,6 +415,8 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-VAL-005 | Clinical shorthand mapping | **Both** | Map frequency shorthand (OD, BD, TDS, SOS) to standard descriptions while retaining original text snippet. | A §4.2 |
 | FR-VAL-006 | Configurable schema rules | **Both** | Rules SHALL be configurable per schema and versioned with it, without a code release. | outline §5 |
 | FR-VAL-007 | Cross-document consistency | **Both** | Consistency checks across documents in one case (name, date of birth, address). | F13, F20 |
+| FR-VAL-008 | Phone, address and currency normalisation | **Both** | The system SHALL normalise phone numbers to E.164 using the document's country, clean address text (whitespace, case, PIN or postal code split out), and record amounts as decimals with an ISO 4217 code. A value that cannot be normalised is kept as read and marked `validation: "failed"`. | F12 |
+| FR-VAL-009 | External and master-data verification | **Both** | WHERE the schema marks a field for verification, the system MAY check it against a master-data list (SCH-008) or an external service (for example a postal-code or national-ID check). It SHALL send only the minimum value needed, only to a provider the tenant policy approves (D2, GR-014, GR-021 to GR-025), and SHALL be off in the on-premise profile. A mismatch flags the field and routes it to review; an unreachable service flags `VERIFICATION_UNAVAILABLE` and does not block extraction. This requirement is P1. | F13 |
 
 ### 5.6 Confidence, routing and review
 
@@ -370,10 +425,12 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-CNF-001 | The system SHALL compute a calibrated confidence per field from parser confidence, model signals and validation outcome. | P0 | Calibration gap ≤ 3 points (M6) on the benchmark. | F14 |
 | FR-CNF-002 | The system SHALL set `review_required: true` on any field whose confidence is below its threshold; default threshold 0.75 for handwriting-derived fields, tenant-configurable per field. | P0 | A handwritten drug name at 0.62 is `review_required` and not auto-approved. | A §4.2, F14 |
 | FR-CNF-003 | WHEN all fields pass validation and thresholds, the system SHALL auto-approve the document; otherwise it SHALL create a review task listing only the flagged fields. | P0 | Review task contains flagged fields only; STP counted from auto-approved documents (M5). | F16 |
+| FR-CNF-004 | **[Proposed]** The system SHALL also apply a document-level bar: IF any schema-marked key field is below 0.95 confidence OR any validation rule fails, THEN the whole document goes to review. The 0.95 default follows the key-field accuracy bar in D3 and is tenant-configurable. | P0 | Given one key field at 0.93, Then the document is not auto-approved and the review task names that field. | D3, F14 |
 | FR-REV-001 | The reviewer UI SHALL show the page image beside the extracted fields and highlight the evidence box for the selected field. | P0 | Selecting a field scrolls and highlights its bbox within 300 ms. | F15, F16 |
 | FR-REV-002 | The reviewer SHALL be able to accept, correct or mark-as-null a field inline; each action SHALL be audit-logged with user, time, old and new value. | P0 | Audit log contains one entry per action. | F16 |
 | FR-REV-003 | A corrected value SHALL be re-validated before the task can be completed. | P0 | An invalid correction blocks completion with the failing rule shown. | F13 |
 | FR-REV-004 | The system SHOULD add reviewer corrections to the benchmark candidate set, subject to approval. | P1 | Corrections appear in a pending-ground-truth list; none enters the benchmark automatically. | F17, GR-012 |
+| FR-REV-005 | The system SHOULD use approved reviewer corrections to improve results over time: first as prompt examples and lookup lists per schema, then as fine-tuning data (FR-TRN-001, FR-TRN-004), and SHALL report the straight-through rate (M5) per schema and model version so the effect is visible. Corrections never enter the locked benchmark set. | P1 | After a fine-tune that used approved corrections, Then the per-version STP and field F1 are reported next to the previous version on the locked set. | F17, M5 |
 
 ### 5.7 Delivery and audit
 
@@ -402,6 +459,7 @@ The schema is the main control surface: business users define what to extract an
 | SCH-008 | Reference data (code lists, lookup tables) SHALL be uploadable and versioned per tenant. | P1 | A state-code list is referenced by field `state` and applied in normalisation. |
 | SCH-009 | A schema library of cloneable prebuilt schemas SHALL ship for the seven launch types. | P1 | Each launch type has an approved library schema. |
 | SCH-010 | The system MAY draft a schema from a plain-English description, always as `draft` for human editing. | P2 | Generated schema is never auto-approved. |
+| SCH-015 | A schema field SHALL accept a list of `aliases` (other labels that mean the same thing, per language), used by FR-EXT-009. | P1 | Given aliases "Total Due" and "Balance Payable" on `amount_due`, Then a page printing either label fills `amount_due`. |
 
 ### 6.2 Schema definition format (illustrative)
 
@@ -1865,13 +1923,13 @@ Front-end analytics: page views per screen, filters used, "Next flagged field" u
 
 | Requirement group | Story | Screen | Source reference |
 | --- | --- | --- | --- |
-| FR-ING-001..008, GR-001 | US-DOCX-001 | DOCX-SCR-001* | F1, A §3 |
+| FR-ING-001..010, GR-001 | US-DOCX-001 | DOCX-SCR-001* | F1, A §3 |
 | API-015, SCH-012 | US-DOCX-002 | DOCX-SCR-002* | F1, F16 |
-| FR-CLS-001..004, GR-004 | US-DOCX-003 | DOCX-SCR-003-unknown-type | A §3, F5 |
-| FR-PRS-001..007, FR-EXT-001..008, GR-002, 003, 005, 006 | US-DOCX-004 | DOCX-SCR-003* | A §3, §4, F6..F11 |
-| FR-VAL-001..007, GR-008 | US-DOCX-005 | DOCX-SCR-003-validation-failed, -arithmetic-mismatch | A §3, F12, F13 |
-| FR-CNF-001..003, GR-009, 017, 027 | US-DOCX-006 | DOCX-SCR-003-low-confidence | A §4.2, F14 |
-| FR-REV-001..004 | US-DOCX-007 | DOCX-SCR-003* | F15, F16, F17 |
+| FR-CLS-001..004, FR-CLS-008, 009, GR-004 | US-DOCX-003 | DOCX-SCR-003-unknown-type | A §3, F5 |
+| FR-PRS-001..010, FR-EXT-001..011, SCH-015, GR-002, 003, 005, 006 | US-DOCX-004 | DOCX-SCR-003* | A §3, §4, F6..F11 |
+| FR-VAL-001..009, GR-008 | US-DOCX-005 | DOCX-SCR-003-validation-failed, -arithmetic-mismatch | A §3, F12, F13 |
+| FR-CNF-001..004, GR-009, 017, 027 | US-DOCX-006 | DOCX-SCR-003-low-confidence | A §4.2, F14 |
+| FR-REV-001..005 | US-DOCX-007 | DOCX-SCR-003* | F15, F16, F17 |
 | API-005, API-016 | US-DOCX-008 | DOCX-SCR-004* | F16 |
 | SCH-001..006, SCH-009 | US-DOCX-009 | DOCX-SCR-005* | outline §5 |
 | SCH-007, API-007 | US-DOCX-010 | DOCX-SCR-005-test-results | outline §5 |
