@@ -4,7 +4,7 @@
 
 The **Document Extraction Engine** is an on-premise, schema-driven system designed to transform scanned BFSI (banking, financial services, insurance) and healthcare documents into validated, evidence-grounded structured data.
 
-The system is architected as a modular, decoupled processing pipeline following the authoritative **PRD v1.1** specification:
+The system is architected as a modular, decoupled processing pipeline following the authoritative PRD, [Document_Extraction_Engine_PRD.md](Document_Extraction_Engine_PRD.md) (current version: **v1.5**; older versions are archived in [docs/prd-versions/](docs/prd-versions/README.md) and are not used for building):
 1. **Module A — Document Ingestion & Preprocessing**: Safe reception, multi-format validation, 200 DPI rendering, image de-skewing, normalization, and secure tenant storage.
 2. **Module B — Layout Parsing & Document Classification**: Visual layout structure parsing (blocks, reading order, Markdown formatting), structural element extraction (tables, checkboxes, character grids), deterministic document classification, and schema binding.
 3. **Module C — Extraction & Grounding**: *(In active development / runtime preparation — not documented as a completed project feature)*.
