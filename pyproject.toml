@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "doc-extractor-ingestion"
 version = "0.1.0"
-description = "Module A: Document Ingestion & Preprocessing for Document Extraction Engine"
+description = "Document Extraction Engine: ingestion (Module A), layout parsing and classification (Module B), schema-guided extraction (Module C), and schema lifecycle"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -15,6 +15,8 @@ authors = [
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
     "Private :: Do Not Upload",
 ]
@@ -24,15 +26,33 @@ dependencies = [
     "Pillow>=9.0.0",
     "opencv-python-headless>=4.8.0",
     "numpy>=1.24.0",
+    "pytesseract>=0.3.10",
     "instructor>=1.0.0",
     "litellm>=1.40.0",
     "PyYAML>=6.0.0",
+    "jsonschema>=4.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0,<9.0.0",
+    "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+]
+# Interactive demo UI (doc_extractor.app). Not needed by the engine.
+ui = [
+    "gradio>=4.0.0",
+]
+# Heavy local multimodal (Qwen3-VL) stack; intentionally not a core dependency.
+# PyTorch AND torchvision are platform-specific and installed separately, BEFORE this extra (see README).
+# - transformers>=4.57.1: Qwen3VLForConditionalGeneration ships from 4.57.0 (itself yanked); 4.56.x has none.
+# - qwen-vl-utils==0.0.14: exact version of the initial reproducible GPU baseline (needs torchvision);
+#   process_vision_info(image_patch_size=16) is required for Qwen3-VL.
+# - accelerate>=0.26.0 / bitsandbytes>=0.43.1: the floors Transformers enforces for 4-bit loading.
+vlm = [
+    "transformers>=4.57.1",
+    "accelerate>=0.26.0",
+    "bitsandbytes>=0.43.1",
+    "qwen-vl-utils==0.0.14",
 ]
 
 [tool.setuptools.packages.find]
@@ -46,5 +66,6 @@ pythonpath = ["src"]
 markers = [
     "unit: Unit tests for foundational components",
     "security: Security and guardrail compliance tests",
+    "live_ollama: Live integration test against a real Ollama server; opt-in via RUN_OLLAMA_TESTS=1",
 ]
 

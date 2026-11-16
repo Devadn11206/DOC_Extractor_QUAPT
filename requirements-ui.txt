@@ -1,0 +1,5 @@
+# Optional: interactive demo UI (doc_extractor.app) - Kaggle / local testing.
+# Not required by the engine, the REST API or the test suite.
+-r requirements.txt
+
+gradio>=4.0.0
