@@ -30,23 +30,27 @@ if _src_dir not in sys.path:
 
 from PIL import Image, ImageDraw, ImageFont
 
-from doc_extractor.config import Settings
+from doc_extractor.config import Settings, load_settings
 from doc_extractor.contracts_b import MVPDocumentType
 from doc_extractor.extractor import SchemaGuidedExtractor, SCHEMA_MAP
-from doc_extractor.handoff import CoordinateTransform
 from doc_extractor.pipeline import ModuleAPipeline
-from doc_extractor.pipeline_b import ModuleBPipeline
+from doc_extractor.pipeline_b import ModuleBPipeline, ReviewerOverrideRequest
 from doc_extractor.pipeline_c import ModuleCPipeline
 from doc_extractor.routing import (
+    DEFAULT_MODEL,
     LANGUAGES,
     UNSTRUCTURED_SUBTYPES,
     DocumentCategory,
     RoutedExtractor,
+    build_generic_prompt,
     heuristic_classify,
+    select_model,
 )
 from doc_extractor.storage import LocalDiskStorage
 
 AUTO = "Auto-Detect"
+TENANT_ID = "test_tenant"
+OVERRIDE_REVIEWER_ID = "extraction_ui_user"
 
 try:
     import gradio as gr
@@ -54,13 +58,44 @@ except ImportError:
     gr = None
 
 
+_SETTINGS: Optional[Settings] = None
+_PIPELINES: Dict[str, Tuple[ModuleAPipeline, ModuleBPipeline]] = {}
+
+
+def get_settings() -> Settings:
+    """Application settings; validated once and shared by every module the app builds."""
+    global _SETTINGS
+    if _SETTINGS is None:
+        _SETTINGS = load_settings()
+    return _SETTINGS
+
+
+def configure_settings(settings: Settings) -> None:
+    """Sets the application settings (e.g. a non-default OCR backend) before processing."""
+    global _SETTINGS
+    _SETTINGS = settings
+
+
+def get_pipelines(settings: Optional[Settings] = None) -> Tuple[ModuleAPipeline, ModuleBPipeline]:
+    """
+    Builds (and caches per settings) Module A and Module B with the *same* Settings, so the
+    configured storage path and OCR backend are used instead of silent defaults. A missing OCR
+    runtime raises here with an actionable error.
+    """
+    settings = settings if settings is not None else get_settings()
+    key = settings.model_dump_json()
+    if key not in _PIPELINES:
+        storage = LocalDiskStorage(settings.storage_base_dir, tenant_id=TENANT_ID)
+        pipe_a = ModuleAPipeline(settings=settings, storage=storage, tenant_id=TENANT_ID)
+        pipe_b = ModuleBPipeline(storage=storage, tenant_id=TENANT_ID, settings=settings)
+        _PIPELINES[key] = (pipe_a, pipe_b)
+    return _PIPELINES[key]
+
+
 def get_pipeline():
-    """Initializes and caches pipeline instances."""
-    storage = LocalDiskStorage(Path("./data/storage"), tenant_id="test_tenant")
-    pipe_a = ModuleAPipeline(storage=storage, tenant_id="test_tenant")
-    pipe_b = ModuleBPipeline(storage=storage, tenant_id="test_tenant")
-    pipe_c = ModuleCPipeline()
-    return pipe_a, pipe_b, pipe_c
+    """Backward-compatible (pipe_a, pipe_b, pipe_c) accessor; pipe_c is the canonical ModuleCPipeline."""
+    pipe_a, pipe_b = get_pipelines()
+    return pipe_a, pipe_b, ModuleCPipeline(extractor=SchemaGuidedExtractor(use_llm=False))
 
 
 def draw_bounding_boxes(
@@ -122,14 +157,10 @@ def get_routed_extractor() -> RoutedExtractor:
     """One RoutedExtractor per process so model weights load once."""
     global _ROUTED
     if _ROUTED is None:
-        _ROUTED = RoutedExtractor()
+        # allow_fallback=False: a failed VLM run must surface (or use the routing fallback in
+        # ModuleCPipeline), never silently degrade to regex heuristics.
+        _ROUTED = RoutedExtractor(allow_fallback=False)
     return _ROUTED
-
-
-def _bbox_to_pixels(bbox, w: int, h: int):
-    """Qwen bbox [ymin, xmin, ymax, xmax] on 0-1000 -> (x0, y0, x1, y1) pixels. Scaled once, here only."""
-    ymin, xmin, ymax, xmax = bbox
-    return (int(xmin * w / 1000.0), int(ymin * h / 1000.0), int(xmax * w / 1000.0), int(ymax * h / 1000.0))
 
 
 def _classification_markdown(info: Dict[str, Any]) -> str:
@@ -138,7 +169,12 @@ def _classification_markdown(info: Dict[str, Any]) -> str:
         ("Document type", info.get("document_type"), info.get("type_source")),
         ("Sub-type", info.get("subtype") or "-", info.get("subtype_source", "-")),
         ("Language", info.get("language"), info.get("language_source")),
-        ("Confidence", f"{float(info.get('confidence', 0)):.2f}", info.get("method", "-")),
+        ("Suggested type", info.get("suggested_document_type") or "-", "advisory only; select it to apply"),
+        (
+            "Confidence",
+            f"{float(info['confidence']):.2f}" if info.get("confidence") is not None else "n/a",
+            info.get("method", "-"),
+        ),
         ("Model", info.get("model_used", "-"), "fallback used" if info.get("fallback_occurred") else "routed"),
     ]
     lines = ["| Field | Value | Source |", "| --- | --- | --- |"]
@@ -152,6 +188,32 @@ def _write_json_download(document_id: str, text: str) -> str:
     return str(out)
 
 
+def _resolve_original_image(pipe_a: ModuleAPipeline, payload_a) -> Optional[Path]:
+    """Resolves the original (200 DPI) first-page image used as the annotation canvas."""
+    if not payload_a.pages:
+        return None
+    path = pipe_a.storage.resolve_uri_to_path(payload_a.pages[0].original_storage_uri)
+    return path if path.exists() else None
+
+
+def _module_c_for(use_vlm: bool, category: DocumentCategory, language: str) -> ModuleCPipeline:
+    """
+    Builds the canonical Module C orchestrator for one request.
+
+    VLM mode: the routed model's multimodal extractor (FR-RTE-001) with the default model as
+    fallback (FR-RTE-003). CPU mode: the deterministic heuristic extractor. Extraction,
+    normalization, evidence and the envelope all happen inside ModuleCPipeline.
+    """
+    if not use_vlm:
+        return ModuleCPipeline(extractor=SchemaGuidedExtractor(use_llm=False))
+
+    routed = get_routed_extractor()
+    primary_name = select_model(category, language, routed.table)
+    default_name = routed.table.get("default_model", DEFAULT_MODEL)
+    fallback = routed.get_extractor(default_name) if default_name != primary_name else None
+    return ModuleCPipeline(extractor=routed.get_extractor(primary_name), fallback_extractor=fallback)
+
+
 def process_document(
     file_obj,
     category_choice: str,
@@ -159,61 +221,78 @@ def process_document(
     subtype_choice: str,
     language_choice: str,
     use_qwen_vl: bool,
+    settings: Optional[Settings] = None,
 ) -> Tuple[Optional[Image.Image], str, str, str, Optional[str]]:
     """Returns (annotated_image, status_text, json_output, classification_markdown, json_file_path).
 
     Category, type, sub-type and language are either user-selected or auto-detected
     (FR-DEMO-002..005). The category picks the model via the routing table (FR-RTE-001).
+    Extraction always runs through ModuleCPipeline; this function only wires Module A/B
+    outputs (including the explicit page-image references) into it and renders the result.
+    ``settings`` defaults to the application settings (see ``get_settings``).
     """
     if file_obj is None:
         return None, "No file uploaded", "{}", "", None
 
-    pipe_a, pipe_b, pipe_c = get_pipeline()
     file_path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
     claimed_name = Path(file_path).name
 
     try:
+        settings = settings if settings is not None else get_settings()
+        pipe_a, pipe_b = get_pipelines(settings)
+
         # 1. Ingestion & preprocessing (Module A)
         payload_a = pipe_a.process_document(file_path, claimed_filename=claimed_name)
         if payload_a.status == "rejected":
             err = json.dumps(payload_a.to_dict(), indent=2)
             return None, f"Rejected: {payload_a.error}", err, "", None
 
-        orig_path = None
-        if payload_a.pages:
-            rec = payload_a.pages[0]
-            prep_path = pipe_a.storage.resolve_uri_to_path(rec.preprocessed_storage_uri)
-            orig_path = pipe_a.storage.resolve_uri_to_path(rec.original_storage_uri)
-            img_path = prep_path if prep_path.exists() else orig_path
-        else:
-            img_path = Path(file_path)
+        # 2. Explicit Module A page-image references (the VLM reads these, never storage guesses)
+        page_images = pipe_b.load_page_images(payload_a)
+        orig_path = _resolve_original_image(pipe_a, payload_a)
 
-        # 2. Rule-based parse/classify (Module B): classification hint and CPU path input
+        # 3. Layout parsing + rule-based classification (Module B, configured OCR backend)
         payload_b = pipe_b.process_handoff(payload_a)
-        rule_type = payload_b.classification.document_type.value
-        rule_type = rule_type if rule_type != "UNKNOWN" else None
+        if payload_b.status == "failed":
+            err = payload_b.error or {}
+            msg = f"Module B failed: {err.get('code', 'UNKNOWN')}: {err.get('message', 'no detail')}"
+            return None, msg, json.dumps({"error": err}, indent=2, default=str), "", None
+        # Module B's content-based type is already subject to its confidence threshold: it is
+        # UNKNOWN (needs_review, no schema bound) whenever classification is inconclusive.
+        module_b_type = payload_b.classification.document_type.value
+        rule_type = module_b_type if module_b_type != "UNKNOWN" else None
+        rule_confidence = payload_b.classification.classification_confidence if rule_type else None
 
-        # 3. Resolve category, type, sub-type, language: user choice wins, else auto-detect
+        # 4. Resolve category, type, sub-type, language: user choice wins, else auto-detect
         user_cat = bool(category_choice) and category_choice != AUTO
         user_type = bool(doc_type_choice) and doc_type_choice != AUTO
         user_lang = bool(language_choice) and language_choice != AUTO
         user_sub = bool(subtype_choice) and subtype_choice != AUTO
 
+        classify_image = page_images[0].image_path if page_images else None
         auto: Dict[str, Any] = {}
         if not (user_cat and user_type and user_lang):
-            if use_qwen_vl and img_path and img_path.exists():
-                auto = get_routed_extractor().classify(str(img_path), claimed_name, rule_type)
+            if use_qwen_vl and classify_image is not None and Path(classify_image).exists():
+                auto = get_routed_extractor().classify(
+                    str(classify_image), claimed_name, rule_type, rule_confidence
+                )
             else:
-                auto = heuristic_classify(claimed_name, rule_type)
+                auto = heuristic_classify(claimed_name, rule_type, rule_confidence)
 
         category = DocumentCategory(category_choice.lower() if user_cat else auto.get("category", "structured"))
 
-        doc_type = doc_type_choice if user_type else (auto.get("document_type") or rule_type)
-        if category == DocumentCategory.STRUCTURED:
-            if doc_type not in SCHEMA_MAP:
-                doc_type = "DOC-01"  # only DOC-01..03 schemas exist so far
-        else:
-            doc_type = doc_type if doc_type in SCHEMA_MAP and user_type else None
+        # A document-specific schema is bound only by (a) Module B's thresholded classification
+        # or (b) an explicit, supported user override. Filename hints and the VLM classifier's
+        # uncalibrated self-reported type may suggest a type but never bind one, and an
+        # unidentified document is never defaulted to DOC-01.
+        doc_type = doc_type_choice if user_type else rule_type
+        if doc_type not in SCHEMA_MAP:
+            doc_type = None
+        if category != DocumentCategory.STRUCTURED and not user_type:
+            doc_type = None
+        suggested_type = auto.get("document_type") if auto.get("document_type") in SCHEMA_MAP else None
+        if suggested_type == doc_type:
+            suggested_type = None
 
         language = LANGUAGES[language_choice] if user_lang else str(auto.get("language") or "en")
         subtype = subtype_choice if user_sub else auto.get("subtype")
@@ -223,118 +302,92 @@ def process_document(
         info: Dict[str, Any] = {
             "category": category.value,
             "category_source": "user" if user_cat else "auto",
-            "document_type": doc_type or "generic",
-            "type_source": "user" if user_type else "auto",
+            "document_type": doc_type or ("UNKNOWN" if category == DocumentCategory.STRUCTURED else "generic"),
+            "type_source": "user" if user_type else ("module_b" if doc_type else "unidentified"),
+            "suggested_document_type": suggested_type,
             "subtype": subtype,
             "subtype_source": "user" if user_sub else "auto",
             "language": language,
             "language_source": "user" if user_lang else "auto",
-            "confidence": 1.0 if user_cat else auto.get("confidence", 0.0),
+            # Reported as measured, or None (unavailable): nothing is invented for display either.
+            "confidence": None if user_cat else auto.get("confidence"),
             "method": "user" if user_cat else auto.get("method", "-"),
         }
 
-        schema_cls = SCHEMA_MAP.get(doc_type) if doc_type else None
+        schema_bound = category == DocumentCategory.STRUCTURED and doc_type in SCHEMA_MAP
+        unidentified = category == DocumentCategory.STRUCTURED and doc_type is None
+        use_vlm = bool(use_qwen_vl and page_images)
 
-        # 4. Extraction
-        if use_qwen_vl and img_path and img_path.exists():
-            raw_dict, prov, route = get_routed_extractor().extract(
-                str(img_path), category, language, schema_cls, subtype
-            )
-            info["model_used"] = route["model_used"]
-            info["fallback_occurred"] = route["fallback_occurred"]
-
-            with Image.open(orig_path if orig_path and orig_path.exists() else img_path) as pil_img:
-                w, h = pil_img.size
-                base_img = pil_img.copy()
-
-            fields_dict: Dict[str, Any] = {}
-            for fpath, item in raw_dict.items():
-                if not isinstance(item, dict):
-                    continue
-                v = item.get("value")
-                bbox = item.get("bbox")
-                if v is None and bbox is None:
-                    continue
-                ev = None
-                if bbox and len(bbox) == 4:
-                    ev = {
-                        "page": 1,
-                        "bbox": _bbox_to_pixels(bbox, w, h),
-                        "text_snippet": str(v)[:120],
-                        "ocr_confidence": 0.95,
-                    }
-                fields_dict[fpath] = {
-                    "value": v,
-                    "calibrated_confidence": 0.95 if v is not None else 0.0,
-                    "review_required": category == DocumentCategory.HANDWRITTEN or bool(item.get("uncertain")),
-                    "evidence": ev,
-                }
-
-            annotated_img = draw_bounding_boxes(base_img, fields_dict)
-            envelope = {
-                "document_id": payload_a.document_id,
-                "document_metadata": {
-                    "document_category": category.value,
-                    "document_type": doc_type or "generic",
-                    "document_subtype": subtype,
-                    "language": language,
-                    "schema_id": doc_type,
-                    "schema_version": "1.0.0" if doc_type else None,
-                    "classification_confidence": info["confidence"],
-                    "status": "valid",
-                    "page_count": len(payload_a.pages),
-                },
-                "fields": fields_dict,
-                "flags": [],
-                "run": {
-                    "run_id": payload_a.run_id,
-                    "document_category": category.value,
-                    "model_versions": {
-                        "routed_model": route["model_used"],
-                        "normalizer": "deterministic-v1",
-                    },
-                    "routing": route,
-                    "provenance": prov.model_dump() if hasattr(prov, "model_dump") else prov,
-                },
-            }
-            json_text = json.dumps(envelope, indent=2, default=str)
-            status_msg = (
-                f"Status: VALID | Category: {category.value} | Type: {doc_type or 'generic'} | "
-                f"Fields: {len(fields_dict)} | Model: {route['model_used']}"
-            )
-            return annotated_img, status_msg, json_text, _classification_markdown(info), _write_json_download(payload_a.document_id, json_text)
-
-        # CPU heuristic fast path: only the rule-based structured schemas are supported
-        if category != DocumentCategory.STRUCTURED or doc_type not in SCHEMA_MAP:
+        # CPU heuristic mode only supports the rule-based structured schemas
+        if not use_vlm and not schema_bound and not unidentified:
             msg = "CPU heuristic mode only supports structured DOC-01 to DOC-03. Enable the VLM for this category."
             return None, msg, json.dumps({"error": msg}, indent=2), _classification_markdown(info), None
 
-        payload_b.classification.document_type = MVPDocumentType(doc_type)
-        payload_b.classification.schema_id = doc_type
-        payload_b.classification.review_required = False
-        payload_b.classification.classification_confidence = max(0.95, payload_b.classification.classification_confidence)
-        payload_b.status = "processing"
-        pipe_c.extractor.use_llm = False
-        env = pipe_c.process(payload_b)
+        # 5. Canonical extraction: ModuleCPipeline is the only extraction/envelope path
+        # Unidentified docs run nothing (they are routed to review without a model call).
+        module_c = _module_c_for(use_vlm and not unidentified, category, language)
+        if unidentified:
+            # Inconclusive classification: Module C routes UNKNOWN to needs_review without running
+            # any schema-specific extraction (CLASSIFICATION_UNCERTAIN). A supported type must be
+            # selected explicitly to process the document.
+            env = module_c.process(payload_b)
+        elif schema_bound:
+            if user_type and payload_b.classification.document_type.value != doc_type:
+                # Explicit user override via Module B's audited override path (FR-CLS-004):
+                # resolves the approved schema and records who overrode the type and why.
+                payload_b = pipe_b.apply_reviewer_override(
+                    payload_b,
+                    ReviewerOverrideRequest(
+                        document_id=payload_b.document_id,
+                        tenant_id=payload_b.tenant_id,
+                        reviewer_id=OVERRIDE_REVIEWER_ID,
+                        new_document_type=MVPDocumentType(doc_type),
+                        override_reason="Document type explicitly selected in the extraction UI",
+                    ),
+                )
+            env = module_c.process(payload_b, page_images=page_images if use_vlm else None)
+        else:
+            env = module_c.process_generic(
+                payload_b,
+                page_images,
+                build_generic_prompt(category, subtype, language),
+                document_type=doc_type or "generic",
+                force_review=category == DocumentCategory.HANDWRITTEN,
+            )
+
+        provenance = env.run.provenance
+        info["model_used"] = (provenance.model_name if provenance else None) or env.run.model_versions.get(
+            "extractor", "-"
+        )
+        info["fallback_occurred"] = bool(provenance and provenance.fallback_occurred)
 
         annotated_img = None
-        if orig_path and orig_path.exists():
+        if orig_path is not None:
             with Image.open(orig_path) as pil_img:
                 annotated_img = draw_bounding_boxes(pil_img, env.fields)
-        info["model_used"] = "heuristic"
+
         status_msg = (
-            f"Status: {env.document_metadata.status.upper()} | Type: {env.document_metadata.document_type} | "
-            f"Confidence: {env.document_metadata.classification_confidence:.2f} | Flags: {len(env.flags)}"
+            f"Status: {env.document_metadata.status.upper()} | Category: {category.value} | "
+            f"Type: {env.document_metadata.document_type} | Fields: {len(env.fields)} | "
+            f"Flags: {len(env.flags)} | Model: {info['model_used']}"
         )
         json_text = json.dumps(env.model_dump(), indent=2, default=str)
-        return annotated_img, status_msg, json_text, _classification_markdown(info), _write_json_download(payload_a.document_id, json_text)
+        return (
+            annotated_img,
+            status_msg,
+            json_text,
+            _classification_markdown(info),
+            _write_json_download(payload_a.document_id, json_text),
+        )
 
     except Exception as e:
         return None, f"Error: {e}", json.dumps({"error": str(e)}, indent=2), "", None
 
 
-def create_demo() -> "gr.Blocks":
-    """Constructs Gradio UI layout (FR-DEMO-001..006)."""
+def create_demo(settings: Optional[Settings] = None) -> "gr.Blocks":
+    """Constructs Gradio UI layout (FR-DEMO-001..006). ``settings`` configures every module it runs."""
+    if settings is not None:
+        configure_settings(settings)
     with gr.Blocks(title="Document Extraction Engine") as demo:
         gr.Markdown(
             "# 📄 Document Extraction Engine\n"
