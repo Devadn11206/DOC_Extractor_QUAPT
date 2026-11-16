@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union, get_origin
 import urllib.request
 from pydantic import BaseModel
 
@@ -23,8 +23,22 @@ from doc_extractor.contracts_c import (
     ExecutionMode,
     ExecutionProvenance,
     ExtractionResult,
+    FieldGrounding,
+    GenericExtractionResult,
+    PageImageRef,
 )
 from doc_extractor.exceptions import LLMExecutionError
+from doc_extractor import vlm_runtime
+from doc_extractor.vlm_grounding import (
+    PageLeaf,
+    aggregate_leaves,
+    build_partial_model_from_pages,
+    relaxed_schema,
+    validate_allowing_missing,
+    collect_generic_leaves,
+    collect_schema_leaves,
+    validate_page_leaves,
+)
 from doc_extractor.schemas import (
     CASASchema,
     DischargeSummarySchema,
@@ -146,10 +160,193 @@ def format_indian_currency(n: int) -> str:
     return f"-{res}" if n < 0 else res
 
 
+
+
+def _find_labeled_line_evidence(
+    value: Any,
+    pages: List[PageLayoutOutput],
+    field_name: Optional[str],
+    evidence_value: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Find field evidence by matching a value and its label across adjacent OCR blocks."""
+    if not field_name:
+        return None
+
+    leaf = field_name.split(".")[-1].lower()
+
+    aliases = {
+        "full_name": ("applicant name", "customer name", "account holder name", "name"),
+        "pan_card_number": ("pan card number", "pan number", "pan"),
+        "date_of_birth": ("date of birth", "birth date", "dob"),
+        "phone_number": ("mobile number", "phone number", "contact number", "mobile", "phone"),
+        "account_type": ("account type",),
+        "initial_deposit_amount": ("initial deposit amount", "deposit amount", "initial deposit"),
+        "currency": ("currency",),
+        "cheque_book": ("cheque book", "check book"),
+        "debit_card": ("debit card",),
+        "internet_banking": ("internet banking", "net banking"),
+    }
+
+    field_aliases = aliases.get(
+        leaf,
+        (leaf.replace("_", " "),),
+    )
+
+    def normalize(text: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", text.lower())
+
+    target_values = []
+
+    if isinstance(value, bool):
+        target_values.append("yes" if value else "no")
+    else:
+        target_values.append(value)
+
+    if evidence_value is not None:
+        target_values.append(evidence_value)
+
+    targets = set()
+    for item in target_values:
+        if item is None or isinstance(item, bool):
+            continue
+
+        if isinstance(item, (int, float, Decimal)) and float(item).is_integer():
+            item = str(int(item))
+
+        normalized = normalize(str(item))
+        if normalized:
+            targets.add(normalized)
+
+    if not targets:
+        return None
+
+    normalized_aliases = [
+        normalize(alias) for alias in field_aliases if normalize(alias)
+    ]
+
+    best_match = None
+    best_score = -1.0
+
+    for page in pages:
+        blocks = []
+
+        for block in page.blocks:
+            bbox = block.bbox_original or block.bbox_preprocessed
+            if bbox is None or not block.text.strip():
+                continue
+
+            height = max(1.0, bbox.y1 - bbox.y0)
+
+            blocks.append({
+                "block": block,
+                "bbox": bbox,
+                "cy": (bbox.y0 + bbox.y1) / 2.0,
+                "height": height,
+            })
+
+        # Group vertically aligned OCR words into rows.
+        rows = []
+
+        for item in sorted(blocks, key=lambda x: x["cy"]):
+            matching_row = None
+
+            for row in reversed(rows):
+                row_cy = sum(x["cy"] for x in row) / len(row)
+                tolerance = max(
+                    10.0,
+                    0.55 * min(item["height"], max(x["height"] for x in row)),
+                )
+
+                if abs(item["cy"] - row_cy) <= tolerance:
+                    matching_row = row
+                    break
+
+            if matching_row is None:
+                rows.append([item])
+            else:
+                matching_row.append(item)
+
+        # Split rows at large horizontal gaps.
+        for row in rows:
+            row.sort(key=lambda x: x["bbox"].x0)
+            segments = []
+            current = []
+
+            for item in row:
+                if current:
+                    previous = current[-1]
+                    gap = item["bbox"].x0 - previous["bbox"].x1
+                    max_gap = max(
+                        45.0,
+                        1.75 * max(item["height"], previous["height"]),
+                    )
+
+                    if gap > max_gap:
+                        segments.append(current)
+                        current = []
+
+                current.append(item)
+
+            if current:
+                segments.append(current)
+
+            for segment in segments:
+                line_text = " ".join(
+                    item["block"].text.strip() for item in segment
+                )
+                normalized_line = normalize(line_text)
+
+                matched_aliases = [
+                    alias for alias in normalized_aliases
+                    if alias in normalized_line
+                ]
+
+                if not matched_aliases:
+                    continue
+
+                if not any(target in normalized_line for target in targets):
+                    continue
+
+                bbox = {
+                    "x0": min(x["bbox"].x0 for x in segment),
+                    "y0": min(x["bbox"].y0 for x in segment),
+                    "x1": max(x["bbox"].x1 for x in segment),
+                    "y1": max(x["bbox"].y1 for x in segment),
+                }
+
+                confs = [
+                    x["block"].ocr_confidence for x in segment
+                    if x["block"].ocr_confidence is not None
+                ]
+                confidence = (
+                    round(sum(confs) / len(confs), 4)
+                    if confs
+                    else None
+                )
+
+                specificity = max(len(alias) for alias in matched_aliases)
+                score = specificity + (confidence if confidence is not None else 0.0)
+
+                if score > best_score:
+                    best_score = score
+                    best_match = {
+                        "page": page.page_number,
+                        "bbox": (
+                            bbox["x0"], bbox["y0"],
+                            bbox["x1"], bbox["y1"],
+                        ),
+                        "text": line_text[:160],
+                        "ocr_confidence": confidence,
+                    }
+
+    return best_match
+
+
 def find_evidence_for_value(
     value: Any,
     pages: List[PageLayoutOutput],
     field_name: Optional[str] = None,
+    evidence_value: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """
     FR-EXT-004 & GR-002: Evidence Bounding Boxes.
@@ -188,7 +385,8 @@ def find_evidence_for_value(
                             "page": page.page_number,
                             "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
                             "text": cb.state,
-                            "ocr_confidence": 0.5 if cb.is_uncertain else cb.ocr_confidence,
+                            "ocr_confidence": cb.ocr_confidence,
+                            "uncertain": cb.is_uncertain,
                         }
 
         if matched_any_checkbox_for_field:
@@ -204,11 +402,25 @@ def find_evidence_for_value(
                             "page": page.page_number,
                             "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
                             "text": cb.state,
-                            "ocr_confidence": 0.5 if cb.is_uncertain else cb.ocr_confidence,
+                            "ocr_confidence": cb.ocr_confidence,
+                            "uncertain": cb.is_uncertain,
                         }
+
+        # Textual YES/NO evidence is acceptable only when explicitly
+        # associated with the requested field label.
+        if field_name and not matched_any_checkbox_for_field:
+            text_evidence = _find_labeled_line_evidence(
+                value, pages, field_name, evidence_value
+            )
+            if text_evidence:
+                return text_evidence
+
         return None
 
     candidates = [str(value).strip().lower()]
+    if evidence_value is not None:
+        candidates.append(str(evidence_value).strip().lower())
+
     clean_numeric_targets: List[str] = []
 
     if isinstance(value, (int, float, Decimal)):
@@ -249,8 +461,18 @@ def find_evidence_for_value(
                     "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1),
                     "text": grid_text,
                     "ocr_confidence": grid.mean_ocr_confidence,
+                    "uncertain": grid.has_ambiguity or any(c.is_uncertain for c in grid.character_boxes),
                 }
 
+        # 2. Label-aware matching across adjacent OCR word blocks.
+        # This handles names, normalized dates/phones and repeated values.
+        labeled_evidence = _find_labeled_line_evidence(
+            value, [page], field_name, evidence_value
+        )
+        if labeled_evidence:
+            return labeled_evidence
+
+        # 3. Layout blocks (paragraphs, key-value pairs, headers)
         for block in page.blocks:
             block_text = block.text.strip()
             if matches_text(block_text):
@@ -291,6 +513,8 @@ class SchemaGuidedExtractor:
         allow_fallback: bool = True,
         prompt_version: str = "1.0.0",
         provider_name: Optional[str] = None,
+        api_base: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
         is_mock: bool = False,
         llm_caller: Optional[Callable[[ModuleBOutputPayload, Type[BaseModel]], Tuple[Any, Optional[str]]]] = None,
         # Single GPU by default (faster than splitting layers across cards). "single" resolves to
@@ -298,14 +522,42 @@ class SchemaGuidedExtractor:
         device: str = os.environ.get("DOC_DEVICE_MAP", "single"),
         max_new_tokens: int = 2048,
         temperature: float = 0.0,
-        trust_remote_code: bool = True,
+        trust_remote_code: bool = False,
         load_in_4bit: bool = True,
+        multimodal: Optional[bool] = None,
+        precision: str = "auto",
+        allow_cpu: bool = False,
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        min_vram_gib: Optional[float] = None,
     ):
+        """
+        ``multimodal`` selects whether this extractor reads Module A page images directly
+        (Qwen-VL, PRD v1.3) when page images are supplied. ``None`` infers it from the model:
+        VLM model names (e.g. 'Qwen/Qwen3-VL-8B-Instruct') are multimodal; Ollama/text models
+        are not and keep extracting from Module B markdown.
+
+        Local Qwen-VL runtime (see ``doc_extractor.vlm_runtime``): ``precision`` is ``"auto"`` (BF16
+        only on GPUs with native support, FP16 otherwise, e.g. Tesla T4), or an explicit
+        ``"bfloat16"`` / ``"float16"`` / ``"float32"`` that is honoured or rejected, never silently
+        changed. ``load_in_4bit`` (default) uses bitsandbytes NF4 with the selected compute dtype and
+        fails with an actionable error when unavailable; it never degrades to another precision.
+        ``allow_cpu`` opts in to a (very slow) CPU run. ``min_pixels`` / ``max_pixels`` default to the
+        checkpoint's official image budget. ``trust_remote_code`` defaults to False: Qwen-VL is
+        natively supported by Transformers >= 4.57.1.
+        """
         self.model_name = model_name
+        self.multimodal = (
+            multimodal
+            if multimodal is not None
+            else self._infer_multimodal(model_name, provider_name, api_base)
+        )
         self.use_llm = use_llm
         self.allow_fallback = allow_fallback
         self.prompt_version = prompt_version
         self.provider_name = provider_name
+        self.api_base = api_base
+        self.timeout_seconds = timeout_seconds
         self.is_mock = is_mock
         self.llm_caller = llm_caller
         self.device = device
@@ -313,10 +565,64 @@ class SchemaGuidedExtractor:
         self.temperature = temperature
         self.trust_remote_code = trust_remote_code
         self.load_in_4bit = load_in_4bit
+        self.precision = precision
+        self.allow_cpu = allow_cpu
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
+        self.min_vram_gib = min_vram_gib
         self._model = None
         self._processor = None
+        self._image_config = None
+        self._load_error: Optional[Exception] = None
+        # Versions, loader class, dtype, quantization and image settings of the loaded model
+        # (None until a real model is loaded); recorded in the run provenance.
+        self.runtime_info: Optional[Dict[str, Any]] = None
         self._local = threading.local()
         self._local.last_provenance = None
+
+    @staticmethod
+    def _infer_multimodal(
+        model_name: Optional[str],
+        provider_name: Optional[str],
+        api_base: Optional[str],
+    ) -> bool:
+        name = (model_name or "").lower()
+        if provider_name == "ollama" or name.startswith("ollama/") or (api_base and "11434" in str(api_base)):
+            return False
+        return "-vl-" in name or name.endswith("-vl")
+
+    @classmethod
+    def for_local_ollama(
+        cls,
+        model_name: str = "ollama/qwen2.5:7b-instruct",
+        api_base: str = "http://localhost:11434",
+        use_llm: bool = True,
+        allow_fallback: bool = False,
+        timeout_seconds: float = 30.0,
+        prompt_version: str = "1.0.0",
+    ) -> "SchemaGuidedExtractor":
+        """Factory creating a SchemaGuidedExtractor configured for local Ollama Qwen2.5-7B-Instruct."""
+        return cls(
+            model_name=model_name,
+            use_llm=use_llm,
+            allow_fallback=allow_fallback,
+            prompt_version=prompt_version,
+            provider_name="ollama",
+            api_base=api_base,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @classmethod
+    def from_settings(cls, settings: Any) -> "SchemaGuidedExtractor":
+        """Factory creating a SchemaGuidedExtractor from Settings."""
+        return cls(
+            model_name=getattr(settings, "llm_model_name", "ollama/qwen2.5:7b-instruct"),
+            use_llm=getattr(settings, "llm_use_inference", True),
+            allow_fallback=getattr(settings, "llm_allow_fallback", False),
+            provider_name=getattr(settings, "llm_provider", "ollama"),
+            api_base=getattr(settings, "llm_api_base", "http://localhost:11434"),
+            timeout_seconds=getattr(settings, "llm_timeout_seconds", 30.0),
+        )
 
     @property
     def last_provenance(self) -> Optional[ExecutionProvenance]:
@@ -335,19 +641,25 @@ class SchemaGuidedExtractor:
         self,
         payload: ModuleBOutputPayload,
         schema_cls: Optional[Type[BaseModel]] = None,
+        page_images: Optional[Sequence[PageImageRef]] = None,
     ) -> BaseModel:
         """Legacy/default extraction interface returning BaseModel directly."""
-        result = self.extract_with_provenance(payload, schema_cls=schema_cls)
+        result = self.extract_with_provenance(payload, schema_cls=schema_cls, page_images=page_images)
         return result.payload
 
     def extract_with_provenance(
         self,
         payload: ModuleBOutputPayload,
         schema_cls: Optional[Type[BaseModel]] = None,
+        page_images: Optional[Sequence[PageImageRef]] = None,
     ) -> ExtractionResult:
         """
         Extracts structured data and generates trusted execution provenance (SCH-007).
         Enforces strict no-fallback behavior when allow_fallback=False.
+
+        ``page_images`` are the explicit Module A page-image references. A multimodal
+        extractor (Qwen-VL) reads them directly and returns per-field grounding; text-only
+        extractors (Ollama/litellm, heuristics) ignore them and use Module B markdown.
         """
         self.last_provenance = None
 
@@ -372,26 +684,44 @@ class SchemaGuidedExtractor:
 
         # 2. Genuine LLM requested
         if self.use_llm:
+            provider = self.provider_name or (
+                "ollama"
+                if (
+                    self.model_name.startswith("ollama/")
+                    or (self.api_base and "11434" in str(self.api_base))
+                )
+                else "litellm"
+            )
             try:
-                model_result, request_id = self._extract_llm_internal(payload, target_schema)
+                grounding: Dict[str, FieldGrounding] = {}
+                request_id: Optional[str] = None
+                details: Dict[str, Any] = {}
+                if page_images and self.multimodal and self.llm_caller is None:
+                    # PRD v1.3 1-stage path: Qwen-VL reads every explicit Module A page image.
+                    model_result, grounding, provider, details = self._extract_vlm_internal(
+                        target_schema, page_images
+                    )
+                else:
+                    model_result, request_id = self._extract_llm_internal(payload, target_schema)
                 prov = ExecutionProvenance(
                     mode=ExecutionMode.GENUINE_LLM,
                     model_name=self.model_name,
-                    provider=self.provider_name or "litellm",
+                    provider=provider,
                     prompt_version=self.prompt_version,
                     fallback_occurred=False,
                     request_id=request_id,
+                    details=details,
                 )
                 self.last_provenance = prov
-                return ExtractionResult(payload=model_result, provenance=prov)
+                return ExtractionResult(payload=model_result, provenance=prov, grounding=grounding)
             except Exception as exc:
                 if not self.allow_fallback:
                     prov = ExecutionProvenance(
                         mode=ExecutionMode.GENUINE_LLM,
                         model_name=self.model_name,
-                        provider=self.provider_name or "litellm",
+                        provider=provider,
                         prompt_version=self.prompt_version,
-                        fallback_occurred=True,
+                        fallback_occurred=False,
                         fallback_reason=str(exc),
                     )
                     self.last_provenance = prov
@@ -406,7 +736,7 @@ class SchemaGuidedExtractor:
                 prov = ExecutionProvenance(
                     mode=ExecutionMode.HEURISTIC_FALLBACK,
                     model_name=self.model_name,
-                    provider=self.provider_name or "litellm",
+                    provider=provider,
                     prompt_version=self.prompt_version,
                     fallback_occurred=True,
                     fallback_reason=str(exc),
@@ -426,6 +756,16 @@ class SchemaGuidedExtractor:
         self.last_provenance = prov
         return ExtractionResult(payload=heuristic_model, provenance=prov)
 
+    def _validate_dict(
+        self,
+        payload: ModuleBOutputPayload,
+        schema_cls: Type[BaseModel],
+        data: Dict[str, Any],
+    ) -> BaseModel:
+        """Types a dict result; an absent required field keeps the rest (see vlm_grounding)."""
+        model, _missing = validate_allowing_missing(schema_cls, data)
+        return model
+
     def _extract_llm_internal(
         self,
         payload: ModuleBOutputPayload,
@@ -444,42 +784,79 @@ class SchemaGuidedExtractor:
 
             if not isinstance(model_inst, schema_cls):
                 if isinstance(model_inst, dict):
-                    model_inst = schema_cls.model_validate(model_inst)
+                    model_inst = self._validate_dict(payload, schema_cls, model_inst)
                 else:
                     raise ValueError(f"LLM caller returned {type(model_inst).__name__}, expected {schema_cls.__name__}")
 
             request_id = str(req_id).strip() if (req_id is not None and str(req_id).strip()) else None
             return model_inst, request_id
 
-        # Multimodal VLM path: Module B now records the preprocessed page image path on each page
+        # Legacy single-page vision path (PRD v1.5 hand-off): Module B records the preprocessed page
+        # image path on each page. It carries NO geometry, so no grounding/evidence can be produced
+        # from it; callers that need evidence pass explicit Module A PageImageRefs (the authoritative
+        # geometry source) to extract_with_provenance, which takes the _extract_vlm_internal path.
         first_img = getattr(payload.pages[0], "page_image_path", None) if payload.pages else None
-        if first_img and os.path.exists(first_img):
+        if self.multimodal and first_img and os.path.exists(first_img):
             raw_dict, _ = self.extract_page_image(first_img, schema_cls)
             return schema_cls.model_validate(_flat_to_nested(raw_dict)), None
 
-        # Text LLM fallback via instructor / litellm
+        # Text LLM path via instructor / litellm (Ollama or other text models). The grounded
+        # multimodal path is _extract_vlm_internal, which receives explicit Module A page-image
+        # references.
         import instructor
         import litellm
 
-        client = instructor.from_litellm(litellm.completion)
-        completion_res = client.chat.completions.create_with_completion(
-            model=self.model_name,
-            response_model=schema_cls,
-            messages=[
+        resolved_model = self.model_name
+        is_ollama = (
+            self.provider_name == "ollama"
+            or resolved_model.startswith("ollama/")
+            or (self.api_base and "11434" in str(self.api_base))
+        )
+        if is_ollama and not resolved_model.startswith("ollama/"):
+            if resolved_model in ("Qwen2.5-7B-Instruct", "qwen2.5-7b-instruct"):
+                resolved_model = "ollama/qwen2.5:7b-instruct"
+            else:
+                resolved_model = f"ollama/{resolved_model}"
+
+        system_message = (
+            "You are a schema-constrained document extraction engine. "
+            "Extract only fields defined in the supplied Pydantic schema. "
+            "Use only information explicitly present in the source document. "
+            "Set absent or illegible scalar fields to null and absent collections to empty lists. "
+            "Never infer, guess, calculate, or hallucinate values. "
+            "Return strictly valid JSON matching the schema."
+        )
+
+        response_mode = (
+            instructor.Mode.JSON if is_ollama else instructor.Mode.TOOLS
+        )
+        client = instructor.from_litellm(
+            litellm.completion,
+            mode=response_mode,
+        )
+        call_kwargs: Dict[str, Any] = {
+            "model": resolved_model,
+            # Requiredness-relaxed twin: a required field the model could not find must not
+            # discard everything else it did extract (it is reported as missing downstream).
+            "response_model": relaxed_schema(schema_cls),
+            "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a schema-constrained document extraction engine. "
-                        "Extract only the fields defined in the schema from the provided document text. "
-                        "If a field is absent or not legibly visible, set it to null. "
-                        "Never infer, guess, or hallucinate values. "
-                        "Return strictly valid JSON matching the schema."
-                    ),
+                    "content": system_message,
                 },
                 {"role": "user", "content": payload.combined_markdown},
             ],
-            temperature=0.0,
-        )
+            "temperature": 0.0,
+            "_skip_mcp_handler": True,
+        }
+        if self.api_base:
+            call_kwargs["api_base"] = self.api_base
+        if self.timeout_seconds:
+            call_kwargs["timeout"] = self.timeout_seconds
+        if is_ollama:
+            call_kwargs["custom_llm_provider"] = "ollama"
+
+        completion_res = client.chat.completions.create_with_completion(**call_kwargs)
 
         if isinstance(completion_res, tuple) and len(completion_res) == 2:
             model_inst, raw_completion = completion_res
@@ -491,7 +868,7 @@ class SchemaGuidedExtractor:
 
         if not isinstance(model_inst, schema_cls):
             if isinstance(model_inst, dict):
-                model_inst = schema_cls.model_validate(model_inst)
+                model_inst = self._validate_dict(payload, schema_cls, model_inst)
             else:
                 raise ValueError(
                     f"LLM provider returned invalid object of type {type(model_inst).__name__}, expected {schema_cls.__name__}"
@@ -504,6 +881,151 @@ class SchemaGuidedExtractor:
                 request_id = str(raw_id).strip()
 
         return model_inst, request_id
+
+    def _extract_vlm_internal(
+        self,
+        schema_cls: Type[BaseModel],
+        page_images: Sequence[PageImageRef],
+    ) -> Tuple[BaseModel, Dict[str, FieldGrounding], str, Dict[str, Any]]:
+        """
+        Multimodal extraction over every supplied Module A page image, in document order.
+
+        Each page image is sent to the VLM (``extract_page_image``) on its own; the per-page
+        results are aggregated schema-aware (see ``vlm_grounding.aggregate_leaves``) into one
+        typed schema instance plus per-field, page-specific grounding.
+        Returns (model, grounding, provider, details) where ``details`` records the pages
+        attempted / processed / failed / empty for coverage reporting.
+        """
+        processed, details, provider = self._read_pages(
+            page_images,
+            schema_cls=schema_cls,
+            system_prompt=None,
+            collect=lambda raw: collect_schema_leaves(raw, schema_cls),
+            validate=lambda leaves: validate_page_leaves(schema_cls, leaves),
+        )
+        # Required fields absent from every page do not discard what WAS extracted: they are
+        # recorded (details + per-field validation + REQUIRED_FIELD_MISSING flag downstream).
+        # Malformed values still raise.
+        model, grounding, missing = build_partial_model_from_pages(processed, schema_cls)
+        details["required_fields_missing"] = missing
+        if self.runtime_info:
+            details["runtime"] = self.runtime_info
+        return model, grounding, provider, details
+
+    def extract_generic_pages(
+        self,
+        page_images: Sequence[PageImageRef],
+        system_prompt: str,
+    ) -> GenericExtractionResult:
+        """
+        Schema-less multimodal extraction (unstructured / handwritten categories) over every
+        supplied page image, aggregated with the same page-aware rules as the schema-bound path.
+        """
+        processed, details, provider = self._read_pages(
+            page_images,
+            schema_cls=None,
+            system_prompt=system_prompt,
+            collect=collect_generic_leaves,
+            validate=None,
+        )
+        values, grounding = aggregate_leaves(processed)
+        if self.runtime_info:
+            details["runtime"] = self.runtime_info
+        prov = ExecutionProvenance(
+            mode=ExecutionMode.GENUINE_LLM,
+            model_name=self.model_name,
+            provider=provider,
+            prompt_version=self.prompt_version,
+            fallback_occurred=False,
+            details=details,
+        )
+        self.last_provenance = prov
+        return GenericExtractionResult(values=values, provenance=prov, grounding=grounding)
+
+    def _read_pages(
+        self,
+        page_images: Sequence[PageImageRef],
+        schema_cls: Optional[Type[BaseModel]],
+        system_prompt: Optional[str],
+        collect: Callable[[Dict[str, Any]], Dict[str, PageLeaf]],
+        validate: Optional[Callable[[Dict[str, PageLeaf]], None]],
+    ) -> Tuple[List[Tuple[int, Dict[str, PageLeaf]]], Dict[str, Any], str]:
+        """
+        Runs the VLM once per page image (document order, one image per page number). A page
+        failure - missing image file, VLM error, blank/non-JSON output, or values that violate the
+        schema - is recorded and does NOT discard the other pages. A page whose processing
+        succeeded but yielded no values is *processed (empty)*, not failed. Raises only when no
+        page could be processed at all.
+        """
+        unique: Dict[int, PageImageRef] = {}
+        for ref in page_images:
+            unique.setdefault(ref.page_number, ref)
+        ordered = [unique[n] for n in sorted(unique)]
+        multi = len(ordered) > 1
+
+        processed: List[Tuple[int, Dict[str, PageLeaf]]] = []
+        failed: List[Dict[str, Any]] = []
+        empty: List[int] = []
+        provider = "qwen_vl"
+
+        for ref in ordered:
+            try:
+                image_path = Path(ref.image_path)
+                if not image_path.is_file():
+                    raise FileNotFoundError(f"page image does not exist: {image_path}")
+                raw, vlm_prov = self.extract_page_image(
+                    str(image_path),
+                    schema_cls,
+                    system_prompt=system_prompt,
+                    user_text=self._page_user_text(ref.page_number, len(ordered)) if multi else None,
+                )
+                provider = vlm_prov.provider or provider
+                if not isinstance(raw, dict):
+                    raise ValueError(f"model output is not a JSON object (got {type(raw).__name__})")
+                leaves = collect(raw)
+                if validate is not None:
+                    validate(leaves)
+            except Exception as exc:
+                failed.append({"page": ref.page_number, "reason": f"{type(exc).__name__}: {exc}"})
+                continue
+            processed.append((ref.page_number, leaves))
+            if not leaves:
+                empty.append(ref.page_number)
+
+        if not processed:
+            reasons = "; ".join(f"page {f['page']}: {f['reason']}" for f in failed) or "no page images supplied"
+            raise ValueError(f"No page could be processed by the VLM ({len(ordered)} attempted): {reasons}")
+
+        details = {
+            "input_modality": "image",
+            "pages_attempted": [ref.page_number for ref in ordered],
+            "pages_processed": [n for n, _ in processed],
+            "pages_failed": failed,
+            "pages_empty": empty,
+        }
+        return processed, details, provider
+
+    @staticmethod
+    def _page_user_text(page_number: int, total_pages: int) -> str:
+        return (
+            f"This image is page {page_number} of a {total_pages}-page document that is read one page "
+            "at a time. Transcribe only the values visible on THIS page into the requested JSON "
+            "schema; use null for anything that is not on this page."
+        )
+
+    def _extract_llm(self, payload: ModuleBOutputPayload, schema_cls: Type[BaseModel]) -> BaseModel:
+        """Backward-compatible internal delegate."""
+        try:
+            model_inst, _ = self._extract_llm_internal(payload, schema_cls)
+            return model_inst
+        except Exception as exc:
+            if not self.allow_fallback:
+                raise LLMExecutionError(
+                    message=f"LLM extraction failed under strict no-fallback policy: {exc}",
+                    model_name=self.model_name,
+                    details={"cause": str(exc), "cause_type": type(exc).__name__},
+                ) from exc
+            return self._extract_heuristic(payload, payload.classification.document_type.value, schema_cls)
 
     def extract_page_image(
         self,
@@ -562,6 +1084,9 @@ class SchemaGuidedExtractor:
 
     @staticmethod
     def _parse_json_output(output_text: str) -> Dict[str, Any]:
+        if not (output_text or "").strip():
+            # A blank reply is a failed page, not an empty one; `{}` is a valid empty page.
+            raise ValueError("empty model response")
         return parse_json_tolerant(output_text)
 
     def _generate_from_image(
@@ -572,32 +1097,61 @@ class SchemaGuidedExtractor:
         max_new_tokens: int,
         max_pixels: Optional[int] = None,
     ) -> str:
+        """
+        One Qwen-VL generation over one page image, following the official Qwen3-VL flow:
+        qwen-vl-utils resizes the image once (aspect ratio kept, rounded to the 16-px-patch factor,
+        within the explicit ``min_pixels`` / ``max_pixels``) and the processor is told NOT to resize
+        again (``do_resize=False``). Boxes the model returns are relative to the image it saw, so they
+        stay valid for the Module A geometry (see ``vlm_grounding``).
+        """
         model, processor = self._load_model()
+        family = vlm_runtime.resolve_family(self.model_name)
+        image_config = self._image_config or vlm_runtime.build_image_config(
+            family, self.min_pixels, self.max_pixels
+        )
+
+        if isinstance(image_input, (str, Path)):
+            image: Any = str(image_input)
+        else:
+            import io
+
+            from PIL import Image
+
+            image = Image.open(io.BytesIO(image_input))
         messages = [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": load_capped_image(image_input, max_pixels or MAX_IMAGE_PIXELS)},
+                    vlm_runtime.image_message_element(image, image_config),
                     {"type": "text", "text": user_text},
                 ],
             },
         ]
 
-        from qwen_vl_utils import process_vision_info
+        try:
+            import qwen_vl_utils
+        except ImportError as exc:
+            raise vlm_runtime.VLMRuntimeError(
+                "qwen-vl-utils is not installed. Install the pinned baseline: "
+                f"pip install qwen-vl-utils=={vlm_runtime.QWEN_VL_UTILS_BASELINE} (needs torchvision, which "
+                "comes with your PyTorch install).",
+                code="VLM_DEPENDENCY_MISSING",
+            ) from exc
         import torch
 
+        process_vision_info = vlm_runtime.vision_info_function(qwen_vl_utils, family)
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
+        image_inputs, video_inputs = process_vision_info(messages, image_patch_size=image_config.image_patch_size)
         inputs = processor(
             text=[text],
             images=image_inputs,
             videos=video_inputs,
+            do_resize=False,          # qwen-vl-utils has already resized: never resize twice
             padding=True,
             return_tensors="pt",
         )
-        device = "cuda" if torch.cuda.is_available() else model.device
-        inputs = inputs.to(device)
+        inputs = inputs.to(model.device)
 
         gen_kwargs: Dict[str, Any] = {"max_new_tokens": max_new_tokens}
         if self.temperature > 0:
@@ -662,7 +1216,9 @@ class SchemaGuidedExtractor:
 
         cleaned = re.sub(r"^```json\s*", "", content.strip(), flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned.strip())
-        raw_dict = json.loads(cleaned) if cleaned else {}
+        if not cleaned:
+            raise ValueError("empty model response")
+        raw_dict = json.loads(cleaned)
 
         prov = ExecutionProvenance(
             mode=ExecutionMode.GENUINE_LLM,
@@ -675,54 +1231,37 @@ class SchemaGuidedExtractor:
         return raw_dict, prov
 
     def _load_model(self):
-        """Lazily load Qwen-VL model and processor using official AutoModelForMultimodalLM."""
+        """
+        Lazily loads the Qwen-VL model and processor via ``vlm_runtime.load_qwen_vl``: the exact
+        Transformers class for the checkpoint, hardware-aware dtype, verified 4-bit settings and an
+        actionable ``VLMRuntimeError`` for every incompatibility (no silent fallback to a generic
+        text-only loader, another dtype or non-quantized loading). A model/processor injected into
+        ``self._model`` / ``self._processor`` (unit tests) is used as is.
+        """
         if self._model is None or self._processor is None:
-            import torch
-            import transformers
-            from transformers import AutoProcessor
-
-            self._processor = AutoProcessor.from_pretrained(
-                self.model_name,
-                trust_remote_code=self.trust_remote_code,
-            )
-            device_map = self.device
-            if device_map == "single":
-                device_map = "cuda:0" if torch.cuda.is_available() else "auto"
-            kwargs = {
-                "attn_implementation": "sdpa",  # memory-efficient attention (eager materialises huge matrices)
-                "device_map": device_map,
-                "trust_remote_code": self.trust_remote_code,
-            }
-            if getattr(self, "load_in_4bit", True):
-                try:
-                    from transformers import BitsAndBytesConfig
-                    kwargs["quantization_config"] = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=gpu_dtype(),
-                    )
-                except Exception:
-                    kwargs["torch_dtype"] = gpu_dtype()
-            else:
-                kwargs["torch_dtype"] = gpu_dtype()
-
-            # Official class for Qwen3-VL in transformers is Qwen3VLForConditionalGeneration
-            model_cls = (
-                getattr(transformers, "Qwen3VLForConditionalGeneration", None)
-                or getattr(transformers, "AutoModelForImageTextToText", None)
-                or getattr(transformers, "AutoModelForMultimodalLM", None)
-                or getattr(transformers, "AutoModelForCausalLM", None)
-                or getattr(transformers, "AutoModel", None)
-            )
-
-            if model_cls is None:
-                from transformers import AutoModel
-                model_cls = AutoModel
-
-            self._model = model_cls.from_pretrained(
-                self.model_name,
-                **kwargs,
-            )
-            self._model.eval()
+            if self._load_error is not None:
+                raise self._load_error
+            try:
+                loaded = vlm_runtime.load_qwen_vl(vlm_runtime.VLMLoadConfig(
+                    model_id=self.model_name,
+                    load_in_4bit=getattr(self, "load_in_4bit", True),
+                    precision=self.precision,
+                    allow_cpu=self.allow_cpu,
+                    device_map=self.device,
+                    trust_remote_code=self.trust_remote_code,
+                    min_pixels=self.min_pixels,
+                    max_pixels=self.max_pixels,
+                    min_vram_gib=self.min_vram_gib,
+                ))
+            except vlm_runtime.VLMRuntimeError as exc:
+                # Deterministic compatibility problems are remembered so a document does not retry an
+                # expensive load once per page; an out-of-memory failure may be retried after freeing memory.
+                if exc.code != "VLM_INSUFFICIENT_VRAM":
+                    self._load_error = exc
+                raise
+            self._model, self._processor = loaded.model, loaded.processor
+            self._image_config = loaded.image_config
+            self.runtime_info = loaded.runtime_info
         return self._model, self._processor
 
     def _build_system_prompt(self, schema_cls: Type[BaseModel]) -> str:
@@ -743,7 +1282,10 @@ class SchemaGuidedExtractor:
                             break
 
                 if target_cls:
-                    fields.extend(get_leaf_fields(target_cls, full_name))
+                    # Repeating groups (List[Model]) are listed with an explicit entry index so
+                    # the model can report every entry (nominees.0.name, nominees.1.name, ...).
+                    group_prefix = f"{full_name}.0" if get_origin(ann) in (list, List) else full_name
+                    fields.extend(get_leaf_fields(target_cls, group_prefix))
                 else:
                     desc = info.description or ""
                     fields.append((full_name, desc))
@@ -756,6 +1298,13 @@ class SchemaGuidedExtractor:
                 f'  "{field_name}": {{"value": "<extracted_string_or_null>", "bbox": [x1, y1, x2, y2]}}  # {desc}'
             )
         fields_json = ",\n".join(field_lines)
+        repeating_rule = ""
+        if any(re.search(r"\.0(\.|$)", name) for name, _ in leaf_fields):
+            repeating_rule = (
+                "6. REPEATING GROUPS: fields written with index 0 (for example nominees.0.name) repeat. "
+                "Report every entry visible on this page with consecutive indices (nominees.0.*, "
+                "nominees.1.*, ...). Do not merge entries and do not invent entries that are not visible.\n"
+            )
 
         return f"""You are a high-precision document OCR and extraction engine specialized in Indian BFSI forms.
 
@@ -775,7 +1324,7 @@ CRITICAL RULES:
 7. CHECKBOXES / TICKS: a ticked or marked option is the value (e.g. account_type "SAVINGS" if the Savings box is ticked); for boolean fields use true if ticked, false if clearly unticked, null if not on the form.
 8. OTHER FILLED FIELDS: also add every other filled-in field on the page that is not in the list above, as "other.<snake_case_label>": {{"value": ..., "bbox": [x1, y1, x2, y2]}}.
 9. STRICT FORMAT: Return raw valid JSON only. No markdown fences.
-"""
+{repeating_rule}"""
 
     def _extract_heuristic(
         self,

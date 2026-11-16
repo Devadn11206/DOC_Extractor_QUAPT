@@ -222,8 +222,8 @@ def test_validation_ifsc():
     assert valid == "HDFC0001234"
     assert err is None
 
-    valid2, err2 = validate_ifsc("SBIN0000300")
-    assert valid2 == "SBIN0000300"
+    valid2, err2 = validate_ifsc("ABCD0123456")
+    assert valid2 == "ABCD0123456"
     assert err2 is None
 
     invalid, err_inv = validate_ifsc("HDFC1001234")
@@ -301,9 +301,9 @@ def test_calibrated_confidence_calculation():
     conf_hw = calculate_calibrated_confidence(ocr_confidence=0.90, model_confidence=1.0, validation_passed=True, is_handwritten=True)
     assert conf_hw < 0.90
 
-    # No evidence score
+    # No evidence: confidence is unavailable (None), not an invented 0.0
     conf_no_ev = calculate_calibrated_confidence(ocr_confidence=0.90, has_evidence=False)
-    assert conf_no_ev == 0.0
+    assert conf_no_ev is None
 
 
 def test_evidence_missing_enforcement():

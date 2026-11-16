@@ -11,22 +11,26 @@ Integrates:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 from doc_extractor.contracts_b import ModuleBOutputPayload
 from doc_extractor.contracts_c import (
     CanonicalExtractionEnvelope,
     ExtractedField,
     FlagItem,
+    PageImageRef,
 )
 from doc_extractor.exceptions import LLMExecutionError
 from doc_extractor.extractor import SchemaGuidedExtractor
 from doc_extractor.field_assembly import (
+    DEFAULT_FIELD_CONFIDENCE_THRESHOLD,
     assemble_canonical_envelope,
     assemble_field_entry,
     find_null_reason_signal,
 )
+from doc_extractor.pipeline_c import ModuleCPipeline
 from doc_extractor.rule_evaluator import evaluate_dynamic_rules
+from doc_extractor.vlm_grounding import conflict_flags, grounding_to_evidence_hints
 from doc_extractor.validation_rules import (
     normalize_currency_amount,
     normalize_date_to_iso,
@@ -61,6 +65,7 @@ class DynamicExtractionAdapter:
         schema_id: str,
         version: Union[int, str],
         payload: ModuleBOutputPayload,
+        page_images: Optional[Sequence[PageImageRef]] = None,
     ) -> CanonicalExtractionEnvelope:
         """
         Executes end-to-end dynamic extraction against an exact testing schema version.
@@ -87,13 +92,19 @@ class DynamicExtractionAdapter:
         meta_dict: Dict[str, CompiledFieldMetadata] = getattr(compiled_model_cls, "__field_metadata__", {})
         rules = getattr(compiled_model_cls, "__rules__", [])
 
-        # 3. Execute extraction with strict no-fallback
-        extraction_result = self.extractor.extract_with_provenance(
-            payload=payload,
-            schema_cls=compiled_model_cls,
+        # 3. Execute extraction through Module C's single extraction stage (strict no-fallback:
+        #    the adapter configures no fallback extractor). Optional explicit Module A page images
+        #    let a multimodal extractor read the page; text extractors ignore them.
+        module_c = ModuleCPipeline(extractor=self.extractor)
+        selected_images = module_c._select_page_images(
+            payload.classification.document_type.value, page_images
         )
+        extraction_result = module_c.run_extraction(payload, compiled_model_cls, selected_images)
         extracted_model = extraction_result.payload
         provenance = extraction_result.provenance
+        evidence_hints = grounding_to_evidence_hints(
+            getattr(extraction_result, "grounding", None) or {}, selected_images or []
+        )
 
         # 4. Verify execution provenance integrity (SCH-007)
         if not provenance.is_trusted_for_benchmark(allow_mock=self.allow_mock):
@@ -126,7 +137,19 @@ class DynamicExtractionAdapter:
             bracket_path_alt = re.sub(r"\.\d+", "[]", path)
             if bracket_path_alt in meta_dict:
                 return meta_dict[bracket_path_alt]
+            # Repeating-group item fields are registered without an index (``nominees.name``).
+            unindexed_path = re.sub(r"\.\d+(?=\.|$)", "", path)
+            if unindexed_path in meta_dict:
+                return meta_dict[unindexed_path]
             return None
+
+        def inside_repeating_group(path: str) -> bool:
+            """True for an item-level template path (``nominees.name``): judged per entry, not once."""
+            parts = path.split(".")
+            return any(
+                (m := meta_dict.get(".".join(parts[:i]))) is not None and m.field_type == FieldType.ARRAY
+                for i in range(1, len(parts))
+            )
 
         # 6. Process all fields present in flat_dict
         processed_declared_paths = set()
@@ -148,16 +171,26 @@ class DynamicExtractionAdapter:
                 flags=flags,
                 error=err,
                 required=meta.required if meta else False,
-                confidence_threshold=meta.confidence_threshold if (meta and meta.confidence_threshold is not None) else 0.75,
+                confidence_threshold=(
+                    meta.confidence_threshold
+                    if (meta and meta.confidence_threshold is not None)
+                    else DEFAULT_FIELD_CONFIDENCE_THRESHOLD
+                ),
                 evidence_required=meta.evidence_required if meta else True,
                 explicit_null_reason=null_reason,
                 strict_boolean_evidence=True,
+                evidence_hint=evidence_hints.get(field_path),
             )
             fields_envelope[field_path] = field_entry
 
         # Account for declared scalar/top-level fields omitted from extraction
         for declared_path, meta in meta_dict.items():
-            if declared_path not in processed_declared_paths and not ("[]" in declared_path) and meta.field_type != FieldType.OBJECT:
+            if (
+                declared_path not in processed_declared_paths
+                and "[]" not in declared_path
+                and not inside_repeating_group(declared_path)
+                and meta.field_type != FieldType.OBJECT
+            ):
                 null_reason = find_null_reason_signal(declared_path, payload.pages)
                 fields_envelope[declared_path] = assemble_field_entry(
                     field_name=declared_path,
@@ -165,7 +198,11 @@ class DynamicExtractionAdapter:
                     pages=payload.pages,
                     flags=flags,
                     required=meta.required,
-                    confidence_threshold=meta.confidence_threshold if meta.confidence_threshold is not None else 0.75,
+                    confidence_threshold=(
+                        meta.confidence_threshold
+                        if meta.confidence_threshold is not None
+                        else DEFAULT_FIELD_CONFIDENCE_THRESHOLD
+                    ),
                     evidence_required=meta.evidence_required,
                     explicit_null_reason=null_reason,
                     strict_boolean_evidence=True,
@@ -178,6 +215,15 @@ class DynamicExtractionAdapter:
             fields_envelope=fields_envelope,
             flags=flags,
         )
+
+        flags.extend(conflict_flags(getattr(extraction_result, "grounding", None) or {}))
+        coverage_flag = ModuleCPipeline.partial_coverage_flag(
+            provenance,
+            [p.page_number for p in payload.pages],
+            [r.page_number for r in selected_images] if selected_images else None,
+        )
+        if coverage_flag:
+            flags.append(coverage_flag)
 
         # 8. Assemble canonical output envelope with exact bound version
         return assemble_canonical_envelope(
