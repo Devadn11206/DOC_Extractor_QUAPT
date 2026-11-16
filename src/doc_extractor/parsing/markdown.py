@@ -56,6 +56,7 @@ def sort_blocks_reading_order(
                     element_type=b.element_type,
                     text=b.text,
                     ocr_confidence=b.ocr_confidence,
+                    confidence_provenance=b.confidence_provenance,
                     bbox_preprocessed=b.bbox_preprocessed,
                     bbox_original=b.bbox_original,
                     reading_order_index=idx,

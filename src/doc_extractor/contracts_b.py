@@ -138,6 +138,7 @@ class ModuleBInputPayload(BaseModel):
     completed_at: str
     error: Optional[Dict[str, Any]] = None
     extra_metadata: Dict[str, Any] = Field(default_factory=dict)
+    original_document_storage_uri: Optional[str] = None
 
     @field_validator("contract_version")
     @classmethod
@@ -191,10 +192,11 @@ class LayoutBlock(BaseModel):
     block_id: str
     element_type: LayoutElementType
     text: str
-    ocr_confidence: float = Field(ge=0.0, le=1.0, description="Optical confidence in [0, 1] (FR-PRS-005)")
+    ocr_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Optical confidence in [0, 1] if available (FR-PRS-005)")
     bbox_preprocessed: BoundingBox
     bbox_original: BoundingBox
     reading_order_index: int = Field(ge=0)
+    confidence_provenance: Optional[str] = Field(default=None, description="Confidence provenance (e.g. 'native_text', 'tesseract_ocr')")
 
 
 class CheckboxMark(BaseModel):
@@ -205,7 +207,10 @@ class CheckboxMark(BaseModel):
     """
     mark_id: str
     state: Literal["[x]", "[ ]", "[?]"]
-    ocr_confidence: float = Field(ge=0.0, le=1.0)
+    ocr_confidence: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Measured optical confidence; None when the detector reports none (never invented)",
+    )
     bbox_preprocessed: BoundingBox
     bbox_original: BoundingBox
     is_uncertain: bool = False
@@ -233,7 +238,7 @@ class HTMLTable(BaseModel):
     bbox_original: BoundingBox
     row_count: int = Field(ge=1)
     col_count: int = Field(ge=1)
-    ocr_confidence: float = Field(ge=0.0, le=1.0)
+    ocr_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class CharacterBoxEvidence(BaseModel):
@@ -273,7 +278,8 @@ class PageLayoutOutput(BaseModel):
     key_value_pairs: List[KeyValuePair] = Field(default_factory=list)
     tables: List[HTMLTable] = Field(default_factory=list)
     character_grids: List[CharacterGridMark] = Field(default_factory=list)
-    mean_ocr_confidence: float = Field(ge=0.0, le=1.0, default=1.0)
+    mean_ocr_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Page-level mean OCR confidence if available")
+    confidence_provenance: Optional[str] = Field(default=None, description="Confidence provenance (e.g. 'native_text', 'tesseract_ocr')")
     page_image_path: Optional[str] = Field(
         default=None,
         description="Local path of the preprocessed 200 DPI page image, so Module C can run the vision model on it",
@@ -289,6 +295,9 @@ class ConfidenceProvenance(str, Enum):
     MODEL = "model"              # Derived from calibrated model logprobs / scores
     RULE_HEURISTIC = "heuristic" # Derived from deterministic rule/regex match weights
     UNCALIBRATED = "uncalibrated"# Default nominal score, not a validated probability
+    OCR = "ocr"                  # Measured optical OCR confidence of the evidence text
+    UNAVAILABLE = "unavailable"  # No trustworthy score exists; confidence is None, never invented
+    HUMAN_OVERRIDE = "human_override"  # A reviewer's decision (FR-CLS-004): an assertion, not a model/rule score
 
 
 class ClassificationOutput(BaseModel):

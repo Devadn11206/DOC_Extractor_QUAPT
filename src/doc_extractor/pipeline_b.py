@@ -39,6 +39,7 @@ from doc_extractor.contracts_b import (
     MVPDocumentType,
     PageLayoutOutput,
 )
+from doc_extractor.contracts_c import PageImageRef
 from doc_extractor.exceptions import (
     DocumentExtractorError,
     DocumentProcessingError,
@@ -48,8 +49,9 @@ from doc_extractor.handoff import ModuleAHandoffPayload
 from doc_extractor.idempotency import IdempotencyStore, LocalIdempotencyStore
 from doc_extractor.loader_b import LoadedPageImage, ModuleBLoadResult, SecureModuleBLoader
 from doc_extractor.models import DocumentStatus, IdempotencyRecord
-from doc_extractor.parsing.adapter import LocalOCRParserAdapter
+from doc_extractor.config import Settings
 from doc_extractor.parsing.base import ParserEngine, ParserEngineError
+from doc_extractor.parsing.factory import build_parser_engine
 from doc_extractor.parsing.checkboxes import CandidateCheckboxRegion, CheckboxDetector
 from doc_extractor.parsing.character_grids import CandidateCharacterGrid, CharacterGridReconstructor
 from doc_extractor.parsing.tables import CandidateTableRegion, TableReconstructor
@@ -84,11 +86,19 @@ class ModuleBPipeline:
         schema_registry: Optional[SchemaRegistry] = None,
         idempotency_store: Optional[IdempotencyStore] = None,
         tenant_id: str = "default_tenant",
+        settings: Optional[Settings] = None,
     ) -> None:
+        """
+        Args:
+            parser: Explicit parser engine. When omitted, the parser is built from
+                ``settings.ocr_backend`` (default: local Tesseract OCR). A missing OCR
+                runtime or invalid backend raises immediately with an actionable error.
+            settings: Project settings used to select/configure the default parser.
+        """
         self.storage = storage
         self.tenant_id = tenant_id
         self.loader = loader or SecureModuleBLoader(storage=self.storage)
-        self.parser = parser or LocalOCRParserAdapter()
+        self.parser = parser if parser is not None else build_parser_engine(settings)
         self.schema_registry = schema_registry or InMemorySchemaRegistry()
         
         if classification_service is not None:
@@ -104,6 +114,28 @@ class ModuleBPipeline:
         self.table_reconstructor = TableReconstructor()
         self.checkbox_detector = CheckboxDetector()
         self.grid_reconstructor = CharacterGridReconstructor()
+
+    def load_page_images(
+        self,
+        handoff_data: Union[ModuleAHandoffPayload, Dict[str, Any]],
+    ) -> List[PageImageRef]:
+        """
+        Resolves the real Module A page images of a handoff into explicit ``PageImageRef``s
+        for Module C (multimodal extraction). Goes through the same tenant-validating secure
+        loader as ``process_handoff``; ``PageLayoutOutput`` itself carries no image reference.
+        """
+        load_result = self.loader.load_handoff(
+            handoff_data=handoff_data,
+            expected_tenant_id=self.tenant_id if self.tenant_id != "default_tenant" else None,
+        )
+        return [
+            PageImageRef(
+                page_number=page.page_number,
+                image_path=page.file_path,
+                page_ref=page.page_ref,
+            )
+            for page in load_result.pages
+        ]
 
     # ------------------------------------------------------------------------
     # Pipeline Execution
@@ -289,7 +321,11 @@ class ModuleBPipeline:
                 classification_reasons=["Pipeline failed prior to successful classification."],
             )
 
-            parser_meta_name = getattr(getattr(self, "parser", None), "engine_name", "unknown_parser")
+            parser_meta_name = "unknown_parser"
+            try:
+                parser_meta_name = self.parser.get_metadata().engine_name
+            except Exception:
+                parser_meta_name = getattr(getattr(self, "parser", None), "engine_name", "unknown_parser")
             classifier_meta_name = "unknown_classifier"
 
             return ModuleBOutputPayload(
@@ -365,8 +401,10 @@ class ModuleBPipeline:
             new_classification = ClassificationOutput(
                 domain=MVPClassificationDomain.UNKNOWN,
                 document_type=MVPDocumentType.UNKNOWN,
+                # A human decision, not a measured score: the numeric field is required by the
+                # contract, so it carries the reviewer's assertion and is labelled as such.
                 classification_confidence=1.0,
-                confidence_provenance=ConfidenceProvenance.RULE_HEURISTIC,
+                confidence_provenance=ConfidenceProvenance.HUMAN_OVERRIDE,
                 schema_id=None,
                 schema_version=None,
                 review_required=True,
@@ -394,8 +432,9 @@ class ModuleBPipeline:
             new_classification = ClassificationOutput(
                 domain=domain,
                 document_type=override_request.new_document_type,
-                classification_confidence=1.0,  # Human verified
-                confidence_provenance=ConfidenceProvenance.RULE_HEURISTIC,
+                # A human decision, not a measured score (see ConfidenceProvenance.HUMAN_OVERRIDE).
+                classification_confidence=1.0,
+                confidence_provenance=ConfidenceProvenance.HUMAN_OVERRIDE,
                 schema_id=schema_ref.schema_id,
                 schema_version=override_request.target_schema_version or schema_ref.schema_version,
                 review_required=False,
