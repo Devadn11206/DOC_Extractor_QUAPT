@@ -1,0 +1,137 @@
+"""
+Phase 1 / Task 8A (D5): packaging metadata is consistent and complete.
+
+- pyproject.toml core dependencies == requirements.txt (same distributions, same specifiers);
+  the extras are mirrored by requirements-dev/-ui/-vlm.txt.
+- Every third-party module imported anywhere in ``src/`` is a declared dependency (core or extra)
+  or one of the explicitly documented optional/legacy imports; nothing relies on a transitive
+  install (e.g. ``jsonschema`` used to come in only through litellm).
+- Heavy VLM packages and PyTorch stay out of the core dependencies.
+- The Python-version claim is internally consistent.
+"""
+
+import ast
+import re
+import sys
+from pathlib import Path
+
+import pytest
+
+tomllib = pytest.importorskip("tomllib" if sys.version_info >= (3, 11) else "tomli")
+
+ROOT = Path(__file__).resolve().parents[1]
+PYPROJECT = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+
+# import name -> distribution name (only where they differ)
+DIST_OF_MODULE = {
+    "PIL": "pillow",
+    "cv2": "opencv-python-headless",
+    "yaml": "pyyaml",
+}
+# Imported lazily by optional/legacy code paths; deliberately NOT declared (see README):
+#   torch              installed separately per platform (CUDA/CPU/MPS), needed only for local Qwen-VL
+#   rapidocr_onnxruntime  legacy notebook-era casa_reader.py only
+DOCUMENTED_OPTIONAL = {"torch", "rapidocr_onnxruntime"}
+HEAVY_VLM = {"torch", "transformers", "accelerate", "bitsandbytes", "qwen-vl-utils", "qwen_vl_utils"}
+
+
+def _name(spec: str) -> str:
+    return re.split(r"[<>=!~\[; ]", spec.strip(), maxsplit=1)[0].lower().replace("_", "-")
+
+
+def _requirements(path: str):
+    out = {}
+    for line in (ROOT / path).read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line and not line.startswith("-"):
+            out[_name(line)] = line.replace(" ", "")
+    return out
+
+
+def _declared():
+    names = {_name(d) for d in PYPROJECT["dependencies"]}
+    for extra in PYPROJECT["optional-dependencies"].values():
+        names |= {_name(d) for d in extra}
+    return names
+
+
+def _third_party_imports():
+    std = set(sys.stdlib_module_names)
+    found = {}
+    for path in (ROOT / "src").rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                mods = [node.module]
+            for mod in mods:
+                top = mod.split(".")[0]
+                if top not in std and top not in ("doc_extractor", "schema_lifecycle"):
+                    found.setdefault(top, str(path.relative_to(ROOT)))
+    return found
+
+
+def test_core_dependencies_match_between_pyproject_and_requirements_txt():
+    pyproject_core = {_name(d): d.replace(" ", "") for d in PYPROJECT["dependencies"]}
+    assert _requirements("requirements.txt") == pyproject_core
+
+
+def test_extras_are_mirrored_by_their_requirements_files():
+    extras = PYPROJECT["optional-dependencies"]
+    for extra, filename in (("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"), ("vlm", "requirements-vlm.txt")):
+        declared = {_name(d): d.replace(" ", "") for d in extras[extra]}
+        listed = {k: v for k, v in _requirements(filename).items() if k not in _requirements("requirements.txt")}
+        assert listed == declared, f"{filename} differs from the '{extra}' extra"
+
+
+def test_every_third_party_import_in_src_is_declared_or_documented_optional():
+    declared = _declared()
+    undeclared = {}
+    for module, where in _third_party_imports().items():
+        dist = DIST_OF_MODULE.get(module, module).lower().replace("_", "-")
+        if dist not in declared and module not in DOCUMENTED_OPTIONAL:
+            undeclared[module] = where
+    assert undeclared == {}, f"undeclared third-party imports: {undeclared}"
+
+
+def test_jsonschema_is_a_direct_core_dependency():
+    assert "jsonschema" in {_name(d) for d in PYPROJECT["dependencies"]}
+    assert "jsonschema" in _requirements("requirements.txt")
+
+
+def test_heavy_vlm_stack_is_optional_and_not_in_core():
+    core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
+    assert not core & {h.replace("_", "-") for h in HEAVY_VLM}
+    vlm = {_name(d) for d in PYPROJECT["optional-dependencies"]["vlm"]}
+    assert {"transformers", "accelerate", "bitsandbytes", "qwen-vl-utils"} <= vlm
+    assert "torch" not in vlm            # PyTorch is installed separately for the target platform
+
+
+def test_gradio_is_an_optional_ui_extra_not_a_core_dependency():
+    assert "gradio" in {_name(d) for d in PYPROJECT["optional-dependencies"]["ui"]}
+    assert "gradio" not in {_name(d) for d in PYPROJECT["dependencies"]}
+    assert "gradio" not in _requirements("requirements.txt")
+
+
+def test_qwen3_vl_transformers_floor_is_not_below_4_57():
+    spec = next(d for d in PYPROJECT["optional-dependencies"]["vlm"] if _name(d) == "transformers")
+    major, minor, *_ = (int(x) for x in re.search(r">=\s*([\d.]+)", spec).group(1).split("."))
+    assert (major, minor) >= (4, 57)
+
+
+def test_vlm_group_matches_the_reproducible_gpu_baseline():
+    vlm = {_name(d): d.replace(" ", "") for d in PYPROJECT["optional-dependencies"]["vlm"]}
+    assert vlm["qwen-vl-utils"] == "qwen-vl-utils==0.0.14"          # exact baseline pin
+    assert vlm["transformers"].startswith("transformers>=4.57.1")
+    assert vlm["accelerate"].startswith("accelerate>=0.26")           # transformers' own 4-bit floors
+    assert vlm["bitsandbytes"].startswith("bitsandbytes>=0.43.1")
+    # torch / torchvision are platform-specific and never part of the VLM group
+    assert "torch" not in vlm and "torchvision" not in vlm
+
+
+def test_requires_python_floor_is_3_10_and_classifiers_do_not_overclaim():
+    assert PYPROJECT["requires-python"] == ">=3.10"
+    versions = {c.rsplit(" ", 1)[-1] for c in PYPROJECT["classifiers"] if "Programming Language :: Python :: 3." in c}
+    # only versions this repository was actually exercised on (README "Python compatibility")
+    assert versions <= {"3.10", "3.11", "3.14"}

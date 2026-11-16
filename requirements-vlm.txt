@@ -1,0 +1,20 @@
+# Optional: local multimodal Qwen3-VL extraction (PRD v1.3 1-stage architecture).
+# Heavy dependencies - NOT part of the core install (requirements.txt / pyproject dependencies).
+#
+# PyTorch and torchvision are NOT listed here: install the matching builds for the target machine
+# FIRST (see https://pytorch.org/get-started/locally/), for example:
+#   CUDA 12.x :  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#   CPU only  :  pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   macOS     :  pip install torch torchvision
+# qwen-vl-utils imports torchvision, so it must be installed alongside torch with a matching version.
+# On Kaggle / Colab keep the preinstalled torch + torchvision: do not upgrade or reinstall them.
+# bitsandbytes (4-bit quantization, the default) requires a CUDA GPU.
+-r requirements.txt
+
+# Qwen3-VL ships from transformers 4.57.0 (4.57.0 itself was yanked), so the floor is 4.57.1.
+transformers>=4.57.1
+# Floors enforced by transformers 4.57.1 for 4-bit loading.
+accelerate>=0.26.0
+bitsandbytes>=0.43.1
+# Exact version of the initial reproducible GPU baseline (process_vision_info supports image_patch_size=16).
+qwen-vl-utils==0.0.14
