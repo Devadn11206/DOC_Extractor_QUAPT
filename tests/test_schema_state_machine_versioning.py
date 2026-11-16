@@ -19,6 +19,7 @@ from doc_extractor.classification.base import (
 )
 from doc_extractor.classification.rules import RuleBasedClassifierAdapter
 from doc_extractor.contracts_b import MVPDocumentType
+from doc_extractor.parsing.adapter import LocalOCRParserAdapter
 from doc_extractor.pipeline_b import ModuleBPipeline
 from schema_lifecycle.adapters import (
     LifecycleSchemaRegistryAdapter,
@@ -611,6 +612,7 @@ def test_schema_registry_adapter_pipeline_b_integration():
         storage = LocalDiskStorage(base_dir=tmpdir, tenant_id="tenant_alpha")
         pipeline = ModuleBPipeline(
             storage=storage,
+            parser=LocalOCRParserAdapter(raw_extractor=lambda img: []),
             schema_registry=adapter,
             tenant_id="tenant_alpha",
         )

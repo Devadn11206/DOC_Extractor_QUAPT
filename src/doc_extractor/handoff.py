@@ -67,6 +67,7 @@ class ModuleAHandoffPayload:
     completed_at: str
     error: Optional[Dict[str, Any]] = None
     extra_metadata: Dict[str, Any] = field(default_factory=dict)
+    original_document_storage_uri: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
