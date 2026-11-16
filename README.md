@@ -4,10 +4,10 @@
 
 The **Document Extraction Engine** is an on-premise, schema-driven system designed to transform scanned BFSI (banking, financial services, insurance) and healthcare documents into validated, evidence-grounded structured data.
 
-The system is architected as a modular, decoupled processing pipeline following the authoritative **PRD v1.1** specification:
+The system is architected as a modular, decoupled processing pipeline. The authoritative specification is **PRD v1.3** ([`Document_Extraction_Engine_PRD.md`](Document_Extraction_Engine_PRD.md): 1-stage multimodal extraction with `Qwen3-VL-8B-Instruct` / `Qwen2.5-VL-7B-Instruct`). See "Repository documents" below for the other PRD copies in this repository.
 1. **Module A — Document Ingestion & Preprocessing**: Safe reception, multi-format validation, 200 DPI rendering, image de-skewing, normalization, and secure tenant storage.
 2. **Module B — Layout Parsing & Document Classification**: Visual layout structure parsing (blocks, reading order, Markdown formatting), structural element extraction (tables, checkboxes, character grids), deterministic document classification, and schema binding.
-3. **Module C — Extraction & Grounding**: *(In active development / runtime preparation — not documented as a completed project feature)*.
+3. **Module C — Extraction & Grounding**: `ModuleCPipeline` is the single extraction orchestrator. It reads every page image with the multimodal extractor (or the OCR/text extractor), aggregates pages, grounds each value in page-specific evidence, validates, and gates the output status. A real Qwen-VL run on a GPU has **not** been verified yet (the test suite uses a faked model call); VLM-read fields carry no confidence, so those documents always route to `needs_review`.
 
 ---
 
@@ -174,10 +174,11 @@ Module C acts as Stage 3 of the engine, consuming `ModuleBOutputPayload` and tra
 - **Business Logic & Cross-Field Rules (`FR-VAL-003`, `FR-VAL-004`)**:
   - Arithmetic reconciliation of itemized amounts vs declared total (`ARITHMETIC_MISMATCH`).
   - Chronology validation ensuring discharge date $\ge$ admission date (`CHRONOLOGY_MISMATCH`).
-- **Calibrated Confidence & Status Gating (`FR-CNF-001` - `FR-CNF-003`, `GR-027`)**:
-  - Calibrated field confidence math combining optical OCR confidence, model score, and validation status.
-  - Threshold gating: scores $< 0.75$ or validation failures trigger `review_required: true`.
-  - Document status gating: documents auto-approve only when all fields pass with no review flags, otherwise routing to `needs_review`.
+- **Confidence & Status Gating (`FR-CNF-001` - `FR-CNF-003`, `GR-027`)**:
+  - Field confidence comes only from measured signals (the evidence's optical OCR confidence and, when an extractor supplies one, a model score). When no trustworthy signal exists the confidence is `null` (`None`) with provenance `unavailable`; nothing is invented. The Qwen-VL extractor currently supplies no confidence, so VLM-read fields are always `null` and the document routes to `needs_review` (a deliberately conservative policy).
+  - Threshold gating: scores $< 0.75$, unavailable/uncalibrated scores or validation failures trigger `review_required: true`.
+  - Document status gating: documents auto-approve only when all fields pass with no flags (missing required fields, conflicts, partial page coverage, evidence missing, rule failures all force `needs_review`), otherwise routing to `needs_review`.
+  - A reviewer's document-type override (FR-CLS-004) is recorded as `confidence_provenance: "human_override"`, a human decision rather than a model or rule score.
 - **Canonical JSON Output Envelope (`SCH-011` - `SCH-013`)**:
   - Versioned `CanonicalExtractionEnvelope` adhering strictly to PRD §6.3.
 
@@ -186,8 +187,14 @@ Module C acts as Stage 3 of the engine, consuming `ModuleBOutputPayload` and tra
 ## Project Setup & Local Development
 
 ### 1. Prerequisites
-- **Python**: Version 3.10 or higher.
-- **Operating System**: Linux, macOS, or Windows (tested on Windows 11 with Python 3.10.0).
+- **Python**: `requires-python >=3.10`. **Verified in this repository** (full test suite, clean install): macOS with Python **3.11.15** and **3.14**. Python 3.10, 3.12 and 3.13 are declared-compatible but **have not been verified**; Python 3.9 and older are rejected by `pip`.
+- **Operating System**: Linux, macOS, or Windows. Verification above was done on macOS only.
+- **Tesseract OCR binary (external, required by the default OCR backend)**: the `pytesseract` Python package is only a wrapper and is installed automatically, but the `tesseract` executable itself must be installed separately:
+  - macOS: `brew install tesseract`
+  - Debian/Ubuntu: `sudo apt-get install tesseract-ocr`
+  - Windows: install the UB-Mannheim Tesseract build and add it to `PATH` (or set `ocr_tesseract_cmd`).
+  - Extra languages need their tessdata packs (e.g. `tesseract-ocr-hin`). Verify with `tesseract --version` and `tesseract --list-langs`.
+  - Without it the default backend fails closed with `OCR_BINARY_MISSING` (it never produces empty pages).
 
 ### 2. Environment Installation
 
@@ -200,36 +207,135 @@ source .venv/bin/activate
 
 # On Windows (PowerShell):
 .venv\Scripts\Activate.ps1
-
-# Install package and dependencies in editable mode
-pip install -e .
 ```
+
+Install exactly the components you need (the extras are mirrored by the `requirements-*.txt` files):
+
+| Goal | Command | Installs |
+| --- | --- | --- |
+| Engine (core) | `pip install -e .` | Modules A/B/C, schema lifecycle, Tesseract wrapper, `instructor`/`litellm` |
+| Development / run the tests | `pip install -e ".[dev]"` | core + pytest, pytest-cov |
+| Demo UI (`doc_extractor.app`) | `pip install -e ".[ui]"` | core + gradio |
+| Local multimodal Qwen3-VL | install PyTorch + torchvision first (below), then `pip install -e ".[vlm]"` | core + transformers (>=4.57.1), accelerate (>=0.26.0), bitsandbytes (>=0.43.1), qwen-vl-utils (==0.0.14) |
+
+Extras combine, e.g. `pip install -e ".[dev,ui]"`. Without an editable install, use `pip install -r requirements.txt` (core), `requirements-dev.txt`, `requirements-ui.txt` or `requirements-vlm.txt`.
+
+**PyTorch and torchvision are not installed by any command above.** They are platform-specific, so install the builds for your machine *before* the `vlm` extra (see <https://pytorch.org/get-started/locally/>), for example `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126` (CUDA 12.x). `qwen-vl-utils` imports `torchvision`, so the two must match. On Kaggle and Colab keep the preinstalled torch/torchvision: do not upgrade or reinstall them. The full GPU runtime guide is in "Qwen3-VL GPU runtime" below.
 
 ### 3. Configuration
 
-```bash
-# Copy example configuration
-cp .env.example .env     # Linux/macOS
-Copy-Item .env.example .env  # Windows PowerShell
+The application does **not** read a `.env` file or environment variables. [`.env.example`](.env.example) is a reference of the available settings: each key is the upper-case name of a field on `doc_extractor.config.Settings`. Provide values in code:
+
+```python
+from doc_extractor.config import Settings, load_settings
+
+settings = Settings(ocr_backend="tesseract", ocr_tesseract_lang="eng")
+settings = load_settings({"app_env": "staging", "max_page_count": 50})   # validated
 ```
+
+and pass them on (for example `ModuleBPipeline(storage, settings=settings)` or `doc_extractor.app.configure_settings(settings)`). Copying `.env.example` to `.env` has no effect. The default LLM setting is the Ollama text model; the multimodal Qwen-VL extractor (`Qwen/Qwen3-VL-8B-Instruct`) is selected on `SchemaGuidedExtractor`, not through `llm_model_name`.
+
+#### Module B OCR backend
+
+Module B builds its parser from `Settings.ocr_backend` (fields can be passed as `Settings(...)` / `load_settings({...})`; `ModuleBPipeline(storage, settings=...)` uses them when no `parser=` is injected):
+
+| `ocr_backend` | Parser | Notes |
+| --- | --- | --- |
+| `tesseract` (default) | Local Tesseract OCR on every page image | Needs `pytesseract` + the Tesseract binary |
+| `pdfium_hybrid` | Native PDF text per page, Tesseract fallback | Fallback also needs Tesseract |
+| `pdfium` | Native PDF text only | No OCR: fails on scanned pages and images |
+| `none` | Explicit no-parser mode | Reported non-operational; Module B fails closed with `PARSER_NOT_CONFIGURED` |
+
+Related settings: `ocr_tesseract_lang` (default `eng`, e.g. `eng+hin`), `ocr_tesseract_config` (e.g. `--psm 6`), `ocr_tesseract_cmd` (explicit executable path). A missing package, executable, language pack or invalid value fails immediately with an actionable error (`OCR_DEPENDENCY_MISSING`, `OCR_BINARY_MISSING`, `OCR_BINARY_UNUSABLE`, `OCR_LANGUAGE_MISSING`) instead of silently producing empty pages. A parser without an OCR extractor never reports itself as operational.
+
+---
+
+## Qwen3-VL GPU runtime
+
+The 1-stage multimodal path (PRD v1.3) runs `Qwen/Qwen3-VL-8B-Instruct` locally through Transformers. All loading logic lives in `doc_extractor/vlm_runtime.py`; `SchemaGuidedExtractor` uses it. **Status: implemented and unit-tested with fakes; it has not yet been executed on a GPU.**
+
+| Item | Value |
+| --- | --- |
+| Primary checkpoint | `Qwen/Qwen3-VL-8B-Instruct` (the default). `Qwen/Qwen2.5-VL-7B-Instruct` (PRD alternate) is supported with its own class and 14-px patches; any other checkpoint is rejected with `VLM_UNSUPPORTED_MODEL` |
+| Transformers class | `Qwen3VLForConditionalGeneration` (explicit; there is no fallback to `AutoModelForCausalLM` / `AutoModel`) |
+| Transformers version | **>= 4.57.1.** Qwen3-VL first ships in 4.57.0 (itself yanked); 4.56.x has no Qwen3-VL. Checked by inspecting the 4.57.1 release (class present; accelerate/bitsandbytes floors), **not yet by a GPU run** |
+| Other pins | `qwen-vl-utils==0.0.14` (reproducible baseline), `accelerate>=0.26.0`, `bitsandbytes>=0.43.1` (the floors Transformers enforces for 4-bit) |
+| Recorded per run | Exact `transformers` / `torch` / `torchvision` / `qwen-vl-utils` / `accelerate` / `bitsandbytes` versions, loader class, dtype, quantization, GPU(s) and image settings, in the envelope's `run.provenance.details["runtime"]` |
+
+**Installation (GPU host):**
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126   # skip on Kaggle/Colab
+pip install -e ".[vlm]"        # transformers, accelerate, bitsandbytes, qwen-vl-utils==0.0.14
+```
+
+**GPU requirements.** An NVIDIA GPU with CUDA is required (4-bit quantization needs it; there is no CPU default). Total VRAM must be at least ~6 GiB with 4-bit (default) or ~16 GiB unquantized (PRD NFR-007); the loader checks this before loading and says what to change. These are weights-only pre-flight minimums: activations and the KV cache for a full 200-DPI page need more.
+
+**Precision selection** (`precision="auto"` by default; no silent changes):
+
+| GPU | Compute capability | `auto` picks | Explicit `bfloat16` |
+| --- | --- | --- | --- |
+| A100, A10, L4, RTX 30xx/40xx | >= 8.0 | `bfloat16` | honoured |
+| **Tesla T4**, V100, P100 | < 8.0 | `float16` | **rejected** (`VLM_DTYPE_UNSUPPORTED`) |
+| No GPU | n/a | error `VLM_GPU_REQUIRED` unless `allow_cpu=True` (then `float32`, very slow) | n/a |
+
+BF16 is chosen from the compute capability, not from `torch.cuda.is_bf16_supported()` (recent PyTorch returns True on older GPUs by emulation). An explicit `precision="float16"` / `"float32"` is always honoured.
+
+**4-bit quantization** (`load_in_4bit=True`, the default): bitsandbytes NF4 with double quantization; the compute dtype is the *selected* dtype (FP16 on a T4), and the non-quantized layers are loaded in the same dtype. If CUDA, `bitsandbytes>=0.43.1` or `accelerate>=0.26.0` is missing the load fails with `VLM_QUANTIZATION_UNAVAILABLE`; it never falls back to another precision. Set `load_in_4bit=False` only on a GPU with enough memory.
+
+**Image processing.** `qwen-vl-utils` resizes each page image once (aspect ratio kept, each side rounded to a multiple of 32 = 16-px patches x 2 merge), then the processor is called with `do_resize=False`, so there is no second resize. `process_vision_info` is always called with `image_patch_size=16` (its default of 14 is Qwen2.5-VL's). `min_pixels` / `max_pixels` default to the checkpoint's official range (65,536 / 16,777,216 px), so a full 200-DPI A4 page (about 3.9 MP, roughly 3.8k visual tokens) is not down-scaled. Lowering `max_pixels` to save memory is allowed but explicit, trades reading accuracy for memory, and is recorded in the run info. Boxes are `[ymin, xmin, ymax, xmax]` on the model's relative 0-1000 grid over the image it saw, which stays valid for the Module A preprocessed page and `CoordinateTransform` whatever the resize.
+
+```python
+from doc_extractor.extractor import SchemaGuidedExtractor
+
+extractor = SchemaGuidedExtractor(          # defaults shown
+    model_name="Qwen/Qwen3-VL-8B-Instruct", use_llm=True, allow_fallback=False,
+    precision="auto", load_in_4bit=True, min_pixels=None, max_pixels=None,
+)
+```
+
+
+**Known T4 limitations** (expected from the hardware; none measured yet):
+- No native BF16, so FP16 is used. FP16 can overflow in some models; if outputs are garbage or NaN, report it (the code will not switch precision on its own).
+- About 15 GiB per GPU: 4-bit is required for the 8B model (an unquantized load is refused by the VRAM pre-flight). Kaggle's 2xT4 shards the model with `device_map="auto"`.
+- No FlashAttention-2 (needs Ampere or newer); attention uses the default SDPA path, so long, high-resolution pages are slow and memory-hungry. Pages are processed sequentially, so latency grows linearly with page count.
+- 4-bit bitsandbytes inference is slower than FP16 and carries a small accuracy cost versus unquantized weights; neither effect has been measured for this task.
 
 ---
 
 ## Testing & Verification Status
 
 ### Automated Test Suite
-The repository includes comprehensive unit, regression, and end-to-end handoff test coverage across Module A, Module B, and Module C:
-- **Module A Coverage**: File validation, decompression bomb protection, malware scanner gating, 200 DPI PDF rendering, OpenCV de-skew / contrast CLAHE, idempotency storage, and handoff contracts.
-- **Module B Coverage**: Parser engine adapter, coordinate inversion, reading-order Markdown generation, table extraction, checkbox fill detection, character grid grouping, document classification, schema binding, and Module B pipeline orchestration.
-- **Module C Coverage**: Schema-guided field extraction, visual evidence grounding (bounding boxes and text snippets), Indian format validation (PAN, Aadhaar Verhoeff checksum, IFSC), currency/date/phone normalization, arithmetic/chronology cross-field rules, calibrated confidence calculations, and PRD §6.3 canonical JSON output envelope.
+The repository includes unit, regression, integration and end-to-end test coverage across Modules A, B and C, the schema lifecycle, OCR backends, multipage multimodal extraction (with a faked model call) and the DOC-01/02/03 launch types.
 
-**Reported Test Result**:
-- Full automated test suite passes with **183+ tests passing** (0 failures).
+**Result (Phase 1):** 812 tests collected; 811 pass and 1 is an explicit skip (the opt-in live Ollama test, below). The Qwen-VL runtime (`vlm_runtime.py`) is covered with fakes; real Qwen-VL / GPU behaviour is not covered by any automated test.
 
-To run the automated test suite locally:
 ```bash
-pytest -v -k "not live_model"
+pip install -e ".[dev]"      # test dependencies
+pytest                       # default run: everything except the opt-in live test (reported as skipped)
+pytest -rs                   # same, and print why tests were skipped
+pytest --cov=src --cov-branch --cov-report=term-missing   # coverage
 ```
+
+**Opt-in live Ollama test.** `test_live_qwen_smoke_against_local_ollama` (marker `live_ollama`) calls a real Ollama server with the text model `qwen2.5:7b-instruct`; it does **not** exercise the Qwen-VL multimodal path. It is skipped unless explicitly enabled, and once enabled an unavailable server is a genuine failure (never a skip or pass):
+
+```bash
+RUN_OLLAMA_TESTS=1 pytest -m live_ollama                         # http://localhost:11434
+RUN_OLLAMA_TESTS=1 OLLAMA_API_BASE=http://host:11434 pytest -m live_ollama
+```
+
+Tests that need the external Tesseract binary skip with an explicit reason when it is not on `PATH` (`pytest -rs` lists them); everything else mocks the OCR and model layers.
+
+## Repository documents
+
+| File | Purpose |
+| --- | --- |
+| `Document_Extraction_Engine_PRD.md` | **Authoritative PRD v1.3** (1-stage multimodal extraction with Qwen3-VL-8B-Instruct / Qwen2.5-VL). Phase 1 is measured against this file. |
+| `Document Extraction Engine Product Requirements Document (PRD).pdf` | An earlier PRD revision (header dated Oct 28, 2026; exact revision not verified), kept for reference. |
+| `src/doc_extractor/Document_Extraction_Engine_PRD (3).md` | PRD **v1.4** (adds category-based model routing, language dimension and a demo UI). It specifies the `RoutedExtractor` / demo category selectors in the code; it is **not** the Phase 1 acceptance baseline. |
+| `src/doc_extractor/notebookb4c0029335.ipynb`, `notebookbdb318963a.ipynb` | Kaggle demo launchers that clone a *remote* branch of a collaborator's fork (`feature/prd-v1.3-qwen3-vl-multimodal`), install dependencies and launch the Gradio demo. They run that remote code, **not** this working tree. They do not install the Tesseract binary. |
+| `notebooks/*.ipynb`, `notebooks/doc01_support/` | Earlier Colab notebooks for the standalone DOC-01 CASA reader (`casa_reader.py` / `casa_form.py`); legacy, separate from the `ModuleCPipeline` path. |
+| `casa_reader.py`, `casa_form.py`, `insurance_form.py` (`src/doc_extractor/`) | Legacy rule-based form readers. They are not used by the canonical pipeline. `casa_reader.py` additionally imports `rapidocr_onnxruntime`, `torch` and `transformers` lazily; these are intentionally not declared dependencies. |
 
 ---
 
@@ -237,7 +343,7 @@ pytest -v -k "not live_model"
 
 This project is under active development. The current codebase implements **Module A**, **Module B**, and **Module C**. Known open gaps and architecture prerequisites include:
 
-- **Module B OCR Runtime Connection**: While Module B provides the pluggable `ParserEngine` interface and `LocalOCRParserAdapter`, the current pipeline tests operate on deterministic mock extractors; direct cross-process worker integration with isolated local OCR engines (e.g. PaddleOCR) remains to be connected.
+- **Module B OCR Runtime**: Module B now selects a real local parser from `Settings.ocr_backend` (default Tesseract; see "Module B OCR backend"). Cross-process worker integration with isolated OCR engines (e.g. PaddleOCR) is not implemented, and the Tesseract binary must be installed on the host.
 - **Local Model Serving Cluster**: Module C supports pluggable LLM extraction (LiteLLM/Instructor) and deterministic extraction heuristics; production deployment on-premise requires containerized vLLM/Ollama services with GPU acceleration per PRD ARC-004/ARC-005.
 - **Durable Message Broker**: Inter-module queues currently provide an in-memory adapter (`LocalMemoryQueueAdapter`); production deployment requires connecting a persistent broker (e.g. RabbitMQ or Redis Streams).
 - **Distributed Idempotency & Locking**: Current concurrency locking is process-local; multi-replica horizontal clustering requires a shared distributed cache (e.g. Redis).
