@@ -28,6 +28,7 @@ class StoredArtifact:
     file_path: Path
     file_size_bytes: int
     mime_type: str
+    storage_uri: Optional[str] = None
 
 
 class StorageBackend(ABC):
@@ -42,6 +43,15 @@ class StorageBackend(ABC):
         format_extension: str = "png",
     ) -> StoredArtifact:
         """Stores a rendered page image associated with document_id and page_number."""
+        pass
+
+    @abstractmethod
+    def store_original_document(
+        self,
+        document_id: str,
+        document_data: Union[bytes, BinaryIO],
+    ) -> StoredArtifact:
+        """Stores the accepted original PDF under the tenant/document boundary."""
         pass
 
     @abstractmethod
@@ -146,6 +156,47 @@ class LocalDiskStorage(StorageBackend):
                 details={"document_id": document_id},
             )
         return doc_dir
+
+    def store_original_document(
+        self,
+        document_id: str,
+        document_data: Union[bytes, BinaryIO],
+    ) -> StoredArtifact:
+        """Persist the original PDF atomically inside tenant-scoped storage."""
+        doc_dir = self._get_document_dir(document_id)
+        source_dir = doc_dir / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+
+        target_file = source_dir / "original.pdf"
+        temp_file = source_dir / f".tmp_original_{uuid.uuid4().hex}"
+
+        try:
+            with open(temp_file, "wb") as destination:
+                if isinstance(document_data, bytes):
+                    destination.write(document_data)
+                else:
+                    document_data.seek(0)
+                    shutil.copyfileobj(document_data, destination)
+
+            temp_file.replace(target_file)
+            file_size = target_file.stat().st_size
+        except Exception as exc:
+            if temp_file.exists():
+                temp_file.unlink(missing_ok=True)
+            raise StorageError(
+                message="Failed to persist original document artifact.",
+                details={"document_id": document_id},
+            ) from exc
+
+        return StoredArtifact(
+            artifact_id="original.pdf",
+            document_id=document_id,
+            page_number=None,
+            file_path=target_file,
+            file_size_bytes=file_size,
+            mime_type="application/pdf",
+            storage_uri=f"{self.tenant_id}/{document_id}/source/original.pdf",
+        )
 
     def store_page_image(
         self,

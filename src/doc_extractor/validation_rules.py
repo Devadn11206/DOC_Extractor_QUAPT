@@ -7,6 +7,8 @@ from datetime import datetime
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from doc_extractor.contracts_b import ConfidenceProvenance
+
 
 # Regex patterns
 PAN_REGEX = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")
@@ -331,21 +333,37 @@ def validate_arithmetic(
     return None
 
 
-def calculate_calibrated_confidence(
-    ocr_confidence: float,
-    model_confidence: float = 1.0,
+def calibrate_field_confidence(
+    ocr_confidence: Optional[float] = None,
+    model_confidence: Optional[float] = None,
     validation_passed: bool = True,
     is_handwritten: bool = False,
     has_evidence: bool = True,
-) -> float:
+) -> Tuple[Optional[float], ConfidenceProvenance]:
     """
-    FR-CNF-001: Combines OCR optical confidence, model score, and validation status
-    into a calibrated score in [0.0, 1.0].
+    FR-CNF-001: Combines only *measured* signals into a score in [0.0, 1.0] and reports its source.
+
+    - ``ocr_confidence``: measured optical confidence of the evidence text (None if the parser
+      reports none, e.g. native PDF text or a VLM-read value).
+    - ``model_confidence``: a trustworthy (calibrated) extraction-model score. None when the model
+      provides none; it is never defaulted to 1.0.
+
+    With neither signal (or no evidence) there is no trustworthy score: returns
+    ``(None, UNAVAILABLE)``. The handwriting and validation-failure penalties (FR-CNF-002) only
+    scale an existing score; they cannot create one.
     """
     if not has_evidence:
-        return 0.0
+        return None, ConfidenceProvenance.UNAVAILABLE
 
-    score = ocr_confidence * model_confidence
+    if ocr_confidence is None and model_confidence is None:
+        return None, ConfidenceProvenance.UNAVAILABLE
+
+    score = 1.0
+    if ocr_confidence is not None:
+        score *= ocr_confidence
+    if model_confidence is not None:
+        score *= model_confidence
+    provenance = ConfidenceProvenance.MODEL if model_confidence is not None else ConfidenceProvenance.OCR
 
     if is_handwritten:
         # Handwriting penalty per FR-CNF-002
@@ -354,4 +372,21 @@ def calculate_calibrated_confidence(
     if not validation_passed:
         score *= 0.50
 
-    return max(0.0, min(1.0, round(score, 2)))
+    return max(0.0, min(1.0, round(score, 2))), provenance
+
+
+def calculate_calibrated_confidence(
+    ocr_confidence: Optional[float] = None,
+    model_confidence: Optional[float] = None,
+    validation_passed: bool = True,
+    is_handwritten: bool = False,
+    has_evidence: bool = True,
+) -> Optional[float]:
+    """Score-only form of ``calibrate_field_confidence``; None when no trustworthy score exists."""
+    return calibrate_field_confidence(
+        ocr_confidence=ocr_confidence,
+        model_confidence=model_confidence,
+        validation_passed=validation_passed,
+        is_handwritten=is_handwritten,
+        has_evidence=has_evidence,
+    )[0]

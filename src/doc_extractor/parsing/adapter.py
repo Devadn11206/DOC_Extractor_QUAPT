@@ -26,6 +26,11 @@ from doc_extractor.parsing.base import (
     RawOCRToken,
 )
 from doc_extractor.parsing.markdown import generate_page_markdown, sort_blocks_reading_order
+from doc_extractor.parsing.tesseract import (
+    TesseractExtractor,
+    check_tesseract_available,
+    tesseract_raw_extractor,
+)
 
 
 class LocalOCRParserAdapter(ParserEngine):
@@ -43,12 +48,14 @@ class LocalOCRParserAdapter(ParserEngine):
         engine_version: str = "1.0.0",
         raw_extractor: Optional[Callable[[np.ndarray], List[RawOCRToken]]] = None,
         is_operational: bool = True,
-        default_confidence_when_missing: float = 0.5,
+        default_confidence_when_missing: Optional[float] = None,
     ) -> None:
         self.engine_name = engine_name
         self.engine_version = engine_version
         self._raw_extractor = raw_extractor
-        self._is_operational = is_operational
+        # An adapter without an OCR extractor cannot produce tokens, so it must never
+        # report itself as operational (it would silently yield empty pages).
+        self._is_operational = bool(is_operational) and raw_extractor is not None
         self.default_confidence_when_missing = default_confidence_when_missing
 
     def get_metadata(self) -> ParserEngineMetadata:
@@ -63,14 +70,51 @@ class LocalOCRParserAdapter(ParserEngine):
     def is_operational(self) -> bool:
         return self._is_operational
 
+    @classmethod
+    def with_tesseract(
+        cls,
+        engine_name: str = "Tesseract-OCR",
+        engine_version: Optional[str] = None,
+        lang: str = "eng",
+        config: str = "",
+        default_confidence_when_missing: Optional[float] = None,
+        tesseract_cmd: Optional[str] = None,
+        verify: bool = True,
+    ) -> "LocalOCRParserAdapter":
+        """
+        Factory method to construct a LocalOCRParserAdapter injected with Tesseract OCR.
+
+        With ``verify=True`` (default) the Tesseract runtime is checked first and a
+        ParserEngineError with an actionable message is raised if the Python package,
+        executable or language pack is unavailable, so a non-working OCR engine is never
+        reported as operational. When ``engine_version`` is not given, the detected
+        Tesseract version is used. Pass ``verify=False`` only for tests that fully mock
+        pytesseract.
+        """
+        detected_version: Optional[str] = None
+        if verify:
+            detected_version = check_tesseract_available(lang=lang, tesseract_cmd=tesseract_cmd)
+        return cls(
+            engine_name=engine_name,
+            engine_version=engine_version or detected_version or "unverified",
+            raw_extractor=TesseractExtractor(lang=lang, config=config),
+            is_operational=True,
+            default_confidence_when_missing=default_confidence_when_missing,
+        )
+
     def parse_page(self, loaded_page: LoadedPageImage) -> PageLayoutOutput:
         """
         Executes OCR on loaded_page.image_bgr, maps coordinates back to original 200 DPI space,
         and constructs PageLayoutOutput.
         """
         if not self.is_operational():
+            reason = (
+                "no OCR extractor is configured"
+                if self._raw_extractor is None
+                else "it was marked non-operational"
+            )
             raise ParserEngineError(
-                message=f"Parser engine '{self.engine_name}' is not operational.",
+                message=f"Parser engine '{self.engine_name}' is not operational: {reason}.",
                 engine_name=self.engine_name,
                 code="PARSER_UNAVAILABLE",
             )
@@ -84,17 +128,19 @@ class LocalOCRParserAdapter(ParserEngine):
 
         # 1. Extract raw OCR tokens using configured local extractor
         try:
-            if self._raw_extractor is not None:
-                raw_tokens = self._raw_extractor(loaded_page.image_bgr)
-            else:
-                # Default: empty token set (e.g. blank page or placeholder)
-                raw_tokens = []
+            # is_operational() guarantees an extractor exists; an empty result here
+            # genuinely means the engine found no text (e.g. a blank page).
+            raw_tokens = self._raw_extractor(loaded_page.image_bgr)
         except Exception as exc:
+            code = getattr(exc, "code", "OCR_EXTRACTION_FAILED")
+            details = {"page_number": loaded_page.page_number}
+            if hasattr(exc, "details") and isinstance(exc.details, dict):
+                details.update(exc.details)
             raise ParserEngineError(
                 message=f"OCR engine extraction failed on page {loaded_page.page_number}: {str(exc)}",
                 engine_name=self.engine_name,
-                code="OCR_EXTRACTION_FAILED",
-                details={"page_number": loaded_page.page_number},
+                code=code,
+                details=details,
             ) from exc
 
         # 2. Build layout blocks with SCH-013 coordinate inversion
@@ -158,6 +204,7 @@ class LocalOCRParserAdapter(ParserEngine):
                     element_type=elem_type,
                     text=text,
                     ocr_confidence=conf,
+                    confidence_provenance="ocr",
                     bbox_preprocessed=bbox_prep,
                     bbox_original=bbox_orig,
                     reading_order_index=idx,
@@ -168,11 +215,15 @@ class LocalOCRParserAdapter(ParserEngine):
         ordered_blocks = sort_blocks_reading_order(blocks)
         markdown = generate_page_markdown(ordered_blocks)
 
-        mean_conf = (
-            sum(b.ocr_confidence for b in ordered_blocks) / len(ordered_blocks)
-            if ordered_blocks
-            else 1.0
-        )
+        if ordered_blocks:
+            valid_confs = [b.ocr_confidence for b in ordered_blocks if b.ocr_confidence is not None]
+            mean_conf = (
+                round(sum(valid_confs) / len(valid_confs), 4)
+                if valid_confs
+                else None
+            )
+        else:
+            mean_conf = None
 
         return PageLayoutOutput(
             page_number=loaded_page.page_number,
@@ -181,6 +232,7 @@ class LocalOCRParserAdapter(ParserEngine):
             checkboxes=[],
             key_value_pairs=[],
             tables=[],
-            mean_ocr_confidence=round(mean_conf, 4),
+            mean_ocr_confidence=mean_conf,
+            confidence_provenance="ocr",
         )
 

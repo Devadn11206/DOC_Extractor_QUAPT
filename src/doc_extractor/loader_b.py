@@ -12,6 +12,7 @@ Implements Module B Step 3 requirements:
 """
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 import cv2
@@ -38,6 +39,7 @@ class LoadedPageImage:
     dpi: int
     file_path: Path
     page_ref: ModuleAPageRef
+    source_pdf_path: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -103,7 +105,57 @@ class SecureModuleBLoader:
                 },
             )
 
-        # 3. Load, decode, and verify each page image
+        # 3. Resolve and verify the optional original PDF artifact.
+        source_pdf_path: Optional[Path] = None
+        source_uri = input_payload.original_document_storage_uri
+
+        if source_uri:
+            expected_uri = (
+                f"{input_payload.tenant_id}/{input_payload.document_id}/source/original.pdf"
+            )
+            if source_uri != expected_uri:
+                raise StorageError(
+                    message="Original document reference does not match the handoff document.",
+                    details={"document_id": input_payload.document_id},
+                )
+
+            source_pdf_path = self.storage.resolve_uri_to_path(source_uri)
+
+            if not source_pdf_path.exists() or not source_pdf_path.is_file():
+                raise UnsupportedFileError(
+                    message="Original PDF artifact is missing from secure storage.",
+                    details={"document_id": input_payload.document_id},
+                )
+
+            digest = hashlib.sha256()
+            actual_size = 0
+            try:
+                with open(source_pdf_path, "rb") as source_file:
+                    while True:
+                        chunk = source_file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        actual_size += len(chunk)
+                        digest.update(chunk)
+            except Exception as exc:
+                raise StorageError(
+                    message="Failed to verify original PDF artifact.",
+                    details={"document_id": input_payload.document_id},
+                ) from exc
+
+            if actual_size != input_payload.file_size_bytes:
+                raise StorageError(
+                    message="Original PDF artifact size does not match the handoff.",
+                    details={"document_id": input_payload.document_id},
+                )
+
+            if digest.hexdigest() != input_payload.file_hash_sha256:
+                raise StorageError(
+                    message="Original PDF artifact hash does not match the handoff.",
+                    details={"document_id": input_payload.document_id},
+                )
+
+        # 4. Load, decode, and verify each page image.
         loaded_pages: List[LoadedPageImage] = []
 
         for page_ref in input_payload.pages:
@@ -181,6 +233,7 @@ class SecureModuleBLoader:
                     dpi=page_ref.dpi,
                     file_path=img_path,
                     page_ref=page_ref,
+                    source_pdf_path=source_pdf_path,
                 )
             )
 

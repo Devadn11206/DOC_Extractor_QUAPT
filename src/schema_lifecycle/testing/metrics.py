@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import collections
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from schema_lifecycle.testing.contracts import (
     AggregateMetrics,
@@ -385,8 +385,9 @@ def compute_field_metrics(
                 # Predicted value when ground truth is null (False-Fill per PRD §13.3)
                 fp += 1
                 false_fills += 1
-                confidences.append(pred.confidence)
-                correct_flags.append(False)
+                if pred.confidence is not None:
+                    confidences.append(pred.confidence)
+                    correct_flags.append(False)
         else:
             support += 1
             if pred is None or pred.is_null or pred.predicted_value is None:
@@ -408,8 +409,9 @@ def compute_field_metrics(
                 if gt.match_strategy == MatchStrategy.TOKEN_F1:
                     token_f1_scores.append(score)
 
-                confidences.append(pred.confidence)
-                correct_flags.append(is_match)
+                if pred.confidence is not None:
+                    confidences.append(pred.confidence)
+                    correct_flags.append(is_match)
 
                 if is_match:
                     tp += 1
@@ -561,8 +563,9 @@ def compute_aggregate_metrics(
             fpred = spred.predictions.get(field_path) if spred else None
             if fpred and not fpred.is_null and fpred.predicted_value is not None:
                 if gt_field.is_null or gt_field.expected_value is None:
-                    all_confs.append(fpred.confidence)
-                    all_correct.append(False)
+                    if fpred.confidence is not None:
+                        all_confs.append(fpred.confidence)
+                        all_correct.append(False)
                 else:
                     eff_tok_thresh = gt_field.token_f1_threshold or token_f1_threshold
                     is_match, _ = match_field_values(
@@ -574,8 +577,9 @@ def compute_aggregate_metrics(
                         field_type=gt_field.field_type,
                         normalization_profile=gt_field.normalization_profile,
                     )
-                    all_confs.append(fpred.confidence)
-                    all_correct.append(is_match)
+                    if fpred.confidence is not None:
+                        all_confs.append(fpred.confidence)
+                        all_correct.append(is_match)
 
     if all_confs:
         dataset_cal_gap, _ = compute_10_bin_calibration(all_confs, all_correct)

@@ -64,7 +64,7 @@ class TableReconstructor:
         self,
         row_y_tolerance_px: float = 12.0,
         col_x_tolerance_px: float = 20.0,
-        default_confidence_when_missing: float = 0.5,
+        default_confidence_when_missing: Optional[float] = None,
     ) -> None:
         self.row_y_tolerance_px = row_y_tolerance_px
         self.col_x_tolerance_px = col_x_tolerance_px
@@ -109,7 +109,8 @@ class TableReconstructor:
                 if cell.confidence is not None
                 else self.default_confidence_when_missing
             )
-            confidences.append(max(0.0, min(1.0, float(c_val))))
+            if c_val is not None:
+                confidences.append(max(0.0, min(1.0, float(c_val))))
             valid_cells.append(cell)
 
         # 2. Cluster cells into rows and columns
@@ -146,7 +147,11 @@ class TableReconstructor:
         )
         bbox_orig = BoundingBox.from_tuple(orig_tuple)
 
-        mean_conf = sum(confidences) / len(confidences) if confidences else 1.0
+        mean_conf = (
+            round(sum(confidences) / len(confidences), 4)
+            if confidences
+            else None
+        )
 
         return HTMLTable(
             table_id=candidate_region.region_id,
@@ -154,7 +159,7 @@ class TableReconstructor:
             bbox_original=bbox_orig,
             row_count=row_count,
             col_count=col_count,
-            ocr_confidence=round(mean_conf, 4),
+            ocr_confidence=mean_conf,
         )
 
     def _build_explicit_grid(
@@ -187,7 +192,7 @@ class TableReconstructor:
                         CandidateTableCell(
                             text="",
                             bbox_preprocessed=(0.0, 0.0, 0.0, 0.0),
-                            confidence=1.0,
+                            confidence=None,  # structural padding cell: nothing was read, no score
                             row_hint=r_idx,
                             col_hint=c_idx,
                         )
