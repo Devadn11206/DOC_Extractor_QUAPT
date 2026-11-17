@@ -9,6 +9,7 @@ Enforces:
 """
 
 from pathlib import Path
+import re
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 from doc_extractor.exceptions import ConfigurationError
@@ -91,6 +92,59 @@ class Settings(BaseModel):
         description="Scanner backend (mock, clamav_socket, offline_bundle)",
     )
 
+    # Module B OCR / layout parser backend (FR-PRS-001, FR-PRS-005, ARC-002)
+    ocr_backend: Literal["passthrough", "tesseract", "pdfium_hybrid", "pdfium", "none"] = Field(
+        default="passthrough",
+        description=(
+            "Module B parser backend. 'passthrough' (default): explicit no-OCR mode - empty layouts, "
+            "page images preserved for the vision model, UNKNOWN classification and review required; needs no "
+            "OCR runtime. 'tesseract': local Tesseract OCR on every page image (optional: pip install -e \".[ocr]\" "
+            "plus the Tesseract binary). "
+            "'pdfium_hybrid': native PDF text per page with Tesseract OCR fallback. "
+            "'pdfium': native PDF text only (no OCR; fails on scanned pages and images). "
+            "'none': explicit no-parser mode; the parser reports non-operational and Module B fails closed."
+        ),
+    )
+    ocr_tesseract_lang: str = Field(
+        default="eng",
+        description="Tesseract language string, '+' joins packs (e.g. 'eng+hin'); packs must be installed",
+    )
+    ocr_tesseract_config: str = Field(
+        default="",
+        description="Extra Tesseract CLI configuration (e.g. '--psm 6')",
+    )
+    ocr_tesseract_cmd: Optional[str] = Field(
+        default=None,
+        description="Explicit Tesseract executable path/name; None uses 'tesseract' from PATH",
+    )
+
+    # Local LLM Extraction Configuration (Module C / PRD ARC-004, ARC-005)
+    llm_model_name: str = Field(
+        default="ollama/qwen2.5:7b-instruct",
+        description="Target local extraction model identifier (e.g. 'ollama/qwen2.5:7b-instruct')",
+    )
+    llm_api_base: str = Field(
+        default="http://localhost:11434",
+        description="Local model server base URL (Ollama or vLLM loopback endpoint)",
+    )
+    llm_provider: str = Field(
+        default="ollama",
+        description="Local LLM provider backend ('ollama' or 'vllm')",
+    )
+    llm_use_inference: bool = Field(
+        default=False,
+        description="Whether to execute live LLM inference in Module C (false by default for offline testing)",
+    )
+    llm_allow_fallback: bool = Field(
+        default=False,
+        description="Strict no-fallback policy: fail closed if LLM extraction fails",
+    )
+    llm_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Local inference request timeout in seconds",
+    )
+
     @field_validator("allow_external_egress")
     @classmethod
     def validate_no_egress_in_production(cls, v: bool, info) -> bool:
@@ -100,6 +154,38 @@ class Settings(BaseModel):
             raise ValueError(
                 "External egress (allow_external_egress=True) violates ARC-001/SEC-011. "
                 "The engine operates strictly inside the customer VPC/on-prem boundary."
+            )
+        return v
+
+    @field_validator("ocr_tesseract_lang")
+    @classmethod
+    def validate_tesseract_lang(cls, v: str) -> str:
+        """Reject malformed language strings (must look like 'eng' or 'eng+hin')."""
+        if not re.fullmatch(r"[A-Za-z0-9_]+(\+[A-Za-z0-9_]+)*", v or ""):
+            raise ValueError(
+                f"Invalid ocr_tesseract_lang '{v}'. Use Tesseract language codes such as "
+                "'eng' or 'eng+hin'."
+            )
+        return v
+
+    @field_validator("llm_api_base")
+    @classmethod
+    def validate_local_llm_endpoint(cls, v: Optional[str], info) -> Optional[str]:
+        """Guardrail: Disallow public cloud LLM endpoints to preserve zero-egress boundary (ARC-001, SEC-011)."""
+        if not v:
+            return v
+        v_clean = v.strip().lower()
+        cloud_endpoints = (
+            "api.openai.com",
+            "api.anthropic.com",
+            "api.cohere.ai",
+            "generativelanguage.googleapis.com",
+            "bedrock.amazonaws.com",
+        )
+        if any(cloud in v_clean for cloud in cloud_endpoints):
+            raise ValueError(
+                f"Configured llm_api_base '{v}' targets a public cloud provider, "
+                "violating on-prem zero-egress policy (ARC-001, SEC-011)."
             )
         return v
 

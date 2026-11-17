@@ -1,7 +1,8 @@
-# Module A: Document Ingestion & Preprocessing - Development & Test Dependencies
+# Development & test dependencies (mirrors the 'dev' extra in pyproject.toml).
 -r requirements.txt
 
-# Constrain pytest to <9.0.0 due to a known Python 3.10.0 dataclass slots issue in pytest 9.x
-pytest>=7.0.0,<9.0.0
+pytest>=7.0.0
 pytest-cov>=4.0.0
 
+# Upstream reported a dataclass-slots problem with pytest 9.x on Python 3.10.0 exactly; this has
+# not been verified here (no Python 3.10 available). On 3.10.0 use 3.10.1+ or pin pytest<9.

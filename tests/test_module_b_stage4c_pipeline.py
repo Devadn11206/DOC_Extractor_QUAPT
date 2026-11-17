@@ -365,7 +365,11 @@ def test_reviewer_override_success(temp_storage):
 
 def test_reviewer_override_tenant_mismatch_raises_error(temp_storage):
     """Override request from wrong tenant fails with StorageError."""
-    pipeline = ModuleBPipeline(storage=temp_storage, tenant_id="tenant-test")
+    pipeline = ModuleBPipeline(
+        storage=temp_storage,
+        parser=LocalOCRParserAdapter(raw_extractor=lambda img: []),
+        tenant_id="tenant-test",
+    )
     handoff = _create_synthetic_handoff_files(temp_storage, ["Page 1"])
     orig_payload = pipeline.process_handoff(handoff)
 
@@ -383,7 +387,11 @@ def test_reviewer_override_tenant_mismatch_raises_error(temp_storage):
 
 def test_reviewer_override_missing_reviewer_or_reason_raises_error(temp_storage):
     """Override without reviewer ID or reason is rejected (FR-CLS-004 auditability)."""
-    pipeline = ModuleBPipeline(storage=temp_storage, tenant_id="tenant-test")
+    pipeline = ModuleBPipeline(
+        storage=temp_storage,
+        parser=LocalOCRParserAdapter(raw_extractor=lambda img: []),
+        tenant_id="tenant-test",
+    )
     handoff = _create_synthetic_handoff_files(temp_storage, ["Page 1"])
     orig_payload = pipeline.process_handoff(handoff)
 

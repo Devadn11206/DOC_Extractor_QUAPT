@@ -265,7 +265,13 @@ class FieldPrediction(BaseModel):
 
     field_path: str = Field(..., description="Canonical dot or bracket path of the field")
     predicted_value: Optional[Any] = Field(default=None, description="Extracted value; None if predicted absent/null")
-    confidence: float = Field(ge=0.0, le=1.0, description="Stated calibrated confidence score in [0.0, 1.0]")
+    confidence: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0,
+        description=(
+            "Stated calibrated confidence score in [0.0, 1.0]; None when the extraction reported none "
+            "(such predictions are excluded from calibration instead of being treated as 0 or 1)"
+        ),
+    )
     is_null: bool = Field(default=False, description="Flag indicating model predicted null/absent")
 
     @field_validator("field_path")

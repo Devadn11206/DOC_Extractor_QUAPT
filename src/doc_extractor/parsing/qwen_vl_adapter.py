@@ -10,9 +10,8 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 from PIL import Image
-import torch
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
+from doc_extractor import vlm_runtime
 from doc_extractor.contracts_b import (
     BoundingBox,
     CheckboxMark,
@@ -36,42 +35,26 @@ class QwenVLParserAdapter(ParserEngine):
     def __init__(
         self,
         model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct",
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        device: str = "auto",
         load_in_4bit: bool = True,  # Recommended for Kaggle 16GB T4 / P100 GPUs
-        torch_dtype: torch.dtype = torch.bfloat16,
+        precision: str = "auto",    # "auto": BF16 only on GPUs with native support, else FP16 (e.g. T4)
     ):
         self.model_id = model_id
         self.device = device
         self._is_operational = False
 
         try:
-            # 1. Load Processor
-            self.processor = AutoProcessor.from_pretrained(
-                model_id, 
-                trust_remote_code=True
-            )
-
-            # 2. Load Model (4-bit quantized to run comfortably inside 16GB VRAM on Kaggle)
-            model_kwargs = {
-                "trust_remote_code": True,
-                "device_map": "auto",
-            }
-            if load_in_4bit:
-                from transformers import BitsAndBytesConfig
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch_dtype,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
-            else:
-                model_kwargs["torch_dtype"] = torch_dtype
-
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_id,
-                **model_kwargs
-            )
-            self.model.eval()
+            # Exact Qwen2.5-VL model class, hardware-aware dtype and verified 4-bit settings (no hard-coded
+            # BF16, no generic-loader fallback); see doc_extractor.vlm_runtime.
+            loaded = vlm_runtime.load_qwen_vl(vlm_runtime.VLMLoadConfig(
+                model_id=model_id,
+                load_in_4bit=load_in_4bit,
+                precision=precision,
+                device_map=device,
+            ))
+            self.processor = loaded.processor
+            self.model = loaded.model
+            self.runtime_info = loaded.runtime_info
             self._is_operational = True
         except Exception as e:
             # Will allow fail-closed handling if weights cannot load
@@ -117,7 +100,7 @@ class QwenVLParserAdapter(ParserEngine):
         prompt_text = (
             "Read all printed and handwritten text in this document page in logical reading order. "
             "For each detected text block, heading, table row, or checkbox label, detect its bounding box "
-            "in the format: [ymin, xmin, ymax, xmax] followed by the text content. "
+            "in the format: [x1, y1, x2, y2] (left, top, right, bottom) followed by the text content. "
             "If a checkbox is checked, output [x]. If unchecked, output [ ]."
         )
 
@@ -136,14 +119,13 @@ class QwenVLParserAdapter(ParserEngine):
             text_prompt = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
-            image_inputs, video_inputs = self.processor.image_processor(
-                images=pil_image, return_tensors="pt"
-            ).values()
+            import torch
 
+            # The processor resizes the PIL image exactly once with the checkpoint's own settings;
+            # the image is not pre-processed separately (that would resize/normalize twice).
             inputs = self.processor(
                 text=[text_prompt],
-                images=image_inputs,
-                videos=video_inputs,
+                images=[pil_image],
                 padding=True,
                 return_tensors="pt",
             ).to(self.model.device)
@@ -152,8 +134,7 @@ class QwenVLParserAdapter(ParserEngine):
                 generated_ids = self.model.generate(
                     **inputs,
                     max_new_tokens=2048,
-                    temperature=0.01,  # Near-deterministic
-                    do_sample=False,
+                    do_sample=False,  # greedy: deterministic
                 )
 
             # Strip prompt tokens from output
@@ -186,7 +167,7 @@ class QwenVLParserAdapter(ParserEngine):
         blocks: List[LayoutBlock] = []
         checkboxes: List[CheckboxMark] = []
 
-        # Matches coordinate patterns like [120, 45, 160, 350] or (120, 45, 160, 350)
+        # Matches coordinate patterns like [45, 120, 350, 160] or (45, 120, 350, 160): [x1, y1, x2, y2]
         box_pattern = re.compile(
             r"(?:\[|\()(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:\]|\))\s*(.*)"
         )
@@ -197,9 +178,9 @@ class QwenVLParserAdapter(ParserEngine):
         for line in lines:
             match = box_pattern.search(line)
             if match:
-                ymin_norm, xmin_norm, ymax_norm, xmax_norm, content = match.groups()
-                ymin, xmin = float(ymin_norm), float(xmin_norm)
-                ymax, xmax = float(ymax_norm), float(xmax_norm)
+                x1_norm, y1_norm, x2_norm, y2_norm, content = match.groups()   # [x1, y1, x2, y2]
+                xmin, ymin = float(x1_norm), float(y1_norm)
+                xmax, ymax = float(x2_norm), float(y2_norm)
                 text = content.strip()
             else:
                 # If a line had no explicit coordinates, assign full-width span in sequence
@@ -211,7 +192,7 @@ class QwenVLParserAdapter(ParserEngine):
             if not text:
                 continue
 
-            # Convert Qwen2.5-VL [0, 1000] scale to actual preprocessed image pixels
+            # Convert the [0, 1000] grid to actual preprocessed image pixels (x by width, y by height)
             x0 = max(0.0, min(float(w_px), (xmin / 1000.0) * w_px))
             y0 = max(0.0, min(float(h_px), (ymin / 1000.0) * h_px))
             x1 = max(x0, min(float(w_px), (xmax / 1000.0) * w_px))
@@ -236,7 +217,7 @@ class QwenVLParserAdapter(ParserEngine):
                     CheckboxMark(
                         mark_id=f"cb_p{loaded_page.page_number}_{reading_idx}",
                         state=state,
-                        ocr_confidence=0.95,
+                        ocr_confidence=None,  # the VLM reports no optical confidence; none is invented
                         bbox_preprocessed=bbox_prep,
                         bbox_original=bbox_orig,
                     )
@@ -254,7 +235,7 @@ class QwenVLParserAdapter(ParserEngine):
                     block_id=f"blk_p{loaded_page.page_number}_{reading_idx:04d}",
                     element_type=elem_type,
                     text=text,
-                    ocr_confidence=0.92,
+                    ocr_confidence=None,  # unavailable: model-read text has no optical confidence
                     bbox_preprocessed=bbox_prep,
                     bbox_original=bbox_orig,
                     reading_order_index=reading_idx,
@@ -273,5 +254,5 @@ class QwenVLParserAdapter(ParserEngine):
             key_value_pairs=[],
             tables=[],
             character_grids=[],
-            mean_ocr_confidence=0.92,
+            mean_ocr_confidence=None,  # no measured block confidences to average
         )
