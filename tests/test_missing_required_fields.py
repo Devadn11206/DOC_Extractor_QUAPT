@@ -79,7 +79,7 @@ def _schema_def() -> SchemaDefinition:
 
 
 def _box(i: int):
-    return [100 * i, 100, 100 * i + 50, 500]
+    return [100, 100 * i, 500, 100 * i + 50]            # [x1, y1, x2, y2]
 
 
 def _leaf(value) -> PageLeaf:
@@ -339,7 +339,7 @@ def test_non_json_and_blank_replies_are_still_failures_not_missing_fields(
 # ============================================================================
 
 def test_structured_doc01_missing_required_name_keeps_other_fields(casa_run, monkeypatch):
-    vlm = PageAwareVLM({1: {"applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [200, 120, 250, 320]}}})
+    vlm = PageAwareVLM({1: {"applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [120, 200, 320, 250]}}})
     vlm.bind(casa_run["page_images"]).install(monkeypatch)
 
     env = _vlm_pipeline().process(casa_run["payload"], page_images=casa_run["page_images"])
@@ -508,12 +508,12 @@ def _three_page_repeat_run(temp_storage, monkeypatch, responses):
 
 def test_evidence_survives_three_page_aggregation_with_per_page_geometry(temp_storage, monkeypatch):
     responses = {
-        1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [100, 120, 150, 420]},
-            "applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [200, 120, 250, 320]}},
-        2: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [110, 130, 160, 430]},
-            "applicant.phone_number": {"value": "9876543210", "bbox": [400, 120, 450, 320]}},
-        3: {"applicant.full_name": {"value": "RUPESH  KUMAR JR", "bbox": [120, 140, 170, 440]},
-            "applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [210, 130, 260, 330]}},
+        1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [120, 100, 420, 150]},
+            "applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [120, 200, 320, 250]}},
+        2: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [130, 110, 430, 160]},
+            "applicant.phone_number": {"value": "9876543210", "bbox": [120, 400, 320, 450]}},
+        3: {"applicant.full_name": {"value": "RUPESH  KUMAR JR", "bbox": [140, 120, 440, 170]},
+            "applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [130, 210, 330, 260]}},
     }
     run, env = _three_page_repeat_run(temp_storage, monkeypatch, responses)
 
@@ -521,9 +521,9 @@ def test_evidence_survives_three_page_aggregation_with_per_page_geometry(temp_st
     assert (name.evidence.page, name.value) == (1, "RUPESH KUMAR")
     # same reading on page 2 and the conflicting reading on page 3 both stay available for review
     assert [(e.page, e.text) for e in name.additional_evidence] == [(2, "RUPESH KUMAR"), (3, "RUPESH  KUMAR JR")]
-    assert name.evidence.bbox == pytest.approx(_expected_original_bbox(run.refs[0], [100, 120, 150, 420]))
-    assert name.additional_evidence[0].bbox == pytest.approx(_expected_original_bbox(run.refs[1], [110, 130, 160, 430]))
-    assert name.additional_evidence[1].bbox == pytest.approx(_expected_original_bbox(run.refs[2], [120, 140, 170, 440]))
+    assert name.evidence.bbox == pytest.approx(_expected_original_bbox(run.refs[0], [120, 100, 420, 150]))
+    assert name.additional_evidence[0].bbox == pytest.approx(_expected_original_bbox(run.refs[1], [130, 110, 430, 160]))
+    assert name.additional_evidence[1].bbox == pytest.approx(_expected_original_bbox(run.refs[2], [140, 120, 440, 170]))
     pan = env.fields["applicant.pan_card_number"]
     assert [e.page for e in pan.additional_evidence] == [3]                  # deduplicated, evidence kept
     assert any(f.code == "FIELD_VALUE_CONFLICT" and f.fields == ["applicant.full_name"] for f in env.flags)
@@ -531,9 +531,9 @@ def test_evidence_survives_three_page_aggregation_with_per_page_geometry(temp_st
 
 def test_every_evidence_reference_names_a_real_page_of_the_document(temp_storage, monkeypatch):
     responses = {
-        1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [100, 120, 150, 420]}},
-        2: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [110, 130, 160, 430]}},
-        3: {"applicant.phone_number": {"value": "9876543210", "bbox": [400, 120, 450, 320]}},
+        1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [120, 100, 420, 150]}},
+        2: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [130, 110, 430, 160]}},
+        3: {"applicant.phone_number": {"value": "9876543210", "bbox": [120, 400, 320, 450]}},
     }
     run, env = _three_page_repeat_run(temp_storage, monkeypatch, responses)
     real_pages = {p.page_number for p in run.payload.pages}
@@ -552,7 +552,7 @@ def test_every_evidence_reference_names_a_real_page_of_the_document(temp_storage
 
 def test_missing_page_reference_can_never_produce_complete_coverage(temp_storage, monkeypatch):
     run = _run(temp_storage, 3)
-    PageAwareVLM({n: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [100, 120, 150, 420]}}
+    PageAwareVLM({n: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [120, 100, 420, 150]}}
                   for n in (1, 2, 3)}).bind(run.refs).install(monkeypatch)
 
     env = _vlm_pipeline().process(run.payload, page_images=[run.refs[0], run.refs[2]])
@@ -567,7 +567,7 @@ def test_missing_page_reference_can_never_produce_complete_coverage(temp_storage
 def test_empty_processed_pages_stay_valid_and_failed_pages_stay_represented(temp_storage, monkeypatch):
     run = _run(temp_storage, 3)
     PageAwareVLM({1: {}, 2: RuntimeError("oom"),
-                  3: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [100, 120, 150, 420]}}}
+                  3: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [120, 100, 420, 150]}}}
                  ).bind(run.refs).install(monkeypatch)
 
     env = _vlm_pipeline().process(run.payload, page_images=run.refs)

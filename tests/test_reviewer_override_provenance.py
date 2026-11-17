@@ -92,7 +92,7 @@ def test_override_never_creates_extraction_confidence_or_approval(temp_storage, 
 
     # Real page images for this handoff drive the multimodal extractor.
     refs = pipeline.load_page_images(_create_synthetic_handoff_files(temp_storage, ["Page 1"]))
-    PageAwareVLM({1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [100, 120, 150, 420]}}}
+    PageAwareVLM({1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [120, 100, 420, 150]}}}
                  ).bind(refs).install(monkeypatch)
     env = _vlm_pipeline().process(overridden, page_images=refs)
 

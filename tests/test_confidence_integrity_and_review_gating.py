@@ -46,7 +46,7 @@ from doc_extractor.parsing.adapter import LocalOCRParserAdapter
 from doc_extractor.parsing.base import RawOCRToken
 from doc_extractor.pipeline_b import ModuleBPipeline
 from doc_extractor.pipeline_c import ModuleCPipeline
-from doc_extractor.routing import heuristic_classify
+from doc_extractor.routing import RoutedExtractor, heuristic_classify
 from doc_extractor.validation_rules import calculate_calibrated_confidence, calibrate_field_confidence
 from schema_lifecycle.testing.contracts import FieldPrediction, GroundTruthField
 from schema_lifecycle.testing.metrics import compute_field_metrics
@@ -54,11 +54,13 @@ from schema_lifecycle.testing.metrics import compute_field_metrics
 from tests.test_canonical_module_c_orchestration import (  # noqa: F401  (fixtures + helpers)
     CASA_VLM_OUTPUT,
     TENANT,
+    VLM_ONLY_TABLE,
     FakeVLM,
     _casa_ocr_tokens,
     _isolate_environment,
     _module_a,
     _png_bytes,
+    _run_app,
     _tiff_bytes,
     _vlm_pipeline,
     _write_png,
@@ -253,6 +255,7 @@ def test_no_synthetic_confidence_literals_remain_in_pipeline_sources():
     scanned = [
         "field_assembly.py", "validation_rules.py", "pipeline_c.py", "extractor.py",
         "vlm_grounding.py", "app.py", "parsing/qwen_vl_adapter.py", "parsing/tables.py",
+        "routed_pages.py", "adapters.py",
     ]
     assignment = re.compile(
         r"""(?<![\w])(?:ocr_|model_|mean_ocr_|calibrated_)?confidence\s*=\s*(?:1\.0|1|0\.\d+)\b"""
@@ -351,6 +354,7 @@ def _wire(monkeypatch, storage, token_fn):
     monkeypatch.setattr(
         app, "get_pipelines", lambda settings=None: (_module_a(storage), _module_b_with(storage, token_fn))
     )
+    app._ROUTED = RoutedExtractor(table=VLM_ONLY_TABLE, allow_fallback=False)
 
 
 def _named_png(tmp_path: Path, name: str) -> str:
@@ -359,47 +363,44 @@ def _named_png(tmp_path: Path, name: str) -> str:
     return str(path)
 
 
-def test_unknown_document_does_not_become_doc01_in_the_app(temp_storage, tmp_path, monkeypatch):
+def test_unidentified_document_never_becomes_doc01_in_the_app(temp_storage, tmp_path, monkeypatch):
     fake = FakeVLM().install(monkeypatch)
     _wire(monkeypatch, temp_storage, _tokens_unrelated)
-    # A filename full of CASA keywords must not bind DOC-01 either.
-    _, status, json_text, md, _ = app.process_document(
-        _named_png(tmp_path, "bank_account_form.png"), "Structured", app.AUTO, app.AUTO, "English", True
+    # A filename full of CASA keywords must not bind DOC-01 either (v1.5 default: dynamic fields, no fixed schema).
+    (_, status, json_text, md, _, _), _ = _run_app(
+        _named_png(tmp_path, "bank_account_form.png"), "Structured", app.AUTO, app.AUTO, "English"
     )
     envelope = json.loads(json_text)
 
-    assert envelope["document_metadata"]["document_type"] == "UNKNOWN"
+    assert envelope["document_metadata"]["document_type"] == "generic"        # never DOC-01
+    assert envelope["document_metadata"]["schema_id"] == "generic"
     assert envelope["document_metadata"]["status"] == "needs_review"
-    assert envelope["fields"] == {}
-    # Only the document classifier may have run; no schema extraction prompt reached a model.
-    assert all("You classify document images" in c["system_prompt"] for c in fake.calls)
+    # No schema field list reached a model: the extraction prompt is the generic, label-driven one.
     assert not any("applicant.full_name" in c["system_prompt"] for c in fake.calls)
     assert status.startswith("Status: NEEDS_REVIEW")
-    assert "unidentified" in md
 
 
 def test_vlm_suggested_type_is_advisory_and_does_not_bind(temp_storage, tmp_path, monkeypatch):
-    calls: List[str] = []
+    prompts: List[str] = []
 
-    def generate(self_extractor, image_input, system_prompt, user_text, max_new_tokens):
-        calls.append(system_prompt[:40])
+    def generate(self_extractor, image_input, system_prompt, user_text, max_new_tokens, max_pixels=None):
+        prompts.append(system_prompt)
         if "You classify document images" in system_prompt:
             return json.dumps({"category": "structured", "document_type": "DOC-01", "subtype": None,
                                "language": "en", "confidence": 0.99})
-        raise AssertionError("schema extraction must not run for an unidentified document")
+        return json.dumps({"title": {"value": "Some Form", "bbox": [100, 100, 500, 150]}})
 
     monkeypatch.setattr(SchemaGuidedExtractor, "_generate_from_image", generate)
     _wire(monkeypatch, temp_storage, _tokens_unrelated)
 
-    _, _, json_text, md, _ = app.process_document(
-        _named_png(tmp_path, "scan.png"), app.AUTO, app.AUTO, app.AUTO, app.AUTO, True
+    (_, _, json_text, md, _, _), _ = _run_app(
+        _named_png(tmp_path, "scan.png"), app.AUTO, app.AUTO, app.AUTO, app.AUTO
     )
     envelope = json.loads(json_text)
 
-    assert envelope["document_metadata"]["document_type"] == "UNKNOWN"
-    assert envelope["document_metadata"]["status"] == "needs_review"
-    assert "| Suggested type | DOC-01 |" in md  # surfaced to the user, not applied
-    assert len(calls) == 1  # only the classifier ran
+    assert envelope["document_metadata"]["document_type"] == "generic"        # the suggestion did not bind
+    assert "(suggested DOC-01)" in md                                           # surfaced to the user, not applied
+    assert not any("applicant.full_name" in p for p in prompts)                # no DOC-01 schema prompt ran
 
 
 def test_explicit_supported_override_processes_an_unknown_document(temp_storage, tmp_path, monkeypatch):
@@ -414,8 +415,8 @@ def test_explicit_supported_override_processes_an_unknown_document(temp_storage,
 
     monkeypatch.setattr(ModuleBPipeline, "apply_reviewer_override", spy)
 
-    _, _, json_text, _, _ = app.process_document(
-        _named_png(tmp_path, "scan.png"), "Structured", "DOC-01", app.AUTO, "English", True
+    (_, _, json_text, _, _, _), _ = _run_app(
+        _named_png(tmp_path, "scan.png"), "Structured", "DOC-01", app.AUTO, "English"
     )
     envelope = json.loads(json_text)
 
@@ -430,22 +431,24 @@ def test_explicit_supported_override_processes_an_unknown_document(temp_storage,
 def test_unsupported_override_is_not_silently_replaced_by_doc01(temp_storage, tmp_path, monkeypatch):
     FakeVLM().install(monkeypatch)
     _wire(monkeypatch, temp_storage, _tokens_unrelated)
-    _, _, json_text, _, _ = app.process_document(
-        _named_png(tmp_path, "scan.png"), "Structured", "DOC-07", app.AUTO, "English", True
+    (_, _, json_text, _, _, _), _ = _run_app(
+        _named_png(tmp_path, "scan.png"), "Structured", "DOC-07", app.AUTO, "English"
     )
-    assert json.loads(json_text)["document_metadata"]["document_type"] == "UNKNOWN"
+    assert json.loads(json_text)["document_metadata"]["document_type"] == "generic"
 
 
-def test_module_b_identified_type_binds_without_an_override(temp_storage, tmp_path, monkeypatch):
+def test_module_b_identified_type_is_a_hint_not_a_schema_binding(temp_storage, tmp_path, monkeypatch):
+    FakeVLM().install(monkeypatch)
     _wire(monkeypatch, temp_storage, _casa_ocr_tokens)
     overrides: List[Any] = []
     monkeypatch.setattr(ModuleBPipeline, "apply_reviewer_override", lambda *a, **k: overrides.append(1))
 
-    _, _, json_text, _, _ = app.process_document(
-        _named_png(tmp_path, "whatever.png"), "Structured", app.AUTO, app.AUTO, "English", False
+    (_, _, json_text, md, _, _), _ = _run_app(
+        _named_png(tmp_path, "whatever.png"), "Structured", app.AUTO, app.AUTO, "English"
     )
-    assert overrides == []
-    assert json.loads(json_text)["document_metadata"]["document_type"] == "DOC-01"
+    assert overrides == []                                              # nothing was overridden
+    assert json.loads(json_text)["document_metadata"]["document_type"] == "generic"   # v1.5: schema only by user pick
+    assert "(suggested DOC-01)" in md                                    # Module B's content-based type, as a hint
 
 
 def _doc02_tokens(img):
@@ -473,11 +476,14 @@ def _doc03_tokens(img):
     (_doc03_tokens, "DOC-03"),
 ])
 def test_supported_document_routing_is_preserved(temp_storage, tmp_path, monkeypatch, tokens, expected):
+    FakeVLM().install(monkeypatch)
     _wire(monkeypatch, temp_storage, tokens)
-    _, _, json_text, _, _ = app.process_document(
-        _named_png(tmp_path, "doc.png"), "Structured", app.AUTO, app.AUTO, "English", False
+    handoff = _module_a(temp_storage).process_document(io.BytesIO(_png_bytes()), "doc.png")
+    assert _module_b_with(temp_storage, tokens).process_handoff(handoff).classification.document_type.value == expected
+    (_, _, _, md, _, _), _ = _run_app(
+        _named_png(tmp_path, "doc.png"), "Structured", app.AUTO, app.AUTO, "English"
     )
-    assert json.loads(json_text)["document_metadata"]["document_type"] == expected
+    assert f"(suggested {expected})" in md
 
 
 # ============================================================================

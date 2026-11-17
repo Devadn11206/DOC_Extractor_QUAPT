@@ -138,17 +138,17 @@ def _process(run: Run, vlm: PageAwareVLM, monkeypatch, refs=None):
     return _vlm_pipeline().process(run.payload, page_images=run.refs if refs is None else refs)
 
 
-def _name(page_value: str, bbox=(100, 120, 150, 420)) -> Dict[str, Any]:
+def _name(page_value: str, bbox=(120, 100, 420, 150)) -> Dict[str, Any]:
     return {"applicant.full_name": {"value": page_value, "bbox": list(bbox)}}
 
 
 PAGE_FIELDS = {
-    1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [100, 120, 150, 420]},
-        "applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [200, 120, 250, 320]}},
-    2: {"applicant.date_of_birth": {"value": "15/08/1990", "bbox": [300, 120, 350, 320]},
-        "applicant.phone_number": {"value": "9876543210", "bbox": [400, 120, 450, 320]}},
-    3: {"account_details.account_type": {"value": "Savings", "bbox": [500, 120, 550, 320]},
-        "account_details.initial_deposit_amount": {"value": "Rs. 5,000.00", "bbox": [600, 120, 650, 320]}},
+    1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [120, 100, 420, 150]},
+        "applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [120, 200, 320, 250]}},
+    2: {"applicant.date_of_birth": {"value": "15/08/1990", "bbox": [120, 300, 320, 350]},
+        "applicant.phone_number": {"value": "9876543210", "bbox": [120, 400, 320, 450]}},
+    3: {"account_details.account_type": {"value": "Savings", "bbox": [120, 500, 320, 550]},
+        "account_details.initial_deposit_amount": {"value": "Rs. 5,000.00", "bbox": [120, 600, 320, 650]}},
 }
 
 
@@ -182,11 +182,11 @@ def test_three_page_pdf_extracts_values_from_every_page(temp_storage, monkeypatc
 def test_five_page_document_keeps_correct_page_numbering(temp_storage, monkeypatch):
     run = _run(temp_storage, 5)
     per_page = {
-        1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [100, 100, 150, 400]}},
-        2: {"applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [100, 100, 150, 400]}},
-        3: {"applicant.date_of_birth": {"value": "15/08/1990", "bbox": [100, 100, 150, 400]}},
-        4: {"applicant.phone_number": {"value": "9876543210", "bbox": [100, 100, 150, 400]}},
-        5: {"account_details.account_type": {"value": "Savings", "bbox": [100, 100, 150, 400]}},
+        1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": [100, 100, 400, 150]}},
+        2: {"applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [100, 100, 400, 150]}},
+        3: {"applicant.date_of_birth": {"value": "15/08/1990", "bbox": [100, 100, 400, 150]}},
+        4: {"applicant.phone_number": {"value": "9876543210", "bbox": [100, 100, 400, 150]}},
+        5: {"account_details.account_type": {"value": "Savings", "bbox": [100, 100, 400, 150]}},
     }
     env = _process(run, PageAwareVLM(per_page), monkeypatch)
 
@@ -233,7 +233,7 @@ def test_each_page_uses_its_own_geometry_for_coordinate_transform(temp_storage, 
         update={"applied_deskew_deg": 4.0, "preprocessed_width_px": 800, "preprocessed_height_px": 1000}
     )
     refs = [run.refs[0], PageImageRef(page_number=2, image_path=run.refs[1].image_path, page_ref=skewed_ref)]
-    same_box = [100, 120, 150, 420]
+    same_box = [120, 100, 420, 150]
     vlm = PageAwareVLM({
         1: {"applicant.full_name": {"value": "RUPESH KUMAR", "bbox": same_box}},
         2: {"applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": same_box}},
@@ -265,9 +265,9 @@ def test_each_page_uses_its_own_geometry_for_coordinate_transform(temp_storage, 
 def test_identical_scalar_across_pages_is_deduplicated_with_every_page_evidence(temp_storage, monkeypatch):
     run = _run(temp_storage, 3)
     vlm = PageAwareVLM({
-        1: _name("RUPESH KUMAR", (100, 120, 150, 420)),
-        2: _name("RUPESH KUMAR", (300, 200, 350, 500)),
-        3: _name("RUPESH KUMAR", (700, 100, 750, 300)),
+        1: _name("RUPESH KUMAR", (120, 100, 420, 150)),
+        2: _name("RUPESH KUMAR", (200, 300, 500, 350)),
+        3: _name("RUPESH KUMAR", (100, 700, 300, 750)),
     })
     env = _process(run, vlm, monkeypatch)
 
@@ -276,14 +276,14 @@ def test_identical_scalar_across_pages_is_deduplicated_with_every_page_evidence(
     assert field.evidence.page == 1
     assert [e.page for e in field.additional_evidence] == [2, 3]
     refs = {r.page_number: r for r in run.refs}
-    assert field.additional_evidence[0].bbox == pytest.approx(_expected_original_bbox(refs[2], (300, 200, 350, 500)))
-    assert field.additional_evidence[1].bbox == pytest.approx(_expected_original_bbox(refs[3], (700, 100, 750, 300)))
+    assert field.additional_evidence[0].bbox == pytest.approx(_expected_original_bbox(refs[2], (200, 300, 500, 350)))
+    assert field.additional_evidence[1].bbox == pytest.approx(_expected_original_bbox(refs[3], (100, 700, 300, 750)))
     assert not any(f.code == "FIELD_VALUE_CONFLICT" for f in env.flags)
 
 
 def test_conflicting_scalar_is_flagged_and_never_overwrites_the_first_reading(temp_storage, monkeypatch):
     run = _run(temp_storage, 3)
-    vlm = PageAwareVLM({1: _name("RUPESH KUMAR"), 2: {}, 3: _name("RAKESH KUMAR", (300, 200, 350, 500))})
+    vlm = PageAwareVLM({1: _name("RUPESH KUMAR"), 2: {}, 3: _name("RAKESH KUMAR", (200, 300, 500, 350))})
     env = _process(run, vlm, monkeypatch)
 
     field = env.fields["applicant.full_name"]
@@ -328,12 +328,12 @@ def test_aggregation_unit_rules_dedupe_conflict_and_order():
 def _doc02_pages() -> Dict[int, Dict[str, Any]]:
     def nom(i, name, share, y):
         return {
-            f"nominees.{i}.name": {"value": name, "bbox": [y, 100, y + 40, 500]},
-            f"nominees.{i}.share_percentage": {"value": share, "bbox": [y, 520, y + 40, 600]},
+            f"nominees.{i}.name": {"value": name, "bbox": [100, y, 500, y + 40]},
+            f"nominees.{i}.share_percentage": {"value": share, "bbox": [520, y, 600, y + 40]},
         }
 
     return {
-        1: {"proposer_name": {"value": "ANANYA SHARMA", "bbox": [50, 100, 90, 500]},
+        1: {"proposer_name": {"value": "ANANYA SHARMA", "bbox": [100, 50, 500, 90]},
             **nom(0, "ROHIT SHARMA", "60", 200), **nom(1, "KAVITA SHARMA", "40", 260)},
         2: nom(0, "MEERA SHARMA", "25", 300),
         3: nom(0, "ROHIT SHARMA", "60", 400),  # the first nominee again (e.g. a summary page)
@@ -358,8 +358,8 @@ def test_nominees_on_separate_pages_are_not_collapsed_into_the_first(temp_storag
     run = _run(temp_storage, 2, tokens=_doc02_tokens, expect=MVPDocumentType.DOC_02_INSURANCE_APP)
     # Legacy un-indexed reading ("nominees.name") on each page used to keep only the first entry.
     vlm = PageAwareVLM({
-        1: {"nominees.name": {"value": "ROHIT SHARMA", "bbox": [200, 100, 240, 500]}},
-        2: {"nominees.name": {"value": "KAVITA SHARMA", "bbox": [200, 100, 240, 500]}},
+        1: {"nominees.name": {"value": "ROHIT SHARMA", "bbox": [100, 200, 500, 240]}},
+        2: {"nominees.name": {"value": "KAVITA SHARMA", "bbox": [100, 200, 500, 240]}},
     })
     env = _process(run, vlm, monkeypatch)
     assert env.fields["nominees.0.name"].value == "ROHIT SHARMA" and env.fields["nominees.0.name"].evidence.page == 1
@@ -459,8 +459,9 @@ def test_empty_but_successfully_processed_page_is_not_a_failure(temp_storage, mo
 
 @pytest.mark.parametrize("label,response,reason_fragment", [
     ("blank reply", "", "empty model response"),
-    ("not JSON", "I cannot read this page", "JSONDecodeError"),
-    ("JSON but not an object", [1, 2, 3], "not a JSON object"),
+    # v1.5 parse_json_tolerant: prose or a bare JSON array contains no JSON object to recover
+    ("not JSON", "I cannot read this page", "no JSON object"),
+    ("JSON but not an object", [1, 2, 3], "no JSON object"),
     ("values violating the schema", {"account_details.initial_deposit_amount": {"value": "abc", "bbox": None}},
      "does not satisfy schema"),
 ])
@@ -556,7 +557,7 @@ def test_single_page_extraction_behaves_as_before(casa_run, monkeypatch):
 
 def test_single_page_group_mapping_still_reads_unindexed_nominee(temp_storage, monkeypatch):
     run = _run(temp_storage, 1, tokens=_doc02_tokens, expect=MVPDocumentType.DOC_02_INSURANCE_APP)
-    vlm = PageAwareVLM({1: {"nominees.name": {"value": "ROHIT SHARMA", "bbox": [200, 100, 240, 500]}}})
+    vlm = PageAwareVLM({1: {"nominees.name": {"value": "ROHIT SHARMA", "bbox": [100, 200, 500, 240]}}})
     env = _process(run, vlm, monkeypatch)
     assert env.fields["nominees.0.name"].value == "ROHIT SHARMA"
 
@@ -573,11 +574,11 @@ def test_blank_model_reply_is_an_error_but_empty_json_object_is_valid():
 # ============================================================================
 
 GENERIC_PAGES = {
-    1: {"title": {"value": "Gold Shield Plan", "bbox": [50, 100, 120, 600]},
-        "offer": {"value": "10% off", "bbox": [200, 100, 260, 500]}},
-    2: {"contact": {"value": "1800-123-456", "bbox": [700, 100, 760, 500]}},
-    3: {"title": {"value": "Gold Shield Plan", "bbox": [60, 100, 130, 600]},
-        "offer": {"value": "15% off", "bbox": [210, 100, 270, 500]}},
+    1: {"title": {"value": "Gold Shield Plan", "bbox": [100, 50, 600, 120]},
+        "offer": {"value": "10% off", "bbox": [100, 200, 500, 260]}},
+    2: {"contact": {"value": "1800-123-456", "bbox": [100, 700, 500, 760]}},
+    3: {"title": {"value": "Gold Shield Plan", "bbox": [100, 60, 600, 130]},
+        "offer": {"value": "15% off", "bbox": [100, 210, 500, 270]}},
 }
 
 
@@ -617,10 +618,10 @@ def test_dynamic_adapter_aggregates_pages_with_page_specific_evidence(
     run = _run(temp_storage, 2)
 
     vlm = PageAwareVLM({
-        1: {"applicant.full_name": {"value": "ANANYA SHARMA", "bbox": [700, 100, 760, 500]},
-            "required_missing_field": {"value": "PROVIDED", "bbox": [800, 100, 860, 500]},
-            "nominees.name": {"value": "ROHIT SHARMA", "bbox": [880, 100, 930, 500]}},
-        2: {"nominees.0.name": {"value": "KAVITA SHARMA", "bbox": [100, 100, 150, 500]}},
+        1: {"applicant.full_name": {"value": "ANANYA SHARMA", "bbox": [100, 700, 500, 760]},
+            "required_missing_field": {"value": "PROVIDED", "bbox": [100, 800, 500, 860]},
+            "nominees.name": {"value": "ROHIT SHARMA", "bbox": [100, 880, 500, 930]}},
+        2: {"nominees.0.name": {"value": "KAVITA SHARMA", "bbox": [100, 100, 500, 150]}},
     }).bind(run.refs).install(monkeypatch)
 
     adapter = DynamicExtractionAdapter(
@@ -634,7 +635,7 @@ def test_dynamic_adapter_aggregates_pages_with_page_specific_evidence(
     assert env.fields["nominees.1.name"].value == "KAVITA SHARMA"
     assert env.fields["nominees.1.name"].evidence.page == 2
     assert env.fields["nominees.1.name"].evidence.bbox == pytest.approx(
-        _expected_original_bbox(run.refs[1], [100, 100, 150, 500])
+        _expected_original_bbox(run.refs[1], [100, 100, 500, 150])
     )
     assert env.run.provenance.details["pages_processed"] == [1, 2]
     assert env.document_metadata.schema_version == 1

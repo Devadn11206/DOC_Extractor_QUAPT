@@ -30,14 +30,14 @@ from tests.test_multipage_extraction import PageAwareVLM, _run, _vlm_pipeline
 DOC03 = MVPDocumentType.DOC_03_DISCHARGE_SUMMARY
 
 PAGES = {
-    1: {"patient_name": {"value": "RAJESH GUPTA", "bbox": [100, 100, 150, 500]},
-        "admission_date": {"value": "01/03/2025", "bbox": [200, 100, 250, 500]}},
-    2: {"diagnosis": {"value": "Acute appendicitis", "bbox": [300, 100, 350, 500]},
-        "medications.0.medicine_name": {"value": "Paracetamol", "bbox": [400, 100, 450, 300]},
-        "medications.0.dosage": {"value": "500mg", "bbox": [400, 320, 450, 400]},
-        "medications.0.frequency": {"value": "TDS", "bbox": [400, 420, 450, 500]}},
-    3: {"discharge_date": {"value": "05/03/2025", "bbox": [500, 100, 550, 500]},
-        "medications.1.medicine_name": {"value": "Amoxicillin", "bbox": [600, 100, 650, 300]}},
+    1: {"patient_name": {"value": "RAJESH GUPTA", "bbox": [100, 100, 500, 150]},
+        "admission_date": {"value": "01/03/2025", "bbox": [100, 200, 500, 250]}},
+    2: {"diagnosis": {"value": "Acute appendicitis", "bbox": [100, 300, 500, 350]},
+        "medications.0.medicine_name": {"value": "Paracetamol", "bbox": [100, 400, 300, 450]},
+        "medications.0.dosage": {"value": "500mg", "bbox": [320, 400, 400, 450]},
+        "medications.0.frequency": {"value": "TDS", "bbox": [420, 400, 500, 450]}},
+    3: {"discharge_date": {"value": "05/03/2025", "bbox": [100, 500, 500, 550]},
+        "medications.1.medicine_name": {"value": "Amoxicillin", "bbox": [100, 600, 300, 650]}},
 }
 
 
@@ -55,14 +55,14 @@ def test_doc03_fields_are_extracted_from_every_page_with_page_specific_evidence(
     assert env.document_metadata.schema_id == "DOC-03" and env.document_metadata.page_count == 3
 
     expected = {
-        "patient_name": ("RAJESH GUPTA", 1, [100, 100, 150, 500]),
-        "admission_date": ("2025-03-01", 1, [200, 100, 250, 500]),          # normalised to ISO 8601
-        "diagnosis": ("Acute appendicitis", 2, [300, 100, 350, 500]),
-        "discharge_date": ("2025-03-05", 3, [500, 100, 550, 500]),
-        "medications.0.medicine_name": ("Paracetamol", 2, [400, 100, 450, 300]),
-        "medications.0.dosage": ("500mg", 2, [400, 320, 450, 400]),
-        "medications.0.frequency": ("TDS", 2, [400, 420, 450, 500]),
-        "medications.1.medicine_name": ("Amoxicillin", 3, [600, 100, 650, 300]),
+        "patient_name": ("RAJESH GUPTA", 1, [100, 100, 500, 150]),
+        "admission_date": ("2025-03-01", 1, [100, 200, 500, 250]),          # normalised to ISO 8601
+        "diagnosis": ("Acute appendicitis", 2, [100, 300, 500, 350]),
+        "discharge_date": ("2025-03-05", 3, [100, 500, 500, 550]),
+        "medications.0.medicine_name": ("Paracetamol", 2, [100, 400, 300, 450]),
+        "medications.0.dosage": ("500mg", 2, [320, 400, 400, 450]),
+        "medications.0.frequency": ("TDS", 2, [420, 400, 500, 450]),
+        "medications.1.medicine_name": ("Amoxicillin", 3, [100, 600, 300, 650]),
     }
     for path, (value, page, box) in expected.items():
         field = env.fields[path]
@@ -102,8 +102,8 @@ def test_doc03_provenance_records_every_page_processed(temp_storage, monkeypatch
 def test_doc03_invalid_date_fails_validation_and_chronology_violation_is_flagged(temp_storage, monkeypatch):
     pages = {
         1: {"patient_name": PAGES[1]["patient_name"],
-            "admission_date": {"value": "10/03/2025", "bbox": [200, 100, 250, 500]}},
-        3: {"discharge_date": {"value": "05/03/2025", "bbox": [500, 100, 550, 500]}},   # before admission
+            "admission_date": {"value": "10/03/2025", "bbox": [100, 200, 500, 250]}},
+        3: {"discharge_date": {"value": "05/03/2025", "bbox": [100, 500, 500, 550]}},   # before admission
     }
     _run_, _vlm, env = _process(temp_storage, monkeypatch, pages)
 
@@ -113,7 +113,7 @@ def test_doc03_invalid_date_fails_validation_and_chronology_violation_is_flagged
     assert env.document_metadata.status == "needs_review"
 
     bad = {1: {"patient_name": PAGES[1]["patient_name"],
-               "admission_date": {"value": "99/99/9999", "bbox": [200, 100, 250, 500]}}}
+               "admission_date": {"value": "99/99/9999", "bbox": [100, 200, 500, 250]}}}
     _run2, _vlm2, env2 = _process(temp_storage, monkeypatch, bad)
     assert env2.fields["admission_date"].validation == "failed"
     assert env2.document_metadata.status == "needs_review"

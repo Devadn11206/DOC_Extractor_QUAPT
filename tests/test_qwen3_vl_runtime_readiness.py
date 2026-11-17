@@ -61,11 +61,14 @@ class FakeTorch(types.SimpleNamespace):
             types.SimpleNamespace(name=n, major=c[0], minor=c[1], total_memory=int(mem * GiB))
             for n, c, mem in gpus
         ]
+        cache_clears: List[int] = []
         cuda = types.SimpleNamespace(
             is_available=lambda: bool(props),
             device_count=lambda: len(props),
             get_device_properties=lambda i: props[i],
             is_bf16_supported=lambda *a, **k: True,   # real PyTorch says True on a T4 by emulation: must be ignored
+            empty_cache=lambda: cache_clears.append(1),
+            cache_clears=cache_clears,                # exposed so tests can verify the cleanup happened
         )
         super().__init__(
             cuda=cuda,
@@ -182,18 +185,25 @@ def load(gpus, config=None, transformers=None, lookup=None, **config_kwargs):
 # 1. Model identifier
 # ============================================================================
 
-def test_primary_checkpoint_is_qwen3_vl_8b_instruct_everywhere():
-    assert rt.QWEN3_VL_MODEL_ID == "Qwen/Qwen3-VL-8B-Instruct"
-    assert rt.VLMLoadConfig().model_id == rt.QWEN3_VL_MODEL_ID
-    assert SchemaGuidedExtractor().model_name == "Qwen/Qwen3-VL-8B-Instruct"
-    assert rt.resolve_family(rt.QWEN3_VL_MODEL_ID) is rt.FAMILY_QWEN3_VL
+def test_default_checkpoint_is_qwen3_vl_4b_instruct_everywhere():
+    """PRD v1.5 / routing default: Qwen3-VL-4B-Instruct (fits a 16 GB T4); the 8B checkpoint stays supported."""
+    assert rt.QWEN3_VL_MODEL_ID == "Qwen/Qwen3-VL-4B-Instruct"
+    assert rt.DEFAULT_VLM_MODEL_ID == "Qwen/Qwen3-VL-4B-Instruct"
+    assert rt.VLMLoadConfig().model_id == rt.DEFAULT_VLM_MODEL_ID
+    assert SchemaGuidedExtractor().model_name == "Qwen/Qwen3-VL-4B-Instruct"
+    from doc_extractor.routing import DEFAULT_MODEL
+    assert DEFAULT_MODEL == rt.DEFAULT_VLM_MODEL_ID
+    for model in (rt.QWEN3_VL_4B_MODEL_ID, rt.QWEN3_VL_8B_MODEL_ID):
+        assert rt.resolve_family(model) is rt.FAMILY_QWEN3_VL
 
 
 def test_loaded_model_id_is_passed_to_the_loader_and_recorded():
     loaded, tf = load(GPU_T4)
-    assert tf.Qwen3VLForConditionalGeneration.calls[0]["source"] == "Qwen/Qwen3-VL-8B-Instruct"
-    assert tf.processor_box.loaded[0]["source"] == "Qwen/Qwen3-VL-8B-Instruct"
-    assert loaded.runtime_info["model_id"] == "Qwen/Qwen3-VL-8B-Instruct"
+    assert tf.Qwen3VLForConditionalGeneration.calls[0]["source"] == "Qwen/Qwen3-VL-4B-Instruct"
+    assert tf.processor_box.loaded[0]["source"] == "Qwen/Qwen3-VL-4B-Instruct"
+    assert loaded.runtime_info["model_id"] == "Qwen/Qwen3-VL-4B-Instruct"
+    loaded8, tf8 = load(GPU_A100, model_id="Qwen/Qwen3-VL-8B-Instruct")
+    assert tf8.Qwen3VLForConditionalGeneration.calls[0]["source"] == "Qwen/Qwen3-VL-8B-Instruct"
 
 
 # ============================================================================
@@ -370,18 +380,20 @@ def test_4bit_without_cuda_or_with_float32_compute_is_rejected():
 def test_vram_preflight_blocks_unquantized_8b_on_a_t4_and_points_to_4bit():
     tf = make_transformers()
     with pytest.raises(rt.VLMRuntimeError) as exc:
-        rt.load_qwen_vl(rt.VLMLoadConfig(load_in_4bit=False), torch_module=FakeTorch(GPU_T4),
-                        transformers_module=tf, version_lookup=lookup_factory())
+        rt.load_qwen_vl(rt.VLMLoadConfig(model_id=rt.QWEN3_VL_8B_MODEL_ID, load_in_4bit=False),
+                        torch_module=FakeTorch(GPU_T4), transformers_module=tf, version_lookup=lookup_factory())
     assert exc.value.code == "VLM_INSUFFICIENT_VRAM"
     assert "load_in_4bit=True" in exc.value.message and "14.6" in exc.value.message
+    assert "16" in exc.value.message                          # the 8B unquantized figure (PRD NFR-007)
     assert tf.Qwen3VLForConditionalGeneration.calls == []
 
 
 def test_vram_preflight_passes_4bit_on_a_t4_sums_multi_gpu_and_blocks_tiny_gpus():
-    load(GPU_T4)                                              # 6 GiB needed < 14.6 available
-    load(GPU_2xT4, load_in_4bit=False, precision="float16")   # 29.2 GiB across two T4s
+    load(GPU_T4)                                              # 4B 4-bit: 4 GiB needed < 14.6 available
+    load(GPU_2xT4, device_map="auto", model_id=rt.QWEN3_VL_8B_MODEL_ID,
+         load_in_4bit=False, precision="float16")             # 8B fp16: 16 GiB, summed over two T4s (29.2)
     with pytest.raises(rt.VLMRuntimeError) as exc:
-        load(GPU_SMALL)
+        load(GPU_SMALL, model_id=rt.QWEN3_VL_8B_MODEL_ID)     # 8B 4-bit: 6 GiB needed > 4.0
     assert exc.value.code == "VLM_INSUFFICIENT_VRAM" and "Use a GPU with more memory" in exc.value.message
     load(GPU_SMALL, min_vram_gib=1.0)                         # explicit, documented override
 
@@ -535,7 +547,8 @@ def test_generation_resizes_exactly_once_with_patch_16_and_explicit_pixel_limits
     assert len(calls) == 1 and calls[0]["image_patch_size"] == 16
     element = calls[0]["messages"][1]["content"][0]
     assert element["type"] == "image" and element["image"] == str(page)
-    assert (element["min_pixels"], element["max_pixels"]) == (65536, 16777216)
+    # default image budget: the checkpoint's minimum and the 1.3 MP cap (DOC_MAX_IMAGE_PIXELS), NOT 16.7 MP
+    assert (element["min_pixels"], element["max_pixels"]) == (65536, 1_300_000)
     # processor: given the already-resized image, told not to resize again, never pre-processed separately
     (call,) = ext._processor.calls
     assert call["do_resize"] is False and call["images"] == [resized]
@@ -735,15 +748,15 @@ def _page_ref(rotation=0, deskew=0.0, orig=(1654, 2339), prep=(1654, 2339)) -> M
 def test_normalized_boxes_map_through_module_a_geometry_independent_of_the_model_resize(rotation, deskew):
     ref = _page_ref(rotation=rotation, deskew=deskew)
     page = PageImageRef(page_number=1, image_path="p.png", page_ref=ref)
-    bbox_norm = (100.0, 200.0, 150.0, 600.0)                        # [ymin, xmin, ymax, xmax] on 0-1000
+    bbox_norm = (200.0, 100.0, 600.0, 150.0)                        # [x1, y1, x2, y2] on 0-1000
     grounding = {"f": FieldGrounding(page_number=1, bbox_norm=bbox_norm, raw_value="v")}
 
     hint = grounding_to_evidence_hints(grounding, [page])["f"]
 
-    ymin, xmin, ymax, xmax = bbox_norm
+    x1, y1, x2, y2 = bbox_norm
     w, h = ref.preprocessed_width_px, ref.preprocessed_height_px     # the PREPROCESSED page, not the model input
     expected = CoordinateTransform.map_bbox_preprocessed_to_original(
-        bbox=(xmin * w / 1000.0, ymin * h / 1000.0, xmax * w / 1000.0, ymax * h / 1000.0),
+        bbox=(x1 * w / 1000.0, y1 * h / 1000.0, x2 * w / 1000.0, y2 * h / 1000.0),
         original_width=ref.original_width_px, original_height=ref.original_height_px,
         applied_rotation_deg=rotation, applied_deskew_deg=deskew,
     )
@@ -872,7 +885,7 @@ def test_parser_adapter_runs_the_processor_once_on_the_pil_page(monkeypatch):
 
     adapter = QwenVLParserAdapter()
     fake_processor = FakeProcessor()
-    fake_processor.batch_decode = lambda *a, **k: ["[100, 100, 150, 400] BANK NAME: ACME"]
+    fake_processor.batch_decode = lambda *a, **k: ["[100, 100, 400, 150] BANK NAME: ACME"]
     adapter.processor, adapter.model = fake_processor, FakeGenModel()
     ref = _page_ref(orig=(1000, 1400), prep=(1000, 1400))
     page = LoadedPageImage(page_number=1, image_bgr=np.full((1400, 1000, 3), 255, dtype=np.uint8),
