@@ -8,9 +8,13 @@ Draws grounded bounding boxes on the image -> Displays structured JSON.
 import io
 import json
 import os
+
+# Reduce CUDA fragmentation on small GPUs (must be set before torch initialises CUDA)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from pathlib import Path
 import sys
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure src/ is on sys.path and clean out doc_extractor directory from sys.path
@@ -37,7 +41,9 @@ from doc_extractor.handoff import CoordinateTransform
 from doc_extractor.pipeline import ModuleAPipeline
 from doc_extractor.pipeline_b import ModuleBPipeline
 from doc_extractor.pipeline_c import ModuleCPipeline
+from doc_extractor.validation_rules import normalize_and_format
 from doc_extractor.routing import (
+    DEFAULT_MODEL,
     LANGUAGES,
     UNSTRUCTURED_SUBTYPES,
     DocumentCategory,
@@ -47,6 +53,11 @@ from doc_extractor.routing import (
 from doc_extractor.storage import LocalDiskStorage
 
 AUTO = "Auto-Detect"
+ENGINE_CHOICES = {
+    "Follow routing table": None,
+    "GLM-OCR + Qwen3-4B-Instruct text (experimental)": "ocr_text",
+    "GLM-OCR + Qwen2.5-7B text (experimental, comparison)": "ocr_text_7b",
+}
 
 try:
     import gradio as gr
@@ -127,22 +138,30 @@ def get_routed_extractor() -> RoutedExtractor:
 
 
 def _bbox_to_pixels(bbox, w: int, h: int):
-    """Qwen bbox [ymin, xmin, ymax, xmax] on 0-1000 -> (x0, y0, x1, y1) pixels. Scaled once, here only."""
-    ymin, xmin, ymax, xmax = bbox
-    return (int(xmin * w / 1000.0), int(ymin * h / 1000.0), int(xmax * w / 1000.0), int(ymax * h / 1000.0))
+    """Qwen3-VL bbox [x1, y1, x2, y2] on 0-1000 (its native format) -> (x0, y0, x1, y1) pixels.
+    Scaled once, here only. Corners are sorted and clipped so a reversed or out-of-range box still draws."""
+    x1, y1, x2, y2 = (float(c) for c in bbox)
+    x1, x2 = sorted((max(0.0, min(1000.0, x1)), max(0.0, min(1000.0, x2))))
+    y1, y2 = sorted((max(0.0, min(1000.0, y1)), max(0.0, min(1000.0, y2))))
+    return (int(x1 * w / 1000.0), int(y1 * h / 1000.0), int(x2 * w / 1000.0), int(y2 * h / 1000.0))
 
 
-def _classification_markdown(info: Dict[str, Any]) -> str:
-    rows = [
-        ("Category", info.get("category"), info.get("category_source")),
-        ("Document type", info.get("document_type"), info.get("type_source")),
-        ("Sub-type", info.get("subtype") or "-", info.get("subtype_source", "-")),
-        ("Language", info.get("language"), info.get("language_source")),
-        ("Confidence", f"{float(info.get('confidence', 0)):.2f}", info.get("method", "-")),
-        ("Model", info.get("model_used", "-"), "fallback used" if info.get("fallback_occurred") else "routed"),
+# Every page is read by default. DOC_MAX_PAGES=N is only an optional limit for quick test runs (0 = no limit).
+MAX_PAGES = int(os.environ.get("DOC_MAX_PAGES", "0"))
+
+
+def _classification_markdown(pages_info: List[Dict[str, Any]]) -> str:
+    """One row per page: what it was classified as and which model read it."""
+    lines = [
+        "| Page | Category | Type | Sub-type | Language | Confidence | Model | Source |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
-    lines = ["| Field | Value | Source |", "| --- | --- | --- |"]
-    lines += [f"| {k} | {v} | {src} |" for k, v, src in rows]
+    for i in pages_info:
+        lines.append(
+            f"| {i.get('page', 1)} | {i.get('category')} | {i.get('document_type')} | {i.get('subtype') or '-'} | "
+            f"{i.get('language')} | {float(i.get('confidence') or 0):.2f} | {i.get('model_used', '-')}"
+            f"{' (fallback)' if i.get('fallback_occurred') else ''} | {i.get('category_source')}/{i.get('method', '-')} |"
+        )
     return "\n".join(lines)
 
 
@@ -152,185 +171,349 @@ def _write_json_download(document_id: str, text: str) -> str:
     return str(out)
 
 
+def _resolve_page(
+    img_path: Path,
+    filename: str,
+    rule_type: Optional[str],
+    choices: Dict[str, str],
+    page_no: int,
+) -> Dict[str, Any]:
+    """Category, type, sub-type and language for one page: user choice wins, else auto-detect (FR-CLS-005)."""
+    user_cat = bool(choices["category"]) and choices["category"] != AUTO
+    user_type = bool(choices["doc_type"]) and choices["doc_type"] != AUTO
+    user_lang = bool(choices["language"]) and choices["language"] != AUTO
+    user_sub = bool(choices["subtype"]) and choices["subtype"] != AUTO
+
+    auto: Dict[str, Any] = {}
+    if not (user_cat and user_type and user_lang):
+        if img_path and img_path.exists():
+            auto = get_routed_extractor().classify(str(img_path), filename, rule_type if page_no == 1 else None)
+        else:
+            auto = heuristic_classify(filename, rule_type if page_no == 1 else None)
+
+    category = DocumentCategory(choices["category"].lower() if user_cat else auto.get("category", "structured"))
+    detected_type = auto.get("document_type") or (rule_type if page_no == 1 else None)
+    # Dynamic by default: the model returns whatever fields are on the page. A fixed schema is bound
+    # only when the user picks a document type manually (keys will be defined per type later).
+    doc_type = choices["doc_type"] if user_type else None
+    if doc_type not in SCHEMA_MAP:
+        doc_type = None
+    language = LANGUAGES[choices["language"]] if user_lang else str(auto.get("language") or "en")
+    subtype = choices["subtype"] if user_sub else auto.get("subtype")
+    if category != DocumentCategory.UNSTRUCTURED or subtype in (None, "null"):
+        subtype = None
+
+    return {
+        "page": page_no,
+        "category": category.value,
+        "category_source": "user" if user_cat else "auto",
+        "document_type": doc_type or detected_type or "generic",
+        "schema_id": doc_type,
+        "type_source": "user" if user_type else "auto",
+        "subtype": subtype,
+        "language": language,
+        "language_source": "user" if user_lang else "auto",
+        "confidence": 1.0 if user_cat else auto.get("confidence", 0.0),
+        "method": "user" if user_cat else auto.get("method", "-"),
+        "rotation": _safe_rotation(auto.get("rotation")),
+        "router_model": auto.get("router_model"),
+        "filled_by": auto.get("filled_by"),
+    }
+
+
+_STEP_ICONS = {"pending": "⬜", "running": "⏳", "done": "✅", "failed": "❌"}
+
+
+def _step(steps: List[Dict[str, Any]], key: str, label: Optional[str] = None,
+          state: Optional[str] = None, detail: Optional[str] = None) -> None:
+    """Add or update one row of the pipeline-steps panel."""
+    row = next((r for r in steps if r["key"] == key), None)
+    if row is None:
+        row = {"key": key, "label": label or key, "state": "pending", "detail": "", "t0": None, "secs": None}
+        steps.append(row)
+    if label:
+        row["label"] = label
+    if state:
+        if state == "running":
+            row["t0"] = time.perf_counter()
+        elif state in ("done", "failed") and row.get("t0"):
+            row["secs"] = time.perf_counter() - row["t0"]
+        row["state"] = state
+    if detail is not None:
+        row["detail"] = detail
+
+
+def _render_steps(steps: List[Dict[str, Any]]) -> str:
+    if not steps:
+        return "Upload a document and click **Classify & Extract**."
+    lines = ["| | Step | Result | Time |", "| --- | --- | --- | --- |"]
+    for r in steps:
+        t = f"{r['secs']:.1f}s" if r.get("secs") is not None else ("..." if r["state"] == "running" else "")
+        lines.append(f"| {_STEP_ICONS[r['state']]} | {r['label']} | {r['detail']} | {t} |")
+    return "\n".join(lines)
+
+
+def _safe_rotation(value: Any) -> int:
+    try:
+        r = int(value) % 360
+    except (TypeError, ValueError):
+        return 0
+    return r if r in (90, 180, 270) else 0
+
+
+def _rotate_page(path: Path, clockwise_deg: int) -> Path:
+    """Turn a page image upright (clockwise degrees) and save a copy next to the system temp dir."""
+    out = Path(tempfile.gettempdir()) / f"upright_{clockwise_deg}_{path.name}"
+    with Image.open(path) as im:
+        im.rotate(-clockwise_deg, expand=True).save(out)
+    return out
+
+
+def _thumb(path: Path) -> Image.Image:
+    with Image.open(path) as im:
+        return im.convert("RGB").copy()
+
+
 def process_document(
     file_obj,
     category_choice: str,
     doc_type_choice: str,
     subtype_choice: str,
     language_choice: str,
-    use_qwen_vl: bool,
-) -> Tuple[Optional[Image.Image], str, str, str, Optional[str]]:
-    """Returns (annotated_image, status_text, json_output, classification_markdown, json_file_path).
+    engine_choice: str = "Follow routing table",
+):
+    """UI entry point: runs the pipeline and adds the live pipeline-steps panel to every update."""
+    steps: List[Dict[str, Any]] = []
+    for out in _process_core(file_obj, category_choice, doc_type_choice, subtype_choice,
+                             language_choice, engine_choice, steps):
+        yield (*out, _render_steps(steps))
 
-    Category, type, sub-type and language are either user-selected or auto-detected
-    (FR-DEMO-002..005). The category picks the model via the routing table (FR-RTE-001).
+
+def _process_core(
+    file_obj,
+    category_choice: str,
+    doc_type_choice: str,
+    subtype_choice: str,
+    language_choice: str,
+    engine_choice: str,
+    steps: List[Dict[str, Any]],
+):
+    """Reads every page of the document: classify each page, route it to the model for its category,
+    merge fields with page numbers (FR-CLS-005, FR-RTE-001, FR-ING-004).
+
+    Yields (gallery_of_annotated_pages, status_text, json_output, classification_markdown, json_file_path).
     """
     if file_obj is None:
-        return None, "No file uploaded", "{}", "", None
+        yield None, "No file uploaded", "{}", "", None
+        return
 
-    pipe_a, pipe_b, pipe_c = get_pipeline()
+    pipe_a, pipe_b, _pipe_c = get_pipeline()
     file_path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
     claimed_name = Path(file_path).name
+    choices = {"category": category_choice, "doc_type": doc_type_choice,
+               "subtype": subtype_choice, "language": language_choice}
+    split_gallery: List[Tuple[Image.Image, str]] = []
 
     try:
-        # 1. Ingestion & preprocessing (Module A)
+        _step(steps, "upload", "Upload received", "done", claimed_name)
+        _step(steps, "split", "Split into page images (200 DPI) and clean up", "running")
+        yield None, "Splitting into page images...", "", "", None
+
+        # 1. Ingestion & preprocessing (Module A): every page rendered at 200 DPI
         payload_a = pipe_a.process_document(file_path, claimed_filename=claimed_name)
         if payload_a.status == "rejected":
             err = json.dumps(payload_a.to_dict(), indent=2)
-            return None, f"Rejected: {payload_a.error}", err, "", None
+            yield None, f"Rejected: {payload_a.error}", err, "", None
+            return
 
-        orig_path = None
-        if payload_a.pages:
-            rec = payload_a.pages[0]
-            prep_path = pipe_a.storage.resolve_uri_to_path(rec.preprocessed_storage_uri)
-            orig_path = pipe_a.storage.resolve_uri_to_path(rec.original_storage_uri)
-            img_path = prep_path if prep_path.exists() else orig_path
-        else:
-            img_path = Path(file_path)
+        page_items: List[Tuple[int, Path, Optional[Path]]] = []
+        for n, rec in enumerate(payload_a.pages, start=1):
+            prep = pipe_a.storage.resolve_uri_to_path(rec.preprocessed_storage_uri)
+            orig = pipe_a.storage.resolve_uri_to_path(rec.original_storage_uri)
+            page_items.append((n, prep if prep.exists() else orig, orig))
+        if not page_items:
+            page_items = [(1, Path(file_path), None)]
+        total_pages = len(page_items)
+        if MAX_PAGES > 0:
+            page_items = page_items[:MAX_PAGES]
+        _step(steps, "split", state="done", detail=f"{total_pages} page image(s)" + (
+            f", reading the first {len(page_items)}" if total_pages > len(page_items) else ""))
+        split_gallery = [(_thumb(p), f"Page {n} (split)") for n, p, _ in page_items if p and Path(p).exists()]
+        if split_gallery:
+            pw, ph = split_gallery[0][0].size
+            _step(steps, "split", detail=steps[1]["detail"] + f" · page 1 is {pw}×{ph} px ({pw * ph / 1e6:.1f} MP)")
+        _step(steps, "cls", "Classify document from page 1 (router model, once)")
+        for n, _, _ in page_items:
+            _step(steps, f"ext{n}", f"Page {n}: extract fields")
+        _step(steps, "merge", "Validate and build JSON")
+        yield split_gallery or None, f"Split into {total_pages} page image(s).", "", "", None
 
-        # 2. Rule-based parse/classify (Module B): classification hint and CPU path input
+        # 2. Rule-based hint from Module B (page-1 classification fallback)
         payload_b = pipe_b.process_handoff(payload_a)
         rule_type = payload_b.classification.document_type.value
         rule_type = rule_type if rule_type != "UNKNOWN" else None
 
-        # 3. Resolve category, type, sub-type, language: user choice wins, else auto-detect
-        user_cat = bool(category_choice) and category_choice != AUTO
-        user_type = bool(doc_type_choice) and doc_type_choice != AUTO
-        user_lang = bool(language_choice) and language_choice != AUTO
-        user_sub = bool(subtype_choice) and subtype_choice != AUTO
+        engine = ENGINE_CHOICES.get(engine_choice)
+        routed = get_routed_extractor()
 
-        auto: Dict[str, Any] = {}
-        if not (user_cat and user_type and user_lang):
-            if use_qwen_vl and img_path and img_path.exists():
-                auto = get_routed_extractor().classify(str(img_path), claimed_name, rule_type)
-            else:
-                auto = heuristic_classify(claimed_name, rule_type)
+        fields_dict: Dict[str, Any] = {}
+        flags: List[Dict[str, Any]] = []
+        no_evidence: List[str] = []
+        failed: List[str] = []
+        pages_info: List[Dict[str, Any]] = []
+        gallery: List[Tuple[Image.Image, str]] = []
+        provs: List[Any] = []
+        routes: List[Dict[str, Any]] = []
 
-        category = DocumentCategory(category_choice.lower() if user_cat else auto.get("category", "structured"))
+        # Classify ONCE from page 1 and apply to every page (mixed-category PDFs are rare)
+        _step(steps, "cls", state="running", detail="detecting category, type and language")
+        yield (split_gallery or None, "Classifying the document from page 1...", "", "", None)
+        doc_info = _resolve_page(page_items[0][1], claimed_name, rule_type, choices, 1)
+        _step(steps, "cls", state="done",
+              detail=f"{doc_info['category']} · {doc_info['document_type']} · {doc_info['language']} · {doc_info['category_source']}"
+                     + (f" · filled by {doc_info['filled_by']}" if doc_info.get("filled_by") else "")
+                     + (f" · {doc_info['router_model'].split('/')[-1]}" if doc_info.get("router_model") else ""))
 
-        doc_type = doc_type_choice if user_type else (auto.get("document_type") or rule_type)
-        if category == DocumentCategory.STRUCTURED:
-            if doc_type not in SCHEMA_MAP:
-                doc_type = "DOC-01"  # only DOC-01..03 schemas exist so far
-        else:
-            doc_type = doc_type if doc_type in SCHEMA_MAP and user_type else None
+        rotation = doc_info.get("rotation", 0)
+        if rotation:
+            # Orientation fix: the router saw the page sideways/upside down, so turn every page upright
+            # before extraction; boxes are then drawn on the upright image.
+            page_items = [(n, _rotate_page(p, rotation), _rotate_page(o, rotation) if o and o.exists() else None)
+                          for n, p, o in page_items]
+            _step(steps, "cls", detail=steps[[r["key"] for r in steps].index("cls")]["detail"] + f" · rotated {rotation}°")
 
-        language = LANGUAGES[language_choice] if user_lang else str(auto.get("language") or "en")
-        subtype = subtype_choice if user_sub else auto.get("subtype")
-        if category != DocumentCategory.UNSTRUCTURED or subtype in (None, "null"):
-            subtype = None
+        for page_no, img_path, orig_path in page_items:
+            info = dict(doc_info, page=page_no)
+            category = DocumentCategory(info["category"])
+            schema_cls = SCHEMA_MAP.get(info["schema_id"]) if info["schema_id"] else None
+            pages_info.append(info)
+            _step(steps, f"ext{page_no}", state="running", detail=f"routing to the {category.value} model")
+            yield (gallery or split_gallery or None,
+                   f"Page {page_no}/{len(page_items)}: classified as {category.value} ({info['language']}). Extracting...",
+                   "", _classification_markdown(pages_info), None)
 
-        info: Dict[str, Any] = {
-            "category": category.value,
-            "category_source": "user" if user_cat else "auto",
-            "document_type": doc_type or "generic",
-            "type_source": "user" if user_type else "auto",
-            "subtype": subtype,
-            "subtype_source": "user" if user_sub else "auto",
-            "language": language,
-            "language_source": "user" if user_lang else "auto",
-            "confidence": 1.0 if user_cat else auto.get("confidence", 0.0),
-            "method": "user" if user_cat else auto.get("method", "-"),
-        }
+            if not (img_path and img_path.exists()):
+                raise FileNotFoundError(f"Page {page_no} image not found: {img_path}")
 
-        schema_cls = SCHEMA_MAP.get(doc_type) if doc_type else None
-
-        # 4. Extraction
-        if use_qwen_vl and img_path and img_path.exists():
-            raw_dict, prov, route = get_routed_extractor().extract(
-                str(img_path), category, language, schema_cls, subtype
+            # 3. Extraction with the model routed for this page's category
+            raw_dict, prov, route = routed.extract(
+                str(img_path), category, info["language"], schema_cls, info["subtype"], engine=engine
             )
             info["model_used"] = route["model_used"]
             info["fallback_occurred"] = route["fallback_occurred"]
+            provs.append(prov)
+            routes.append({"page": page_no, **route})
+            _step(steps, f"ext{page_no}", state="done",
+                  detail=f"{route['model_used']}{' (fallback)' if route['fallback_occurred'] else ''} · {len(raw_dict)} fields")
 
             with Image.open(orig_path if orig_path and orig_path.exists() else img_path) as pil_img:
                 w, h = pil_img.size
                 base_img = pil_img.copy()
 
-            fields_dict: Dict[str, Any] = {}
+            grounded = route.get("grounded", True)
+            page_fields: Dict[str, Any] = {}
             for fpath, item in raw_dict.items():
                 if not isinstance(item, dict):
                     continue
                 v = item.get("value")
                 bbox = item.get("bbox")
-                if v is None and bbox is None:
-                    continue
+                key = fpath if fpath not in fields_dict else f"{fpath}@p{page_no}"
+                null_reason = None
+                validation = "not_applicable"
+                if v is None:
+                    null_reason = "absent"
+                elif schema_cls is not None and not fpath.startswith("other."):
+                    # FR-VAL-001/002 (schema fields only; free-form other.* labels are not normalised): deterministic normalisation and format checks (schema'd fields only)
+                    v, err = normalize_and_format(fpath, v)
+                    validation = "failed" if err else "passed"
+                    if err:
+                        failed.append(key)
                 ev = None
-                if bbox and len(bbox) == 4:
-                    ev = {
-                        "page": 1,
-                        "bbox": _bbox_to_pixels(bbox, w, h),
-                        "text_snippet": str(v)[:120],
-                        "ocr_confidence": 0.95,
-                    }
-                fields_dict[fpath] = {
+                if v is not None and grounded and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    ev = {"page": page_no, "bbox": _bbox_to_pixels(bbox, w, h), "text": str(v)[:120]}
+                elif v is not None:
+                    no_evidence.append(key)  # GR-002: value without a box
+                entry = {
                     "value": v,
-                    "calibrated_confidence": 0.95 if v is not None else 0.0,
-                    "review_required": category == DocumentCategory.HANDWRITTEN or bool(item.get("uncertain")),
+                    # confidence is not calibrated yet (FR-CNF-001, M6), so no number is claimed
+                    "confidence": None,
+                    "null_reason": null_reason,
+                    "review_required": (
+                        v is not None and (
+                            category == DocumentCategory.HANDWRITTEN or bool(item.get("uncertain"))
+                            or validation == "failed" or ev is None
+                        )
+                    ),
+                    "validation": validation,
                     "evidence": ev,
+                    "page": page_no,
                 }
+                fields_dict[key] = entry
+                page_fields[key] = entry
 
-            annotated_img = draw_bounding_boxes(base_img, fields_dict)
-            envelope = {
-                "document_id": payload_a.document_id,
-                "document_metadata": {
-                    "document_category": category.value,
-                    "document_type": doc_type or "generic",
-                    "document_subtype": subtype,
-                    "language": language,
-                    "schema_id": doc_type,
-                    "schema_version": "1.0.0" if doc_type else None,
-                    "classification_confidence": info["confidence"],
-                    "status": "valid",
-                    "page_count": len(payload_a.pages),
+            gallery.append((draw_bounding_boxes(base_img, page_fields), f"Page {page_no}: {category.value}"))
+
+        if no_evidence:
+            # PRD SCH-013 says null such values. The demo keeps the value but flags it for review.
+            flags.append({"code": "EVIDENCE_MISSING", "fields": no_evidence})
+        if failed:
+            flags.append({"code": "VALIDATION_FAILED", "fields": failed})
+        if total_pages > len(page_items):
+            flags.append({"code": "PAGES_NOT_PROCESSED", "fields": [],
+                          "detail": f"Read pages 1-{len(page_items)} of {total_pages} (demo cap DOC_MAX_PAGES={MAX_PAGES})."})
+
+        _step(steps, "merge", state="done", detail=f"{len(fields_dict)} fields · {len(flags)} flag(s)")
+        first = pages_info[0]
+        cats = {p["category"] for p in pages_info}
+        specialists = sorted({p["model_used"] for p in pages_info})
+        # SCH-012 gating. Confidence is uncalibrated, so the demo never auto-approves (GR-027).
+        doc_status = "needs_review"
+        envelope = {
+            "document_id": payload_a.document_id,
+            "document_metadata": {
+                "document_category": first["category"] if len(cats) == 1 else "mixed",
+                "document_type": first["document_type"],
+                "document_subtype": first["subtype"],
+                "language": first["language"],
+                "schema_id": first["schema_id"],
+                "schema_version": "1.0.0" if first["schema_id"] else None,
+                "classification_confidence": first["confidence"],
+                "status": doc_status,
+                "page_count": total_pages,
+                "pages_processed": len(page_items),
+                "pages": [
+                    {k: p.get(k) for k in ("page", "category", "document_type", "subtype", "language", "model_used")}
+                    for p in pages_info
+                ],
+            },
+            "fields": fields_dict,
+            "flags": flags,
+            "run": {
+                "run_id": payload_a.run_id,
+                "model_versions": {
+                    "router": first.get("router_model") or first.get("method"),
+                    "specialist": ", ".join(specialists),
+                    "normalizer": "deterministic-v1",
                 },
-                "fields": fields_dict,
-                "flags": [],
-                "run": {
-                    "run_id": payload_a.run_id,
-                    "document_category": category.value,
-                    "model_versions": {
-                        "routed_model": route["model_used"],
-                        "normalizer": "deterministic-v1",
-                    },
-                    "routing": route,
-                    "provenance": prov.model_dump() if hasattr(prov, "model_dump") else prov,
-                },
-            }
-            json_text = json.dumps(envelope, indent=2, default=str)
-            status_msg = (
-                f"Status: VALID | Category: {category.value} | Type: {doc_type or 'generic'} | "
-                f"Fields: {len(fields_dict)} | Model: {route['model_used']}"
-            )
-            return annotated_img, status_msg, json_text, _classification_markdown(info), _write_json_download(payload_a.document_id, json_text)
-
-        # CPU heuristic fast path: only the rule-based structured schemas are supported
-        if category != DocumentCategory.STRUCTURED or doc_type not in SCHEMA_MAP:
-            msg = "CPU heuristic mode only supports structured DOC-01 to DOC-03. Enable the VLM for this category."
-            return None, msg, json.dumps({"error": msg}, indent=2), _classification_markdown(info), None
-
-        payload_b.classification.document_type = MVPDocumentType(doc_type)
-        payload_b.classification.schema_id = doc_type
-        payload_b.classification.review_required = False
-        payload_b.classification.classification_confidence = max(0.95, payload_b.classification.classification_confidence)
-        payload_b.status = "processing"
-        pipe_c.extractor.use_llm = False
-        env = pipe_c.process(payload_b)
-
-        annotated_img = None
-        if orig_path and orig_path.exists():
-            with Image.open(orig_path) as pil_img:
-                annotated_img = draw_bounding_boxes(pil_img, env.fields)
-        info["model_used"] = "heuristic"
+                "confidence_calibrated": False,
+                "routing": routes,
+                "provenance": [p.model_dump() if hasattr(p, "model_dump") else p for p in provs],
+            },
+        }
+        json_text = json.dumps(envelope, indent=2, default=str)
         status_msg = (
-            f"Status: {env.document_metadata.status.upper()} | Type: {env.document_metadata.document_type} | "
-            f"Confidence: {env.document_metadata.classification_confidence:.2f} | Flags: {len(env.flags)}"
+            f"Status: {doc_status.upper()} | Pages read: {len(page_items)}/{total_pages} | "
+            f"Fields: {len(fields_dict)} | Flags: {len(flags)} | Model(s): {', '.join(specialists)}"
         )
-        json_text = json.dumps(env.model_dump(), indent=2, default=str)
-        return annotated_img, status_msg, json_text, _classification_markdown(info), _write_json_download(payload_a.document_id, json_text)
+        yield gallery, status_msg, json_text, _classification_markdown(pages_info), _write_json_download(payload_a.document_id, json_text)
+        return
 
     except Exception as e:
-        return None, f"Error: {e}", json.dumps({"error": str(e)}, indent=2), "", None
+        for r in steps:
+            if r["state"] == "running":
+                _step(steps, r["key"], state="failed", detail=str(e)[:120])
+        yield split_gallery or None, f"Error: {e}", json.dumps({"error": str(e)}, indent=2), "", None
+        return
 
 
 def create_demo() -> "gr.Blocks":
@@ -338,47 +521,50 @@ def create_demo() -> "gr.Blocks":
     with gr.Blocks(title="Document Extraction Engine") as demo:
         gr.Markdown(
             "# 📄 Document Extraction Engine\n"
-            "Upload a document, pick its category and type (or leave on Auto-Detect), and get classified, "
-            "grounded JSON. The category decides which model runs."
+            "Upload a document. The engine first classifies it (structured, unstructured or handwritten), "
+            "then routes it to the model for that category and returns grounded JSON."
         )
 
         with gr.Row():
             with gr.Column(scale=1):
                 input_file = gr.File(label="Upload Document (PDF, JPG, PNG, TIFF)", file_types=[".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif"])
-                category_dd = gr.Dropdown(
-                    choices=[AUTO, "Structured", "Unstructured", "Handwritten"], value=AUTO,
-                    label="Document Category",
-                )
-                doc_type_dd = gr.Dropdown(
-                    choices=[AUTO, "DOC-01", "DOC-02", "DOC-03"], value=AUTO,
-                    label="Document Type (structured schemas)",
-                )
-                subtype_dd = gr.Dropdown(
-                    choices=[AUTO] + UNSTRUCTURED_SUBTYPES, value=AUTO,
-                    label="Unstructured Sub-type (brochure, pamphlet, menu card, ...)",
-                )
-                language_dd = gr.Dropdown(
-                    choices=[AUTO] + list(LANGUAGES), value=AUTO, label="Language",
-                )
-                use_vlm_checkbox = gr.Checkbox(
-                    value=True,
-                    label="🤖 Use Qwen3-VL-8B (uncheck for CPU heuristic fallback, structured DOC-01 to DOC-03 only)",
-                )
-                submit_btn = gr.Button("Extract Document", variant="primary")
+                with gr.Accordion("Manual override (optional, leave on Auto-Detect to classify automatically)", open=False):
+                    category_dd = gr.Dropdown(
+                        choices=[AUTO, "Structured", "Unstructured", "Handwritten"], value=AUTO,
+                        label="Document Category",
+                    )
+                    doc_type_dd = gr.Dropdown(
+                        choices=[AUTO, "DOC-01", "DOC-02", "DOC-03"], value=AUTO,
+                        label="Document Type (pick one to force its fixed schema; Auto = dynamic fields)",
+                    )
+                    subtype_dd = gr.Dropdown(
+                        choices=[AUTO] + UNSTRUCTURED_SUBTYPES, value=AUTO,
+                        label="Unstructured Sub-type (brochure, pamphlet, menu card, ...)",
+                    )
+                    language_dd = gr.Dropdown(
+                        choices=[AUTO] + list(LANGUAGES), value=AUTO, label="Language",
+                    )
+                    engine_dd = gr.Dropdown(
+                        choices=list(ENGINE_CHOICES), value="Follow routing table",
+                        label="Engine (compare the default VLM with GLM-OCR + text LLM; the OCR route has no boxes)",
+                    )
+                submit_btn = gr.Button("Classify & Extract", variant="primary")
 
             with gr.Column(scale=2):
                 status_box = gr.Textbox(label="Status & Quality Gate", interactive=False)
+                gr.Markdown("### Pipeline steps")
+                steps_md = gr.Markdown(_render_steps([]))
                 classification_md = gr.Markdown(label="Classification Result")
                 with gr.Tab("Visual Grounding"):
-                    output_image = gr.Image(label="Annotated Document Page (with Grounded Bounding Boxes)", type="pil")
+                    output_image = gr.Gallery(label="Annotated pages (grounded bounding boxes)", columns=1, height=700)
                 with gr.Tab("Canonical JSON Output"):
                     output_json = gr.Code(label="Extracted JSON Envelope", language="json")
                     json_file = gr.File(label="Download JSON")
 
         submit_btn.click(
             fn=process_document,
-            inputs=[input_file, category_dd, doc_type_dd, subtype_dd, language_dd, use_vlm_checkbox],
-            outputs=[output_image, status_box, output_json, classification_md, json_file],
+            inputs=[input_file, category_dd, doc_type_dd, subtype_dd, language_dd, engine_dd],
+            outputs=[output_image, status_box, output_json, classification_md, json_file, steps_md],
         )
 
     return demo
@@ -388,6 +574,16 @@ if __name__ == "__main__":
     if gr is None:
         print("Gradio is not installed. Run: pip install gradio")
     else:
+        if os.environ.get("DOC_PRELOAD", "1") == "1":
+            # Load the models before the UI starts so the first click is not slowed by model loading
+            try:
+                _r = get_routed_extractor()
+                print("Preloading models (set DOC_PRELOAD=0 to skip)...")
+                _r.get_extractor(_r.table.get("default_model", DEFAULT_MODEL))._load_model()
+                _r.get_router()._load_model()
+                print("Models loaded.")
+            except Exception as _e:  # the app still starts; models load on first use
+                print(f"Preload skipped: {_e}")
         demo = create_demo()
         # In Kaggle or remote server, share=True generates a public gradio.live URL
         share_mode = os.environ.get("GRADIO_SHARE", "True").lower() == "true"

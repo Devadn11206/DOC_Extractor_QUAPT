@@ -35,6 +35,92 @@ from doc_extractor.schemas import (
 
 logger = logging.getLogger("doc_extractor.extractor")
 
+
+# Cap on image pixels sent to a vision model. The vision encoder's attention memory grows with the
+# SQUARE of the pixel count: a full 200 DPI A4 page (3.9 MP, ~15k patches) needs one ~14 GB block,
+# which cannot fit a 16 GB T4. 2.0 MP (about 143 DPI for A4) needs roughly a quarter of that.
+# The earlier notebook tests ran at max_pixels=1280*28*28 (1.0 MP). Raise on a bigger GPU:
+# DOC_MAX_IMAGE_PIXELS=4200000 keeps full 200 DPI.
+# 2.0 MP still ran a T4 out of memory during extraction (GPU full), so the default is 1.3 MP.
+MAX_IMAGE_PIXELS = int(os.environ.get("DOC_MAX_IMAGE_PIXELS", "1300000"))
+# Classification (category, language, rotation) does not need 200 DPI: a small image is far faster.
+CLASSIFY_MAX_PIXELS = int(os.environ.get("DOC_CLASSIFY_MAX_PIXELS", "500000"))
+
+
+def parse_json_tolerant(text: str) -> Dict[str, Any]:
+    """Parse model JSON. Strips code fences and extra prose. If the answer was cut off (token limit),
+    keep the complete fields and close the object, instead of failing the whole page."""
+    cleaned = re.sub(r"^```(?:json)?\s*", "", (text or "").strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    start = cleaned.find("{")
+    if start < 0:
+        raise ValueError(f"no JSON object in model output: {cleaned[:200]!r}")
+    body = cleaned[start:]
+    try:
+        return json.loads(body[: body.rfind("}") + 1], strict=False)
+    except json.JSONDecodeError:
+        pass
+    # Truncated: walk back to each '}' and try to close the object there
+    pos = len(body)
+    while True:
+        pos = body.rfind("}", 0, pos)
+        if pos < 0:
+            raise ValueError(f"could not recover JSON from model output: {cleaned[:200]!r}")
+        try:
+            obj = json.loads(body[: pos + 1] + "}", strict=False)
+            logger.warning("OCR text step: model output was truncated; kept the complete fields")
+            return obj
+        except json.JSONDecodeError:
+            continue
+
+
+def _flat_to_nested(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """VLM output {"applicant.full_name": {"value": ..., "bbox": ...}} -> nested {"applicant": {"full_name": ...}}
+    so it validates against the Pydantic schema. Free-form other.* keys are dropped."""
+    nested: Dict[str, Any] = {}
+    for key, item in (raw or {}).items():
+        if key.startswith("other."):
+            continue
+        value = item.get("value") if isinstance(item, dict) else item
+        node = nested
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                break
+        else:
+            node[parts[-1]] = value
+    return nested
+
+
+def gpu_dtype():
+    """bfloat16 on Ampere or newer; float16 on older GPUs such as the T4 (no native bf16)."""
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] < 8:
+        return torch.float16
+    return torch.bfloat16
+
+
+def load_capped_image(image_input, max_pixels: int = MAX_IMAGE_PIXELS):
+    """Open an image (path or bytes) as RGB and downscale it, keeping aspect ratio, to at most max_pixels.
+    Boxes are on a 0-1000 normalised grid, so resizing does not change them."""
+    import io as _io
+    from PIL import Image as _Image
+
+    if isinstance(image_input, (str, Path)):
+        img = _Image.open(image_input)
+    elif isinstance(image_input, (bytes, bytearray)):
+        img = _Image.open(_io.BytesIO(image_input))
+    else:
+        img = image_input
+    img = img.convert("RGB")
+    w, h = img.size
+    if w * h > max_pixels:
+        scale = (max_pixels / float(w * h)) ** 0.5
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), _Image.LANCZOS)
+    return img
+
 SCHEMA_MAP: Dict[str, Type[BaseModel]] = {
     "DOC-01": CASASchema,
     "DOC-02": InsuranceApplicationSchema,
@@ -207,7 +293,9 @@ class SchemaGuidedExtractor:
         provider_name: Optional[str] = None,
         is_mock: bool = False,
         llm_caller: Optional[Callable[[ModuleBOutputPayload, Type[BaseModel]], Tuple[Any, Optional[str]]]] = None,
-        device: str = "auto",
+        # Single GPU by default (faster than splitting layers across cards). "single" resolves to
+        # cuda:0 when a GPU exists, else "auto". Override with DOC_DEVICE_MAP (e.g. "balanced", "auto").
+        device: str = os.environ.get("DOC_DEVICE_MAP", "single"),
         max_new_tokens: int = 2048,
         temperature: float = 0.0,
         trust_remote_code: bool = True,
@@ -363,11 +451,11 @@ class SchemaGuidedExtractor:
             request_id = str(req_id).strip() if (req_id is not None and str(req_id).strip()) else None
             return model_inst, request_id
 
-        # Multimodal VLM path if images exist
-        first_img = getattr(payload.pages[0], "preprocessed_storage_uri", None) if payload.pages else None
+        # Multimodal VLM path: Module B now records the preprocessed page image path on each page
+        first_img = getattr(payload.pages[0], "page_image_path", None) if payload.pages else None
         if first_img and os.path.exists(first_img):
             raw_dict, _ = self.extract_page_image(first_img, schema_cls)
-            return schema_cls.model_validate(raw_dict), None
+            return schema_cls.model_validate(_flat_to_nested(raw_dict)), None
 
         # Text LLM fallback via instructor / litellm
         import instructor
@@ -468,14 +556,13 @@ class SchemaGuidedExtractor:
             CLASSIFIER_SYSTEM_PROMPT,
             "Classify this document image. Return the JSON object only.",
             max_new_tokens=128,
+            max_pixels=CLASSIFY_MAX_PIXELS,
         )
         return self._parse_json_output(text)
 
     @staticmethod
     def _parse_json_output(output_text: str) -> Dict[str, Any]:
-        cleaned = re.sub(r"^```json\s*", "", output_text.strip(), flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned.strip())
-        return json.loads(cleaned) if cleaned else {}
+        return parse_json_tolerant(output_text)
 
     def _generate_from_image(
         self,
@@ -483,6 +570,7 @@ class SchemaGuidedExtractor:
         system_prompt: str,
         user_text: str,
         max_new_tokens: int,
+        max_pixels: Optional[int] = None,
     ) -> str:
         model, processor = self._load_model()
         messages = [
@@ -490,7 +578,7 @@ class SchemaGuidedExtractor:
             {
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": str(image_input) if isinstance(image_input, (str, Path)) else image_input},
+                    {"type": "image", "image": load_capped_image(image_input, max_pixels or MAX_IMAGE_PIXELS)},
                     {"type": "text", "text": user_text},
                 ],
             },
@@ -523,9 +611,13 @@ class SchemaGuidedExtractor:
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
-        return processor.batch_decode(
+        text_out = processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
+        del inputs, generated_ids, generated_ids_trimmed
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return text_out
 
     def _extract_via_vllm_api(
         self,
@@ -593,8 +685,12 @@ class SchemaGuidedExtractor:
                 self.model_name,
                 trust_remote_code=self.trust_remote_code,
             )
+            device_map = self.device
+            if device_map == "single":
+                device_map = "cuda:0" if torch.cuda.is_available() else "auto"
             kwargs = {
-                "device_map": self.device,
+                "attn_implementation": "sdpa",  # memory-efficient attention (eager materialises huge matrices)
+                "device_map": device_map,
                 "trust_remote_code": self.trust_remote_code,
             }
             if getattr(self, "load_in_4bit", True):
@@ -602,12 +698,12 @@ class SchemaGuidedExtractor:
                     from transformers import BitsAndBytesConfig
                     kwargs["quantization_config"] = BitsAndBytesConfig(
                         load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.bfloat16,
+                        bnb_4bit_compute_dtype=gpu_dtype(),
                     )
                 except Exception:
-                    kwargs["torch_dtype"] = torch.bfloat16
+                    kwargs["torch_dtype"] = gpu_dtype()
             else:
-                kwargs["torch_dtype"] = torch.bfloat16
+                kwargs["torch_dtype"] = gpu_dtype()
 
             # Official class for Qwen3-VL in transformers is Qwen3VLForConditionalGeneration
             model_cls = (
@@ -657,7 +753,7 @@ class SchemaGuidedExtractor:
         field_lines: List[str] = []
         for field_name, desc in leaf_fields:
             field_lines.append(
-                f'  "{field_name}": {{"value": "<extracted_string_or_null>", "bbox": [ymin, xmin, ymax, xmax]}}  # {desc}'
+                f'  "{field_name}": {{"value": "<extracted_string_or_null>", "bbox": [x1, y1, x2, y2]}}  # {desc}'
             )
         fields_json = ",\n".join(field_lines)
 
@@ -673,8 +769,12 @@ CRITICAL RULES:
 1. TRANSCRIBE ACTUAL INK: Read the real handwritten and printed letters on the page (character boxes, handwriting, checkboxes). Do NOT invent, assume, or hallucinate placeholder names (e.g. NEVER output dummy names like "GOPAL SINGH" or dummy PANs like "ABCD12345C").
 2. CHARACTER BOXES: For names, PAN, Aadhaar, read the individual letters written in the character grid boxes carefully (e.g. R-U-P-E-S-H -> RUPESH).
 3. ABSENT FIELDS: If a field is not filled or not present on this document, set "value": null and "bbox": null.
-4. BOUNDING BOXES: "bbox" must be [ymin, xmin, ymax, xmax] in normalized 0-1000 scale surrounding the exact text or checked box.
-5. STRICT FORMAT: Return raw valid JSON only. No markdown fences.
+4. BOUNDING BOXES: "bbox" must be [x1, y1, x2, y2] (left, top, right, bottom) in normalized 0-1000 scale tightly surrounding the exact handwritten/printed value (not the label) or the ticked box.
+5. RETURN EVERY KEY listed above, even when the value is null.
+6. NAMES SPLIT INTO ROWS: if the form has separate First / Middle / Last name rows, fill first_name, middle_name and last_name, and set full_name to all three joined with single spaces.
+7. CHECKBOXES / TICKS: a ticked or marked option is the value (e.g. account_type "SAVINGS" if the Savings box is ticked); for boolean fields use true if ticked, false if clearly unticked, null if not on the form.
+8. OTHER FILLED FIELDS: also add every other filled-in field on the page that is not in the list above, as "other.<snake_case_label>": {{"value": ..., "bbox": [x1, y1, x2, y2]}}.
+9. STRICT FORMAT: Return raw valid JSON only. No markdown fences.
 """
 
     def _extract_heuristic(

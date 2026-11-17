@@ -1,8 +1,8 @@
 # Document Extraction Engine: Product Requirements Document (PRD)
 ## Product Requirements Document for Spec-Driven Development
 
-**Version:** 1.3 (Architecture Evolution: 1-Stage Multimodal Extraction with Qwen3-VL-8B-Instruct / Qwen2.5-VL; aligned to the ICXBee PRD and mockup conventions)  
-**Date:** 2026-11-07  
+**Version:** 1.5 (Aligns the spec with the six-layer IDP capability list: adds HEIC and photo clean-up, stitching, zero-shot classification, tables/radio/stamp detection, synonym mapping, prose entities, phone/address normalisation, external verification, document-level exception routing and a corrections feedback loop, plus a coverage table in 3.5; v1.4 added category-based model routing: structured / unstructured / handwritten, language dimension, model-and-cost evaluation, training-data strategy and a basic demo upload UI; builds on v1.3 1-Stage Multimodal Extraction with Qwen3-VL-8B-Instruct / Qwen2.5-VL)  
+**Date:** 2026-11-16  
 **Author:** Praveen (Updated for 1-Stage Multimodal Architecture)  
 **Scope:** Schema-driven extraction of 7 BFSI and healthcare document types into validated, evidence-grounded JSON; SaaS (AWS Mumbai) and customer-controlled deployments from one build  
 **Flows:** Upload and intake, Document tracking, Review (queue and workbench), Schema authoring and approval, Results and export, Developer console, Audit, Security and policy, Operations dashboard  
@@ -17,7 +17,7 @@
 > where neither the source documents nor the ICXBee PRDs give an answer; each is tracked in 15.6.  
 > **Architecture Evolution Notation:** Throughout this document, requirements and specifications undergoing evolution from the initial Technical Approach to the modern 1-Stage Multimodal Engine are labeled with **[OLD]** (Legacy 2-stage decoupled pipeline with OCR and text LLM) and **[NEW]** (1-Stage Multimodal visual extraction with non-thinking `Qwen3-VL-8B-Instruct` / `Qwen2.5-VL-7B-Instruct` and deterministic Python normalization) so differences are unambiguous.
 
-Oct 28, 2026 · @Praveen (original draft v1.0) · updated 2026-10-29 (v1.1) · updated 2026-11-06 (v1.2) · updated 2026-11-07 (v1.3: Qwen3-VL-8B-Instruct Adoption)
+Oct 28, 2026 · @Praveen (original draft v1.0) · updated 2026-10-29 (v1.1) · updated 2026-11-06 (v1.2) · updated 2026-11-07 (v1.3: Qwen3-VL-8B-Instruct Adoption) · updated 2026-11-12 (v1.4: category-based model routing, model/cost evaluation, training strategy, demo UI) · updated 2026-11-16 (v1.5: six-layer IDP capability alignment, section 1.2 and 3.5)
 
 This PRD defines a schema-driven engine, deployable as SaaS or on-premise, that turns scanned BFSI and healthcare documents into validated, evidence-grounded JSON, written so each requirement can be built and tested as a spec. It merges the Technical Approach document (architecture, models, 7 document types) with the Product Requirements Outline (personas, F1–F21, roadmap), incorporating the architectural transition from legacy two-stage OCR+LLM text parsing to direct single-stage multimodal visual extraction with deterministic Python normalization, and adds mock-screen, guardrail, security and NIST CSF 2.0 requirements.
 
@@ -32,9 +32,37 @@ The original inputs disagreed in five places, resolved on 2026-10-29 (D1 to D5).
 | D3 | Accuracy bar | Field F1 > 92% (structured/semi), CER < 3%, WER < 6% | 95%+ key-field accuracy; STP "80% above" | **Two bars:** F1 ≥ 92% on all fields and ≥ 95% on schema-marked key fields for structured and semi-structured types. **STP targets are deferred** until the first paying customer defines them; the escape rule is fixed now: 0 wrong key fields in auto-approved documents (GR-027). Handwritten prescriptions always route to review below the confidence threshold. |
 | D4 | Latency | < 3.0 s/page on GPU | < 10 s/page | **p95 ≤ 3.0 s/page with local models on the recommended GPU profile; ≤ 10 s/page on CPU-only fallback.** Cloud-provider latency is reported, not gated. |
 | D5 | MVP scope | 7 types, but prototype on CASA + Discharge Summary first | 2–3 types across InsurTech, FinTech, Healthcare | **MVP = CASA Account Opening, Insurance Application, Discharge Summary** (one per domain). The other four types are schema-only additions in v1. |
-| D6 | **Extraction Core Architecture** | **[OLD] 2-Stage Decoupled Pipeline:** Stage 3 visual parser (PaddleOCR-VL-1.6 / GLM-OCR) converts page image to Markdown/HTML tables; Stage 4 local text LLM (Qwen2.5-7B-Instruct) extracts fields from markdown using regex/prompts. | Line-by-line regex parsing on OCR text strings; separate OCR bounding box index. | **[NEW] 1-Stage Multimodal Extraction Architecture:** Direct vision-to-JSON extraction powered by `Qwen3-VL-8B-Instruct` (non-thinking instruct VLM; ELO 1542, 66.7% win rate over GLM-OCR on OCR Arena) with `Qwen2.5-VL-7B-Instruct` as compatible baseline, returning structured JSON with inline `[ymin, xmin, ymax, xmax]` normalized bounding boxes, coupled with deterministic Python normalizers for financial/BFSI domain rules (ARC-002, ARC-005, FR-EXT-001, FR-VAL-001). Eliminates layout loss and fragile regex. |
+| D6 | **Extraction Core Architecture** | **[OLD] 2-Stage Decoupled Pipeline:** Stage 3 visual parser (PaddleOCR-VL-1.6 / GLM-OCR) converts page image to Markdown/HTML tables; Stage 4 local text LLM (Qwen2.5-7B-Instruct) extracts fields from markdown using regex/prompts. | Line-by-line regex parsing on OCR text strings; separate OCR bounding box index. | **[NEW] 1-Stage Multimodal Extraction Architecture:** Direct vision-to-JSON extraction powered by `Qwen3-VL-8B-Instruct` (non-thinking instruct VLM; ELO 1542, 66.7% win rate over GLM-OCR on OCR Arena) with `Qwen2.5-VL-7B-Instruct` as compatible baseline, returning structured JSON with inline `[x1, y1, x2, y2]` normalized bounding boxes, coupled with deterministic Python normalizers for financial/BFSI domain rules (ARC-002, ARC-005, FR-EXT-001, FR-VAL-001). Eliminates layout loss and fragile regex. **Superseded in part by D7/D14 (v1.4):** `Qwen3-VL-8B-Instruct` stays as the default baseline and fallback, and the engine evolves into a category-routed architecture that dispatches to specialist models. |
+
+### 1.1 Changes in v1.4 (product-owner review, 2026-11-12)
+
+The product owner reviewed the single-model approach and directed the following. These supersede any statement elsewhere in this PRD that implies one model serves every document.
+
+| # | Area | v1.3 position | v1.4 decision |
+| --- | --- | --- | --- |
+| D7 | **Model strategy** | One model (`Qwen3-VL-8B-Instruct`) for every document. | **No single model does all document scanning.** The engine first identifies the document **category** (structured, unstructured or handwritten), then routes to the model best suited to that category (FR-CLS-005, FR-RTE-001 to FR-RTE-004). Qwen3-VL-8B remains the default and baseline until the evaluation in D9 selects otherwise. |
+| D8 | **Document categories** | Category appears only as a column in 3.1. | Three categories are first-class routing inputs: **Structured** (forms with labelled blanks: name, age, fill-in-the-blank, KYC, loan, claim forms), **Unstructured** (brochures, pamphlets, menu cards, CASA leaflets, invitation cards, policy wordings), **Handwritten** (doctor prescriptions, handwritten forms). The PO asked to be told if a category is missing; this list is the open point for confirmation (OQ-DOCX-20). |
+| D9 | **Model and cost evaluation** | Vendor benchmark figures only (R1). | **Deliverable before further build:** an Excel workbook that, per category (and per language), names the recommended model, its pre-training data, fine-tuning options, per-page cost and GPU/hosting cost (FR-EVL-001 to FR-EVL-004). |
+| D10 | **Language** | Launch languages listed (3.2) but not a routing input. | Language is the second routing dimension after category. Planning baseline: about **80% of clients are English**; other languages follow the per-language gate (FR-PRS-007, FR-RTE-002). |
+| D11 | **Domain variation and training** | Fine-tuning only in v2. | Forms vary per product (loan onboarding, claims, credit card, KYC differ), so **training on synthetic plus real client scans is in scope from the demo phase** and accuracy is tracked per iteration (FR-TRN-001 to FR-TRN-004). |
+| D12 | **Scope boundary** | Extraction plus review plus connectors. | The current assignment focuses **only on document extraction**: its JSON output is the hand-off to any later pipeline (review, decisioning). |
+| D13 | **Demo UI** | Full screen set SCR-01 to SCR-10. | A **basic demo UI** for upload, category and type selection or auto-detection, classification result and JSON output is required first (Section 8.10, FR-DEMO-001 to FR-DEMO-006). |
+| D14 | **Router model and specialist dispatch** | Classification is rule-based and extraction is one model. | **One router model auto-detects the category (and language) from the page image, then dispatches to the specialist model for that category** (FR-RTE-005, FR-RTE-006). Candidates, to be confirmed by the evaluation workbook and benchmark, not decided: digital / printed documents, GLM-OCR (or PaddleOCR-VL) for reading plus a comparable-size pure-text, non-thinking LLM such as Qwen2.5-7B-Instruct for field mapping, with Qwen3-VL-8B as the fallback; handwritten, the highest-accuracy vision model that can be hosted (for example Qwen3-VL-32B or a fine-tuned Qwen3-VL-8B), always with review below threshold. For the demo the router is Qwen3-VL-8B-Instruct. |
 
 Two further inputs from the outline's answers are adopted as stated: pricing is per page, and launch languages are English, Hindi, Telugu, Tamil and Malayalam, with handwriting reading in English only at first. Malayalam is not covered by the approach document's model selection, so it is a validated-or-not gate in Section 14 rather than an assumption.
+
+### 1.2 Changes in v1.5 (capability alignment, 2026-11-16)
+
+The team was told to keep the engine aligned with the standard six-layer capability list for an industry-agnostic IDP engine (ingestion, recognition, classification, extraction, validation, human review and governance). The PRD was checked against that list; most items were already specified (Section 3.5 shows where). The gaps below are now closed. All additions are new IDs; no existing ID changed meaning.
+
+| # | Layer | Gap found | v1.5 addition |
+| --- | --- | --- | --- |
+| D15 | Ingestion | HEIC phone photos, de-noising and shadow removal were not specified; bundles were split but pages were not stitched back into one document. | FR-ING-008 (HEIC), FR-ING-009, FR-ING-010 |
+| D16 | Recognition | Borderless tables, nested grids, radio buttons, and signature or stamp presence were not explicit; headers, footers, margins and sidebars were not named. | FR-PRS-008 to FR-PRS-010 |
+| D17 | Classification | Unseen document types were routed to review only; there was no zero-shot or few-shot path. | FR-CLS-008, FR-CLS-009 |
+| D18 | Extraction | Non-standard labels did not map to one schema field; dense prose had no entity-extraction rule; the box format differed from the common `[x, y, w, h]`. | SCH-015, FR-EXT-009 to FR-EXT-011 |
+| D19 | Validation | Phone (E.164), address clean-up and currency codes were not specified; there was no external verification of IDs or addresses. | FR-VAL-008, FR-VAL-009 |
+| D20 | Review and governance | Routing used per-field thresholds only (no document-level bar); corrections were collected but not wired to prompts or fine-tuning with STP tracking. | FR-CNF-004, FR-REV-005 |
 
 ## 2. Product context
 
@@ -105,9 +133,19 @@ Seven types in two domains. Complexity follows the approach document's matrix: s
 
 Product brochures and policy wordings from the outline are tracked as DOC-08 (v1, fact extraction from unstructured text) and are not in the launch seven.
 
+**Document categories (v1.4, D8).** Routing uses three categories, independent of the Doc ID above:
+
+| Category | Definition | Examples | Typical Doc IDs |
+| --- | --- | --- | --- |
+| Structured | Forms with labelled fields and fill-in-the-blank rows; printed or handwritten entries in fixed positions | KYC, CASA, loan, credit card, claim forms | DOC-01, 02, 04, 05, 06 |
+| Unstructured | Free-layout printed material with no fixed field labels; the type varies widely | Brochures, pamphlets, menu cards, CASA leaflets, invitation cards, policy wordings, discharge summaries | DOC-03, DOC-08 |
+| Handwritten | Content that is predominantly handwritten | Doctor prescriptions | DOC-07 |
+
+**Hand-filled forms (v1.4 rule, 2026-11-13).** A form whose filled-in entries are handwritten is category **Handwritten**, even though its layout is a form. Handwritten pages route to the vision model (Qwen3-VL), which reads handwriting and returns boxes. **Structured** is reserved for forms whose entries are typed or printed, which route to the OCR route (GLM-OCR + text model). The GLM-OCR route is not used for handwriting, since its handwriting reads are unreliable and it returns no boxes.
+
 ### 3.2 Inputs, languages and output
 
-- **Input formats:** PDF (native and scanned, multi-page), JPG, PNG, TIFF at MVP; DOCX, XLSX, email and HTML in v1.
+- **Input formats:** PDF (native and scanned, multi-page), JPG, PNG, TIFF at MVP; DOCX, XLSX, HEIC/HEIF, email and HTML in v1.
 - **Languages at launch:** English, Hindi, Telugu, Tamil, Malayalam. Printed text first; handwriting in English only at MVP.
 - **Output:** JSON (canonical), plus CSV and XML renderings in v1. Dates ISO 8601, amounts as decimals with ISO 4217 currency, booleans as true/false.
 
@@ -139,6 +177,36 @@ This document is the source of truth that code, tests and mock screens are gener
 | ICXBee constitution (`icxbee-refactor-services/.specify/memory/constitution.md`) | Quality gates, compliance-first sequencing, data residency (13.5, SEC-019) |
 | `icxbee-mockups` (README, `TEMPLATE-mockup-brief.md`, `TEMPLATE-business-rules.md`, `MOCKUP-ASSUMPTIONS.md`) | Screen IDs, flow folder layout, generator pattern, Stage 0a/0b/0c artefacts (8.6) |
 
+### 3.5 Capability coverage (six-layer IDP list, v1.5)
+
+The engine must handle fixed templates, semi-structured records and fully unstructured documents across domains. This table maps each capability of the standard list to the requirement that covers it. "Demo" says what the Gradio demo does today (not verified on GPU unless stated); "Spec only" means specified but not built.
+
+| Layer | Capability | Requirements | Demo status |
+| --- | --- | --- | --- |
+| 1 Ingestion | PDF, TIFF, JPEG, PNG | FR-ING-001, FR-ING-004 | Built: every page rendered at 200 DPI |
+| | DOCX, XLSX, HEIC, email, HTML | FR-ING-008 | Spec only |
+| | Rotation, deskew, contrast | FR-ING-005 | Rotation fixed from the router's reading; the rest runs in Module A |
+| | De-noising, shadow removal (phone photos) | FR-ING-010 | Spec only |
+| | Bundle splitting and stitching | FR-ING-007, FR-ING-009 | Spec only |
+| 2 Recognition | OCR for typed text plus handwriting reading | FR-PRS-006, FR-RTE-006 | Built: typed pages via GLM-OCR; handwritten via Qwen3-VL |
+| | Layout-aware vision model, boxes | FR-PRS-001, FR-PRS-004, FR-PRS-010 | Built on the vision route; the OCR route returns no boxes |
+| | Tables, nested grids | FR-PRS-008 | Spec only |
+| | Checkboxes, radio buttons, signature and stamp presence | FR-PRS-002, FR-PRS-009 | Checkbox ticks read by the vision model; rest spec only |
+| 3 Classification | Visual and semantic classification | FR-CLS-001, FR-CLS-005, FR-CLS-007 | Built: router reads category, type, sub-type, language |
+| | Zero-shot and few-shot routing for unseen types | FR-CLS-008, FR-CLS-009 | Zero-shot by the router model; few-shot spec only |
+| 4 Extraction | Dynamic target schemas | SCH-001 to SCH-010, FR-DEMO-008 | Dynamic keys in the demo; schema studio spec only |
+| | Synonym label mapping | SCH-015, FR-EXT-009 | Spec only |
+| | Entity extraction from prose | FR-EXT-010, FR-CLS-006 | Partly: unstructured pages return key facts |
+| | Grounding: page, box, confidence | FR-EXT-004, FR-EXT-011, FR-CNF-001 | Page and box built (vision route); confidence not calibrated |
+| 5 Validation | ISO dates, currency, identifiers | FR-VAL-001, FR-VAL-002 | Built for fixed-schema fields |
+| | Phone E.164, address clean-up | FR-VAL-008 | Spec only |
+| | Arithmetic and chronology rules | FR-VAL-003, FR-VAL-004 | Spec only in the demo |
+| | External and master-data verification | FR-VAL-009, SCH-008 | Spec only |
+| 6 Review and governance | Confidence and validation exception routing | FR-CNF-002 to FR-CNF-004 | Demo marks fields `review_required`; never auto-approves |
+| | Side-by-side review workspace | FR-REV-001 to FR-REV-003 | Annotated pages beside the JSON; full workbench spec only |
+| | Continuous learning from corrections | FR-REV-004, FR-REV-005, FR-TRN-004 | Spec only |
+| | SOC 2, HIPAA, GDPR, PII masking, immutable audit | Sections 10 and 11, SEC-007, SEC-008, GR-025 | Spec only |
+
 ## 4. Architecture
 
 ### 4.1 Architecture Evolution: [OLD] 2-Stage Pipeline vs. [NEW] 1-Stage Multimodal Extraction
@@ -167,18 +235,19 @@ Page Image (200 DPI)
 Page Image (200 DPI from Module A Handoff)
        │
        ▼
-[Module B: Classification & Schema Binding]
-       │  • Fast RuleBasedClassifierAdapter resolves doc type (DOC-01, DOC-02, DOC-03)
-       │  • Binds target Pydantic schema class (e.g., CASASchema)
-       │  • Hands off clean preprocessed image path directly to Module C
+[Module B: Category & Document Routing (FR-CLS-005, FR-RTE-005)]
+       │  • Router model detects category: Structured, Unstructured, Handwritten
+       │  • Detects language and document type; rule-based and filename hints as fallback
+       │  • Binds target Pydantic schema where one exists (e.g., CASASchema)
+       │  • Hands the clean preprocessed image path to Module C with category and language
        ▼
-[Module C: 1-Stage Multimodal Extractor (SchemaGuidedExtractor)]
-       │  • Model: Qwen3-VL-8B-Instruct (or Qwen2.5-VL-7B-Instruct) via Hugging Face AutoProcessor
-       │  • Non-Thinking Instruct Mode: zero-latency immediate structured JSON output (no <think> loops)
-       │  • Direct image-to-JSON visual comprehension (no intermediate markdown serialization loss)
-       │  • Single-pass structured output with inline normalized bounding boxes [0-1000]:
-       │    "field_name": {"value": "extracted_string", "bbox": [ymin, xmin, ymax, xmax]}
-       │  • Robust JSON cleaning: re.sub strips markdown backticks (```json ... ```)
+[Module C: Routed Specialist Extractor (SchemaGuidedExtractor, FR-RTE-001 to FR-RTE-007)]
+       ├── Route A (Structured):   fine-tuned VLM; or GLM-OCR + text LLM for printed forms (candidates)
+       ├── Route B (Unstructured): general VLM; or GLM-OCR / PaddleOCR-VL + text LLM (candidates)
+       └── Route C (Handwritten):  highest-capacity VLM that can be hosted; review below threshold
+       Default fallback: Qwen3-VL-8B-Instruct (non-thinking, no <think> loops)
+       • Every route emits schema-structured JSON with inline [x1, y1, x2, y2] boxes on [0-1000]
+       • Robust JSON cleaning: re.sub strips markdown backticks (```json ... ```)
        ▼
 [Deterministic Python Normalization Layer (validation_rules.py)]
        │  • normalize_and_format(field_name, raw_value)
@@ -188,7 +257,7 @@ Page Image (200 DPI from Module A Handoff)
        │  • Identifier protection: preserves string identifiers and leading zeros on account numbers
        ▼
 [Coordinate Transformation & Evidence Grounding (CoordinateTransform)]
-       │  • map_bbox_preprocessed_to_original: maps [ymin, xmin, ymax, xmax] [0-1000] -> 200 DPI [x0, y0, x1, y1]
+       │  • map_bbox_preprocessed_to_original: maps [x1, y1, x2, y2] [0-1000] -> 200 DPI [x0, y0, x1, y1]
        │  • Inverts applied deskew and rotation from Module A
        │  • EvidenceSnippet wrapping; enforces GR-002 (no value without bbox) and GR-003 (null by default)
        ▼
@@ -204,7 +273,7 @@ Page Image (200 DPI from Module A Handoff)
 | **Extraction Paradigm** | Two separate stages: Visual OCR parser outputs Markdown; Text LLM parses Markdown text. | **Single-stage direct multimodal extraction:** Visual tokens fed directly into non-thinking `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`). |
 | **Model Serving** | PaddleOCR-VL-1.6 / GLM-OCR (Stage 3) + Qwen2.5-7B-Instruct via Ollama/vLLM (Stage 4). | **`Qwen3-VL-8B-Instruct`** (Non-Thinking 8B VLM; OCR Arena ELO 1542, Rank #10, 66.7% win rate over GLM-OCR) with `Qwen2.5-VL-7B` compatibility via `transformers>=4.49.0`, `accelerate>=0.26.0`, `bitsandbytes>=0.43.0`, `qwen-vl-utils>=0.0.8`. |
 | **Intermediate Representation** | Brittle Markdown text and HTML tables. Loses geometric coordinates, character grids, and cell alignments. | **None (Zero serialization loss).** The model operates directly on the 200 DPI preprocessed image pixels. |
-| **Evidence Grounding (GR-002)** | Post-hoc matching: attempts to find extracted text strings inside OCR token spans. Fails on numbers, dates, abbreviations. | **Native visual grounding:** Model returns `"bbox": [ymin, xmin, ymax, xmax]` in `[0, 1000]` coordinate grid alongside `"value"`. Transformed to original 200 DPI pixels. |
+| **Evidence Grounding (GR-002)** | Post-hoc matching: attempts to find extracted text strings inside OCR token spans. Fails on numbers, dates, abbreviations. | **Native visual grounding:** Model returns `"bbox": [x1, y1, x2, y2]` in `[0, 1000]` coordinate grid alongside `"value"`. Transformed to original 200 DPI pixels. |
 | **Extraction Logic** | Fragile line-by-line regex parsing (`re.search`) over generated markdown. Fails on layout variations. | **Schema-guided JSON extraction:** System prompt constrains output to target Pydantic schema structure; sanitized with `re.sub` markdown backtick stripping. |
 | **Data Normalization** | Ad-hoc in-line conversions scattered across regex extraction code. Dropped leading zeros on account numbers. | **Centralized deterministic Python normalizer:** `normalize_and_format()` in `validation_rules.py` enforces strict BFSI currency, ISO 8601 date, PAN, Aadhaar, and string identifier rules. |
 | **Module B Scope** | Heavyweight: ran classification, layout heuristics, and markdown generation coordination. | **Simplified:** Focuses strictly on Document Classification (`RuleBasedClassifierAdapter`), schema binding, and passing image paths. |
@@ -216,7 +285,7 @@ Page Image (200 DPI from Module A Handoff)
 | ID | Architectural requirement | Status & Specification | Pri |
 | --- | --- | --- | --- |
 | ARC-001 | Deployment boundary | All components SHALL run inside the deployment boundary (SaaS tenant environment or customer site); calls to external services SHALL go only to providers the policy allows (see GR-013, SEC-011). | P0 |
-| ARC-002 | **Pipeline & Extractor Decoupling** | **[OLD]** The parser and the extractor SHALL be separate services behind versioned interfaces so that either can be replaced by configuration (NFR-008).<br>**[NEW]** The engine SHALL execute extraction via a unified 1-stage multimodal visual extractor (`Qwen3-VL-8B-Instruct` or `Qwen2.5-VL-7B-Instruct`) that emits schema-structured JSON and normalized bounding boxes directly from preprocessed page images, followed by a deterministic post-extraction Python normalization engine. The extractor interface SHALL abstract model weights behind `SchemaGuidedExtractor`. | P0 |
+| ARC-002 | **Pipeline & Extractor Decoupling** | **[OLD]** The parser and the extractor SHALL be separate services behind versioned interfaces so that either can be replaced by configuration (NFR-008).<br>**[NEW]** The engine SHALL execute extraction via category-routed specialist models behind a unified `SchemaGuidedExtractor` interface (FR-RTE-001 to FR-RTE-007), with `Qwen3-VL-8B-Instruct` as the default fallback, followed by the deterministic Python normalization engine. Model weights SHALL be abstracted behind the interface so a route can change by configuration. | P0 |
 | ARC-003 | Queue and statelessness | Stages SHALL communicate through a durable queue; workers SHALL be stateless, and each stage SHALL store its output under the run ID. | P0 |
 | ARC-004 | Local model isolation | Local model serving SHALL run in network-isolated containers with access only to the stage's input and output (GR-007). | P0 |
 | ARC-005 | **Reference Technology Stack** | **[OLD]** The reference stack from the approach document: Python, pypdfium2, OpenCV, Pydantic, instructor or Outlines, Ollama or vLLM, PaddleOCR-VL-1.6 or GLM-OCR, quantised Qwen2.5-7B-Instruct.<br>**[NEW]** The modern 1-stage multimodal stack: Python 3.10+, `transformers>=4.49.0`, `accelerate>=0.26.0`, `bitsandbytes>=0.43.0`, `qwen-vl-utils>=0.0.8`, `torch`, `pypdfium2`, `OpenCV`, `Pydantic v2`, with deterministic BFSI normalizers. Local weights load via `Qwen3-VL-8B-Instruct` or `Qwen2.5-VL-7B-Instruct` with optional 4-bit/8-bit quantization. | P0 |
@@ -238,7 +307,9 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-ING-005 | The system SHALL de-skew, correct rotation and normalise contrast per page, and record the transforms applied. | P0 | Given a benchmark page skewed 5°, Then residual skew ≤ 0.5° and the transform is in the page record. | A §3, F2 |
 | FR-ING-006 | The system SHALL treat a repeated upload of the same file hash within one tenant as idempotent when the client sends the same idempotency key. | P0 | Given two POSTs with one key, Then one document exists and both calls return its ID. | NFR-006 |
 | FR-ING-007 | The system SHOULD split a bundled file into logical documents and group related pages. | P1 | Given a 12-page bundle of 3 documents, Then 3 child documents with correct page ranges, ≥ 95% boundary accuracy on the benchmark. | F3 |
-| FR-ING-008 | The system SHOULD accept DOCX, XLSX, email and HTML by converting to page images or text with layout. | P1 | Each format yields the same output contract as a scanned PDF. | F1 |
+| FR-ING-008 | The system SHOULD accept DOCX, XLSX, HEIC/HEIF (phone photos), email and HTML by converting to page images or text with layout. | P1 | Each format yields the same output contract as a scanned PDF. | F1 |
+| FR-ING-009 | WHEN a bundle is split into logical documents, the system SHOULD stitch each document's pages back in order, including pages that arrive out of order or interleaved with another document, and keep the page-to-source mapping. | P1 | Given a bundle whose pages of two documents are interleaved, Then two documents are produced with pages in reading order and each page keeps its original upload page number. | F3 |
+| FR-ING-010 | The system SHOULD de-noise, remove shadows and flatten perspective on phone-captured pages before parsing, and record each transform in the page record (FR-ING-005). | P1 | Given a phone photo with a shadow and perspective tilt from the benchmark, Then field accuracy on the cleaned page is at least that of a flat scan of the same document minus 2 points (target to confirm). | F2 |
 
 ### 5.2 Classification and routing
 
@@ -248,6 +319,43 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-CLS-002 | IF classification confidence is below the tenant threshold OR no schema matches, THEN the system SHALL set type `UNKNOWN` and route the document to review; it SHALL NOT run extraction. | P0 | Given an unrelated utility bill, Then type is `UNKNOWN`, no extraction output exists, a review task is created. | F5, GR-004 |
 | FR-CLS-003 | WHEN a type is resolved, the system SHALL bind the current approved version of its schema and record that version on the document. | P0 | Output envelope contains `schema_id` and `schema_version` matching the approved version at processing time. | A §3 stage 2 |
 | FR-CLS-004 | The reviewer SHALL be able to override the document type, which re-runs extraction with the chosen schema. | P0 | Given an override, Then a new extraction run is created and the old one is retained in history. | F16 |
+| FR-CLS-005 | The system SHALL first classify each document into a **category** (`structured`, `unstructured`, `handwritten`) with a confidence in \[0, 1\], and only then resolve the document type within that category. The user MAY supply the category and type manually, which skips auto-detection. | P0 | Given a CASA form, a brochure and a prescription, Then categories are structured, unstructured and handwritten respectively; category accuracy ≥ 95% on the benchmark (target to confirm). Given a manual selection, Then it is recorded as `category_source: "user"`. | D7, D8 |
+| FR-CLS-006 | For unstructured documents the system SHALL accept an open document sub-type (brochure, pamphlet, menu card, CASA leaflet, invitation card, other) and SHALL NOT reject a document solely because its sub-type has no pre-defined schema; it SHALL fall back to a generic key-fact schema. | P1 | Given a menu card, Then a generic extraction result with null-by-default is produced and sub-type is recorded. | D8 |
+| FR-CLS-007 | The system SHALL detect the dominant language of the document and record it with a confidence. | P0 | Given English and Hindi samples, Then `language` is `en` and `hi` with confidence recorded. | D10 |
+| FR-CLS-008 | The router SHALL classify a document type it has never been shown (no template, no schema) by describing its purpose from the page image, and SHALL return the category and a free-text type with a confidence. | P0 | Given a document type outside the launch set, Then category and a descriptive type are returned and extraction runs the generic route (FR-CLS-006); no retraining is needed. | D14 |
+| FR-CLS-009 | The system SHOULD accept a few labelled example pages for a new type (few-shot) and use them to improve routing and the extraction prompt for that type, before any fine-tuning. | P1 | Given three example pages of a new type, Then classification accuracy for that type on a held-out set is no lower than zero-shot; examples are stored with the schema version. | D11 |
+
+### 5.2.1 Model routing (v1.4)
+
+| ID | Requirement | Pri | Acceptance criteria | Source |
+| --- | --- | --- | --- | --- |
+| FR-RTE-001 | The system SHALL select the extraction model from a routing table keyed by (category, language, domain) and SHALL record the selected model in the run provenance. | P0 | Given a handwritten English prescription, Then the handwritten-route model is used and `run.model_versions.extractor` shows it. | D7 |
+| FR-RTE-002 | The routing table SHALL be configuration, not code, and SHALL be versioned. English is the default language route; other languages route per the per-language gate (FR-PRS-007). | P0 | Changing the table changes the model used without a code release. | D7, D10 |
+| FR-RTE-003 | WHEN no category-specific model is configured or the routed model fails to load, THEN the system SHALL fall back to the default model (`Qwen3-VL-8B-Instruct`) and record `fallback_occurred: true` with the reason. | P0 | Given an unavailable model, Then the default model runs and the envelope shows the fallback. | ARC-007 |
+| FR-RTE-004 | Every routed model SHALL implement the same `SchemaGuidedExtractor` interface and output contract (§6.3), so the envelope is identical regardless of route. | P0 | The same schema validation suite passes for every route. | ARC-002 |
+| FR-RTE-005 | A single router model SHALL auto-detect category, document type and language from the page image before any specialist runs, and SHALL fall back to rule-based and filename hints if the router fails. The user MAY override any detected value. | P0 | Given an unlabelled upload, Then category, type and language are returned with confidence and a source (`auto` or `user`) before extraction starts. | D14 |
+| FR-RTE-006 | The system SHALL support specialist models of different kinds (VLM that returns schema JSON, OCR model that returns text, line-level handwriting model) behind one adapter interface. An OCR-only specialist (for example GLM-OCR) SHALL be followed by a **text LLM of comparable size** (for example Qwen2.5-7B-Instruct or Qwen3-4B-Instruct-2507; it SHALL be a pure text model with no thinking mode, not a VLM and not a hybrid thinking model, since it only reads the OCR text) that maps the text to the schema, so every route emits the §6.3 envelope. Evidence boxes SHALL come from the OCR model's own block or word coordinates; a value with no matching box is nulled and flagged `EVIDENCE_MISSING` (GR-002). Because the text model cannot see the page, checkboxes and character grids SHALL stay on the VLM route unless the OCR model reports them (FR-PRS-002, FR-PRS-003). | P0 | Each route passes the same envelope validation suite; the envelope records the router model and the specialist model separately. | D14, FR-RTE-004 |
+| FR-RTE-007 | Digital-document and handwritten routes SHALL be compared against the default model on the same labelled set before being enabled; a specialist is enabled only if it meets or beats the default on field accuracy and cost per page (workbook). | P0 | A comparison table per category exists and the routing table names the winner. | D9, D14 |
+
+### 5.2.2 Model and cost evaluation (v1.4)
+
+| ID | Requirement | Pri | Acceptance criteria | Source |
+| --- | --- | --- | --- | --- |
+| FR-EVL-001 | Deliver an Excel workbook with one sheet per category (structured, unstructured, handwritten) and a language sheet. Each row is a candidate model with: recommended-for (category, language, domain), pre-training data and known strengths, fine-tuning options (LoRA/QLoRA, full), licence, parameter size and VRAM needed. | P0 | Workbook reviewed and signed off by the product owner. | D9 |
+| FR-EVL-002 | The workbook SHALL give cost per page for each model, for both self-hosted (GPU hours, GPU type, throughput pages/hour) and API providers. GPU usage SHALL be included because the engine is hosted, not only API cost. | P0 | Every candidate row has a per-page cost and a GPU profile, with stated assumptions. | D9, NFR-016 |
+| FR-EVL-003 | The workbook SHALL state, per category, the recommended model and the runner-up, with measured accuracy on a sample set where available and clearly marked "vendor claim" where not (R1). | P0 | No accuracy figure is shown without its source. | D9, R1 |
+| FR-EVL-004 | The workbook SHALL cover domain variation (loan onboarding, claims, credit card, KYC) and state which need fine-tuning vs schema-only. | P1 | One row per domain with a fine-tune/no-fine-tune call and the reason. | D9, D11 |
+
+**Deliverable status (2026-11-12):** first draft at `docs/model_cost_evaluation.xlsx` (sheets: Assumptions, Models, By Category, Stack & Hosting, Training Plan). All throughput, VRAM and GPU price figures are estimates and accuracy is unmeasured until the G0 benchmark. The earlier team approach (a Qwen model for handwritten and GLM-OCR for digital forms) is included as candidates, not as decisions.
+
+### 5.2.3 Training and accuracy improvement (v1.4)
+
+| ID | Requirement | Pri | Acceptance criteria | Source |
+| --- | --- | --- | --- | --- |
+| FR-TRN-001 | The system SHALL support PEFT/QLoRA fine-tuning per category and domain using synthetic data and real scanned client forms, run inside the deployment that holds the data. | P0 | A fine-tune run produces a versioned adapter linked to its dataset lineage. | D11, SEC-018 |
+| FR-TRN-002 | A synthetic form generator SHALL produce labelled training pages (fields, values, bounding boxes) per domain, including handwriting-style fills. | P0 | Generator outputs images plus ground-truth JSON per schema. | D11, R7 |
+| FR-TRN-003 | Accuracy SHALL be measured per training iteration on a locked held-out set and recorded so improvement is visible (reference experience: about 60% at first iteration rising to 85 to 90% with more real scans). | P0 | A table of iteration vs field accuracy exists per domain. | D11 |
+| FR-TRN-004 | Once real client scans are available, the system SHALL allow adding them to the training set subject to approval (GR-012). Reviewer corrections feed the same set (FR-REV-004). | P1 | Added samples are traceable and none enter the locked set automatically. | D11 |
 
 ### 5.3 Visual layout parsing
 
@@ -258,15 +366,18 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-PRS-001 | Page to structured layout | **[OLD]** | The system SHALL convert each page to layout-faithful Markdown with HTML tables, using a local OCR model (PaddleOCR-VL-1.6 / GLM-OCR), with per-block bounding boxes. Benchmark CER < 3%, WER < 6% (M2). | A §3 stage 3, F6 |
 | | | **[NEW]** | The system SHALL ingest 200 DPI preprocessed page images directly into `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`), extracting layout semantics and spatial geometries in a single forward pass without intermediate Markdown or HTML table serialization. | ARC-002 |
 | FR-PRS-002 | Checkbox and tick state | **[OLD]** | Render checkboxes as `[x]` or `[ ]` markdown text with bounding boxes; state accuracy ≥ 98%. | A §4.1, F6 |
-| | | **[NEW]** | Directly resolve checkbox and toggle mark visual semantics into target schema boolean or enumerated values with source bounding box coordinates `[ymin, xmin, ymax, xmax]`. | F6, GR-002 |
+| | | **[NEW]** | Directly resolve checkbox and toggle mark visual semantics into target schema boolean or enumerated values with source bounding box coordinates `[x1, y1, x2, y2]`. | F6, GR-002 |
 | FR-PRS-003 | Character grids | **[OLD]** | Merge segmented character grid markdown tokens (e.g., `\|J\|O\|H\|N\|`) into a single string before LLM extraction. | A §4.1 |
 | | | **[NEW]** | Visually fuse segmented character grids (e.g., PAN boxes, account number grids) directly in the multimodal attention layers into contiguous string values, preserving all leading zeros. | A §4.1, FR-VAL-001 |
 | FR-PRS-004 | Layout element detection | **[OLD]** | Detect tables, key-value pairs, signatures, and stamps as typed layout markdown elements. Detection recall ≥ 90%. | F6 |
 | | | **[NEW]** | Directly localize and attend to tables, key-value blocks, signatures, and stamps in image space, grounding extracted fields to their precise visual pixel regions. | F6, GR-002 |
 | FR-PRS-005 | Optical confidence | **[OLD]** | Report an optical OCR confidence score in \[0, 1\] per recognized text block. | A §4.2 |
 | | | **[NEW]** | Compute calibrated confidence per field combining multimodal generation log-likelihoods, spatial grounding overlap, and deterministic validation rule outcomes. | A §4.2, M6 |
-| FR-PRS-006 | English handwriting | **Both** | The system SHOULD read English handwriting and flag struck-out or overwritten entries. Handwriting fields below threshold are routed to review (`review_required: true`). | F7 |
+| FR-PRS-006 | English handwriting | **Both** | The system SHOULD read English handwriting (hand-filled forms included, routed to the vision model per §3.1) and flag struck-out or overwritten entries. Handwriting fields below threshold are routed to review (`review_required: true`). | F7 |
 | FR-PRS-007 | Multilingual printed text | **Both** | The system SHOULD read Hindi, Telugu, Tamil and Malayalam printed text. Per-language CER reported on benchmark; a language ships only if CER meets M2. | F4 |
+| FR-PRS-008 | Tables and nested grids | **Both** | The system SHALL detect tables including borderless tables and grids nested inside cells, and return cell-level boxes with row and column indexes. Cell text accuracy is measured with the field benchmark (M1). | F6 |
+| FR-PRS-009 | Radio buttons, signatures and stamps | **Both** | The system SHALL resolve radio-button groups to one selected option, and SHALL report whether a signature or company stamp is present (true or false, with box) without reading its content. | F6, GR-002 |
+| FR-PRS-010 | Position-sensitive regions | **Both** | The system SHALL tag text in headers, footers, margins and sidebars with its region, so repeated page furniture is not mistaken for body fields. | F6 |
 
 ### 5.4 Extraction
 
@@ -280,11 +391,14 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | | | **[NEW]** | The system SHALL prompt the multimodal model to output a valid JSON object matching the requested schema. The orchestrator SHALL use regex sanitization (`re.sub(r"^```json\s*\|\s*```$", "", text)`) to strip markdown code blocks before robust `json.loads` parsing. | M3, GR-005 |
 | FR-EXT-003 | Null by default (GR-003) | **Both** | IF a field is absent or not legible, THEN the system SHALL return `null` with `null_reason` of `absent` or `illegible`; it SHALL NOT infer, guess, or hallucinate a value. | A §7.2, F11 |
 | FR-EXT-004 | Evidence grounding (GR-002) | **[OLD]** | Post-hoc substring matching between extracted values and OCR token bounding boxes. | F15, GR-002 |
-| | | **[NEW]** | The model SHALL return bounding boxes alongside values in this exact schema format: `"field_name": {"value": "extracted_string", "bbox": [ymin, xmin, ymax, xmax]}` on a `[0, 1000]` normalized grid. The system SHALL map these to original 200 DPI pixel coordinates `[x0, y0, x1, y1]` via `CoordinateTransform.map_bbox_preprocessed_to_original()`. If a value lacks a grounded bounding box, it SHALL be forced to `null` with `null_reason: "absent"` and flagged `EVIDENCE_MISSING`. | F15, GR-002 |
+| | | **[NEW]** | The model SHALL return bounding boxes alongside values in this exact schema format: `"field_name": {"value": "extracted_string", "bbox": [x1, y1, x2, y2]}` on a `[0, 1000]` normalized grid. The system SHALL map these to original 200 DPI pixel coordinates `[x0, y0, x1, y1]` via `CoordinateTransform.map_bbox_preprocessed_to_original()`. If a value lacks a grounded bounding box, it SHALL be forced to `null` with `null_reason: "absent"` and flagged `EVIDENCE_MISSING`. | F15, GR-002 |
 | FR-EXT-005 | Repeating groups | **Both** | The system SHALL extract repeating groups (nominees, dependents, medicines, line items) as arrays with stable order and item-level bounding boxes. | F9 |
 | FR-EXT-006 | Multi-column party attribution | **Both** | The system SHALL associate figures with the right party (applicant vs co-applicant) in multi-column tables. | A §2 |
 | FR-EXT-007 | Checkbox mapping | **Both** | The system SHALL map checkbox markers to booleans or enumerated values defined in the schema (`[x]` -> true, `[ ]` -> false, no mark -> null). | A §4.1 |
 | FR-EXT-008 | Reconciliation pass | **Both** | The system MAY run a second reconciliation pass on fields below confidence threshold and keep the result only if it agrees with visual evidence. | F7, outline §7 |
+| FR-EXT-009 | Semantic key-value mapping | **Both** | The system SHALL map non-standard printed labels to the schema field they mean, using the field description and its aliases (SCH-015), for example "Total Due", "Balance Payable" and "Amount to Pay" all fill `amount_due`. The printed label is kept in the evidence. | F8 |
+| FR-EXT-010 | Entities from prose | **Both** | For dense paragraphs (brochures, policy wordings, medical summaries) the system SHALL extract the entities the schema asks for (for example specifications, exclusions, features, diagnoses) as typed values with the sentence's box, using an instruction-tuned model; it SHALL NOT summarise or add facts absent from the text (GR-003). | F8 |
+| FR-EXT-011 | Box format | **Both** | Evidence boxes SHALL be returned as corners `[x0, y0, x1, y1]` in original-page pixels with `bbox_format: "xyxy"`. A request parameter MAY ask for `[x, y, w, h]` (`xywh`); both describe the same box. | F15, GR-002 |
 
 ### 5.5 Normalisation and validation
 
@@ -301,6 +415,8 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-VAL-005 | Clinical shorthand mapping | **Both** | Map frequency shorthand (OD, BD, TDS, SOS) to standard descriptions while retaining original text snippet. | A §4.2 |
 | FR-VAL-006 | Configurable schema rules | **Both** | Rules SHALL be configurable per schema and versioned with it, without a code release. | outline §5 |
 | FR-VAL-007 | Cross-document consistency | **Both** | Consistency checks across documents in one case (name, date of birth, address). | F13, F20 |
+| FR-VAL-008 | Phone, address and currency normalisation | **Both** | The system SHALL normalise phone numbers to E.164 using the document's country, clean address text (whitespace, case, PIN or postal code split out), and record amounts as decimals with an ISO 4217 code. A value that cannot be normalised is kept as read and marked `validation: "failed"`. | F12 |
+| FR-VAL-009 | External and master-data verification | **Both** | WHERE the schema marks a field for verification, the system MAY check it against a master-data list (SCH-008) or an external service (for example a postal-code or national-ID check). It SHALL send only the minimum value needed, only to a provider the tenant policy approves (D2, GR-014, GR-021 to GR-025), and SHALL be off in the on-premise profile. A mismatch flags the field and routes it to review; an unreachable service flags `VERIFICATION_UNAVAILABLE` and does not block extraction. This requirement is P1. | F13 |
 
 ### 5.6 Confidence, routing and review
 
@@ -309,10 +425,12 @@ Organised in pipeline order. Source column: `A` = Technical Approach document se
 | FR-CNF-001 | The system SHALL compute a calibrated confidence per field from parser confidence, model signals and validation outcome. | P0 | Calibration gap ≤ 3 points (M6) on the benchmark. | F14 |
 | FR-CNF-002 | The system SHALL set `review_required: true` on any field whose confidence is below its threshold; default threshold 0.75 for handwriting-derived fields, tenant-configurable per field. | P0 | A handwritten drug name at 0.62 is `review_required` and not auto-approved. | A §4.2, F14 |
 | FR-CNF-003 | WHEN all fields pass validation and thresholds, the system SHALL auto-approve the document; otherwise it SHALL create a review task listing only the flagged fields. | P0 | Review task contains flagged fields only; STP counted from auto-approved documents (M5). | F16 |
+| FR-CNF-004 | **[Proposed]** The system SHALL also apply a document-level bar: IF any schema-marked key field is below 0.95 confidence OR any validation rule fails, THEN the whole document goes to review. The 0.95 default follows the key-field accuracy bar in D3 and is tenant-configurable. | P0 | Given one key field at 0.93, Then the document is not auto-approved and the review task names that field. | D3, F14 |
 | FR-REV-001 | The reviewer UI SHALL show the page image beside the extracted fields and highlight the evidence box for the selected field. | P0 | Selecting a field scrolls and highlights its bbox within 300 ms. | F15, F16 |
 | FR-REV-002 | The reviewer SHALL be able to accept, correct or mark-as-null a field inline; each action SHALL be audit-logged with user, time, old and new value. | P0 | Audit log contains one entry per action. | F16 |
 | FR-REV-003 | A corrected value SHALL be re-validated before the task can be completed. | P0 | An invalid correction blocks completion with the failing rule shown. | F13 |
 | FR-REV-004 | The system SHOULD add reviewer corrections to the benchmark candidate set, subject to approval. | P1 | Corrections appear in a pending-ground-truth list; none enters the benchmark automatically. | F17, GR-012 |
+| FR-REV-005 | The system SHOULD use approved reviewer corrections to improve results over time: first as prompt examples and lookup lists per schema, then as fine-tuning data (FR-TRN-001, FR-TRN-004), and SHALL report the straight-through rate (M5) per schema and model version so the effect is visible. Corrections never enter the locked benchmark set. | P1 | After a fine-tune that used approved corrections, Then the per-version STP and field F1 are reported next to the previous version on the locked set. | F17, M5 |
 
 ### 5.7 Delivery and audit
 
@@ -341,6 +459,7 @@ The schema is the main control surface: business users define what to extract an
 | SCH-008 | Reference data (code lists, lookup tables) SHALL be uploadable and versioned per tenant. | P1 | A state-code list is referenced by field `state` and applied in normalisation. |
 | SCH-009 | A schema library of cloneable prebuilt schemas SHALL ship for the seven launch types. | P1 | Each launch type has an approved library schema. |
 | SCH-010 | The system MAY draft a schema from a plain-English description, always as `draft` for human editing. | P2 | Generated schema is never auto-approved. |
+| SCH-015 | A schema field SHALL accept a list of `aliases` (other labels that mean the same thing, per language), used by FR-EXT-009. | P1 | Given aliases "Total Due" and "Balance Payable" on `amount_due`, Then a page printing either label fills `amount_due`. |
 
 ### 6.2 Schema definition format (illustrative)
 
@@ -427,7 +546,7 @@ Every value is wrapped with its confidence and evidence. The envelope below is t
 | SCH-011 | Envelope schema versioning | Both | The envelope SHALL be published as JSON Schema and versioned with semantic versioning; breaking changes SHALL bump major version. | P0 |
 | SCH-012 | Document status gating | Both | `status` SHALL be one of `processing`, `auto_approved`, `needs_review`, `reviewed`, `rejected`, `failed`. IF any required schema field is missing or fails validation, THEN status SHALL be set to `needs_review`; otherwise `auto_approved` (GR-027). | P0 |
 | SCH-013 | Bounding box coordinates | **[OLD]** | `bbox` extracted from token-level OCR spans on markdown text. | P0 |
-| | | **[NEW]** | `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`) generates normalized coordinates `[ymin, xmin, ymax, xmax]` in range `[0, 1000]`. In Module C, `CoordinateTransform.map_bbox_preprocessed_to_original()` transforms them into `[x0, y0, x1, y1]` pixels of the original 200 DPI page image (origin top-left), correcting for preprocessed scaling, deskew angle, and rotation. If no bounding box is returned or evidence cannot be formed, the value is forced to `null` and flagged `EVIDENCE_MISSING` (GR-002). | P0 |
+| | | **[NEW]** | `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`) generates normalized coordinates `[x1, y1, x2, y2]` in range `[0, 1000]`. In Module C, `CoordinateTransform.map_bbox_preprocessed_to_original()` transforms them into `[x0, y0, x1, y1]` pixels of the original 200 DPI page image (origin top-left), correcting for preprocessed scaling, deskew angle, and rotation. If no bounding box is returned or evidence cannot be formed, the value is forced to `null` and flagged `EVIDENCE_MISSING` (GR-002). | P0 |
 | SCH-014 | PII masking | Both | Fields marked PII in schema SHALL be maskable in API responses by caller permission (SEC-007). | P0 |
 
 ## 7. API and integration specification
@@ -487,6 +606,23 @@ Aligning each screen's data bindings (8.8) with the API list exposed these gaps.
 ## 8. Screens and mock-screen generation
 
 Mock screens are generated from this section before any UI code is written, so every screen is specified, reviewed with the personas and traceable to a requirement. A screen without a spec here SHALL NOT be built.
+
+### 8.0 Basic demo UI (v1.4, D13)
+
+The product owner asked for a basic UI to upload a document first, ahead of the full screen set. Reference implementation: the Gradio app in `app.py`. This is a demo surface, not a replacement for SCR-01 to SCR-10.
+
+| ID | Requirement | Pri | Acceptance criteria |
+| --- | --- | --- | --- |
+| FR-DEMO-001 | The UI SHALL let the user upload a document (JPG, PNG, PDF, TIFF). | P0 | Given a supported file, Then it is accepted and previewed. |
+| FR-DEMO-002 | The UI SHALL let the user choose the **document type** (for example DOC-01 CASA, or Auto-detect). | P0 | Selecting a type skips type classification and binds that schema. |
+| FR-DEMO-003 | The UI SHALL let the user choose the **category**: structured, unstructured or handwritten, or Auto-detect. | P0 | Selection routes to that category's model (FR-RTE-001); Auto-detect runs FR-CLS-005. |
+| FR-DEMO-004 | For **unstructured** documents the UI SHALL offer a sub-type (brochure, pamphlet, menu card, CASA leaflet, invitation card, other). | P1 | Sub-type is passed to extraction and shown in the result. |
+| FR-DEMO-005 | The UI SHALL show the **classification result**: category, document type, language, confidence, and whether each was auto-detected or user-selected. | P0 | All five values visible after Extract. |
+| FR-DEMO-006 | The UI SHALL show the **JSON output** in the §6.3 envelope and the annotated page with field bounding boxes, and SHALL allow downloading the JSON. | P0 | JSON validates against the envelope schema; boxes align with the text (no double scaling, correct `[x1, y1, x2, y2]` mapping). |
+| FR-DEMO-007 | The demo SHALL read **every page** of the upload (no cap by default; an optional `DOC_MAX_PAGES` may limit a test run): the document is classified **once from page 1** and that category is applied to every page (mixed-category PDFs are rare), each page is extracted with the model for that category, and the results are merged into one JSON with a page number on each field. IF the file has more pages than the cap, THEN the envelope SHALL carry `PAGES_NOT_PROCESSED` with the counts. | P0 | Given a 3-page PDF, Then one classification call is made (page 1), all three pages are extracted with that category's model, and fields carry `page`. Given a 7-page PDF, Then pages 1 to 5 are read and the flag is present. |
+| FR-DEMO-008 | The demo SHALL extract fields **dynamically by default**: the model returns the label and value of every filled field on the page, because each document differs and keys are not yet defined. A fixed schema (DOC-01 to DOC-03) SHALL be applied only when the user selects that document type. Per-type keys will be defined later (SCH-*). | P0 | Given an auto-detected form, Then fields are keyed by the labels on the page; given a manual DOC-01 selection, Then the DOC-01 keys are returned. |
+
+Demo flow: Upload → (optional) choose category and type → Extract → classification result → JSON output and annotated image.
 
 ### 8.1 Mock-screen generation requirements
 
@@ -749,7 +885,7 @@ In lending and clinical settings an unverified guess is worse than a missing val
 | ID | Point | Guardrail | Mechanism | Acceptance test | Pri |
 | --- | --- | --- | --- | --- | --- |
 | GR-001 | Input | Only supported, clean files enter the pipeline. | Magic-byte check, size and page limits, malware scan, decompression-bomb limit. | Fuzz corpus of malformed files: 0 crashes, 100% rejected with a code. | P0 |
-| GR-002 | Output | No value without evidence. | **[OLD]** Substring search against OCR word tokens.<br>**[NEW]** `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`) emits inline `[ymin, xmin, ymax, xmax]` normalized coordinates for every value (`"field": {"value": ..., "bbox": [...]}`). Transformed to 200 DPI pixels via `CoordinateTransform.map_bbox_preprocessed_to_original()`. Any non-null value lacking an evidence bounding box is forced to `null` with `null_reason: "absent"` and flagged `EVIDENCE_MISSING`. | Seeded test: model returns a value with fake or missing evidence; result is forced to null and flagged `EVIDENCE_MISSING`. | P0 |
+| GR-002 | Output | No value without evidence. | **[OLD]** Substring search against OCR word tokens.<br>**[NEW]** `Qwen3-VL-8B-Instruct` (or `Qwen2.5-VL-7B-Instruct`) emits inline `[x1, y1, x2, y2]` normalized coordinates for every value (`"field": {"value": ..., "bbox": [...]}`). Transformed to 200 DPI pixels via `CoordinateTransform.map_bbox_preprocessed_to_original()`. Any non-null value lacking an evidence bounding box is forced to `null` with `null_reason: "absent"` and flagged `EVIDENCE_MISSING`. | Seeded test: model returns a value with fake or missing evidence; result is forced to null and flagged `EVIDENCE_MISSING`. | P0 |
 | GR-003 | Generation | Null by default. | **[OLD]** Text prompt: "If not visible, return null."<br>**[NEW]** Multimodal system prompt instructs Qwen3-VL: "If not legibly visible in the document image, return null. Never guess or hallucinate." Absent and illegible are kept as distinct reasons. | Blank-field benchmark: false-fill rate ≤ 0.5% of blank fields. | P0 |
 | GR-004 | Input | No forced classification. | Below-threshold or no matching schema yields `UNKNOWN` and review; extraction does not run. | Out-of-domain set: ≥ 98% routed to `UNKNOWN`. | P0 |
 | GR-005 | Generation | Output must conform to the schema. | **[OLD]** Grammar-guided decoding on text LLM.<br>**[NEW]** Target Pydantic schema compiled into multimodal prompt; response cleaned via `re.sub(r"^```json\s*\|\s*```$", "", ...)` and validated through Pydantic model envelopes and deterministic normalizers. | 1,000 runs, 0 exceptions (M3). | P0 |
@@ -887,7 +1023,7 @@ Performance targets are measured with local models on hardware profile P2 in 12.
 | NFR-004 | Availability | Service availability for a single-site deployment; high-availability option documented. | 99.5% monthly (HA: 99.9%) | P0 |
 | NFR-005 | Scalability | Add worker nodes to scale throughput linearly up to 4 nodes; queue absorbs month-end bursts. | ≥ 85% scaling efficiency | P1 |
 | NFR-006 | Reliability | Retries and idempotency on all mutating calls; at-least-once processing with no lost documents on node failure. | 0 lost documents in failure-injection test | P0 |
-| NFR-007 | **Model footprint** | **[OLD]** Parser stage VRAM < 2 GB; extractor stage VRAM within 8 to 16 GB (two separate models loaded simultaneously).<br>**[NEW]** Single unified multimodal model (`Qwen3-VL-8B-Instruct` or `Qwen2.5-VL-7B-Instruct`): ~16 GB VRAM unquantized (bfloat16), or ~6 to 8 GB VRAM with 4-bit / 8-bit quantization (`bitsandbytes`), comfortably fitting single 24 GB GPU instances (L4, A10, RTX 3090/4090). | Single GPU footprint ≤ 16 GB | P0 |
+| NFR-007 | **Model footprint** | **[OLD]** Parser stage VRAM < 2 GB; extractor stage VRAM within 8 to 16 GB (two separate models loaded simultaneously).<br>**[NEW]** Default multimodal model (`Qwen3-VL-8B-Instruct` or `Qwen2.5-VL-7B-Instruct`): ~16 GB VRAM unquantized (bfloat16), or ~6 to 8 GB VRAM with 4-bit / 8-bit quantization (`bitsandbytes`), comfortably fitting single 24 GB GPU instances (L4, A10, RTX 3090/4090). **Multi-model serving (v1.4):** where specialist models are deployed (for example GLM-OCR plus a text LLM, or a larger handwriting model), they SHALL either be co-hosted within available VRAM (for example 24 GB or 48 GB GPUs, with usable VRAM headroom) or served as modular worker endpoints, as sized in the model evaluation workbook (`FR-EVL-002`, `docs/model_cost_evaluation.xlsx`). | Default model ≤ 16 GB; with multiple specialists, total footprint fits the chosen GPU profile (see workbook) | P0 |
 | NFR-008 | **Model flexibility** | **[OLD]** Parser and extractor sit behind separate interfaces.<br>**[NEW]** Unified `SchemaGuidedExtractor` multimodal interface; swapping model checkpoints requires only configuration and regression run, without multi-stage pipeline coupling. | Swap demonstrated for multimodal backbone | P0 |
 | NFR-009 | Deployment | One container build deploys to SaaS, private cloud or VPC, and on-premise with Helm or Compose; offline installation bundle. | Install with no internet in under 1 day | P0 |
 | NFR-010 | Observability | Dashboards for accuracy, STP, confidence distribution, error patterns, latency, GPU use and cost per page; no PII. | All listed panels live | P1 |
@@ -995,6 +1131,8 @@ A service passes no gate by waiver; a merge that fails one is blocked, as in the
 
 Phases are gated by evidence, not dates. Durations are set after capacity planning and hardware confirmation. The approach document's advice is followed: stabilise the pipeline on the two structural extremes (CASA form and discharge summary), then treat the rest as schema work.
 
+**Demo phase (v1.4, immediate).** Basic demo for the product owner on 2026-11-13: upload UI with category and type selection (Section 8.0), JSON output, single default model with the routing table in place. In parallel: the model and cost workbook (FR-EVL-001 to FR-EVL-004) and the first synthetic-data training iteration (FR-TRN-001 to FR-TRN-003). Real client scans are added when the first client is onboarded.
+
 **MVP — prove the pipeline on one document per domain.**
 
 - Types: DOC-01 CASA, DOC-02 Insurance application, DOC-03 Discharge summary.
@@ -1034,6 +1172,8 @@ Phases are gated by evidence, not dates. Durations are set after capacity planni
 | R9 | Reviewer fatigue causes accepting wrong values. | Escapes | Evidence highlight, no pre-checked accept-all, escape audit sampling of auto-approved documents. | FR-REV-001 |
 | R10 | Scope creep to "any document". | Missed commitments | Publish supported types with measured accuracy; new type only through schema and gate. | §3.1 |
 | R11 | Cloud provider use conflicts with a customer's or regulator's expectations for PII or PHI. | Lost deals or a compliance finding | Off by default; signed policy per tenant and document type; agreement, region and no-training conditions; on-premise profile with providers disabled; call logging without content. | GR-021 to GR-025, ARC-006 |
+| R13 | A single model underperforms on handwritten or unstructured documents (v1.4). The demo run on a handwritten CASA form returned placeholder values and misaligned boxes. | Wrong or hallucinated data | Category-based routing (D7); anti-hallucination prompt directive (transcribe only visible ink, `null` otherwise); bbox order and scaling fix; model evaluation workbook (D9); fine-tuning (D11). | FR-RTE-001, FR-EXT-003 |
+| R14 | Multiple models multiply GPU and hosting cost and test surface. | Cost overrun | Cost per page and GPU profile in the workbook (FR-EVL-002); routing table in configuration; shared interface (FR-RTE-004). | D9 |
 | R12 | SaaS and on-premise from one build widens the test and support matrix. | Schedule and quality | One container build with the profile set by configuration; the same test suite on both profiles at G1; profile-specific features deferred. | ARC-006, G1 |
 
 ### 15.2 Assumptions and dependencies
@@ -1064,6 +1204,10 @@ Phases are gated by evidence, not dates. Durations are set after capacity planni
 - [x] **Operational targets.** Confirmed: availability 99.5% (99.9% with high availability), RPO 15 minutes, RTO 4 hours, throughput 15 pages per minute.
 - [x] **Handwriting.** English only at first.
 - [x] **Healthcare data rules.** Both HIPAA and DPDP apply (GR-025).
+- [ ] **OQ-DOCX-20 Categories.** Are structured, unstructured and handwritten sufficient, or is a category missing (v1.4, D8)? Owner: product owner.
+- [ ] **OQ-DOCX-21 Models per category.** Which model for each category and language? Answered by the evaluation workbook (D9).
+- [ ] **OQ-DOCX-22 Hosting cost.** GPU type and per-page cost target for the routed models (FR-EVL-002).
+- [ ] **OQ-DOCX-23 Real training data.** Scanned client forms are expected once a client is onboarded; agree volume and delivery (D11).
 - [ ] **Samples.** The product owner will provide them; agree the delivery date and the size of the locked set (about 100 per MVP type proposed).
 - [ ] **Hardware.** Recommendations are in 12.1 (profiles P1 to P4 and S1); confirm the profile for the first pilot.
 - [ ] **STP definition.** Deferred until the first paying customer defines it (M5); revisit then.
@@ -1153,7 +1297,7 @@ Each slice ends with something demonstrable and passing its tests. Slices 1 to 6
 | 1 | Upload to preprocessed pages with idempotency and file safety (Module A) | FR-ING-001 to 006, GR-001 |
 | 2 | **[OLD]** Layout parsing to Markdown, tables, checkboxes, with bounding boxes (PaddleOCR-VL / GLM-OCR).<br>**[NEW]** Direct visual feature and token preparation for multimodal vision ingestion. | FR-PRS-001 to 005 |
 | 3 | Classification, schema binding, schema service with lifecycle (Module B Simplified) | FR-CLS, SCH-001 to 007 |
-| 4 | **[OLD]** Guided extraction with evidence, null handling and guardrails from OCR text.<br>**[NEW]** 1-Stage Multimodal Extraction (`Qwen3-VL-8B-Instruct` / `Qwen2.5-VL-7B-Instruct`), schema-guided JSON, inline `[ymin, xmin, ymax, xmax]` bbox extraction, markdown strip (`re.sub`), coordinate transform to 200 DPI pixels (`CoordinateTransform`), evidence snippet wrapping. | FR-EXT-001 to 007, GR-002, GR-003, GR-005 |
+| 4 | **[OLD]** Guided extraction with evidence, null handling and guardrails from OCR text.<br>**[NEW]** 1-Stage Multimodal Extraction (`Qwen3-VL-8B-Instruct` / `Qwen2.5-VL-7B-Instruct`), schema-guided JSON, inline `[x1, y1, x2, y2]` bbox extraction, markdown strip (`re.sub`), coordinate transform to 200 DPI pixels (`CoordinateTransform`), evidence snippet wrapping. | FR-EXT-001 to 007, GR-002, GR-003, GR-005 |
 | 5 | **[OLD]** Ad-hoc validation, normalisation, confidence, routing.<br>**[NEW]** Deterministic Python normalizer (`normalize_and_format` for currency, ISO 8601 dates, PAN, Aadhaar, string identifiers), status gating (`auto_approved` vs `needs_review`), and canonical output envelope (§6.3). | FR-VAL-001 to 004, FR-CNF, SCH-011 to 014 |
 | 6 | API, webhooks, audit and reproducibility | API-001 to 014, FR-AUD-001 |
 | 7 | Review queue and workbench, results and export screens | SCR-03, 04, 06; FR-REV |
@@ -1305,7 +1449,7 @@ Feature: Extraction
 
   Scenario: Evidence on every value ([NEW] Multimodal 1-Stage)
     Given an extracted non-null field from Qwen3-VL-8B-Instruct (or Qwen2.5-VL-7B-Instruct)
-    Then it carries native normalized bbox [ymin, xmin, ymax, xmax]
+    Then it carries native normalized bbox [x1, y1, x2, y2]
     And is mapped to 200 DPI pixel coordinates [x0, y0, x1, y1] on the original page image
     And carries the supporting text snippet
 
@@ -1779,13 +1923,13 @@ Front-end analytics: page views per screen, filters used, "Next flagged field" u
 
 | Requirement group | Story | Screen | Source reference |
 | --- | --- | --- | --- |
-| FR-ING-001..008, GR-001 | US-DOCX-001 | DOCX-SCR-001* | F1, A §3 |
+| FR-ING-001..010, GR-001 | US-DOCX-001 | DOCX-SCR-001* | F1, A §3 |
 | API-015, SCH-012 | US-DOCX-002 | DOCX-SCR-002* | F1, F16 |
-| FR-CLS-001..004, GR-004 | US-DOCX-003 | DOCX-SCR-003-unknown-type | A §3, F5 |
-| FR-PRS-001..007, FR-EXT-001..008, GR-002, 003, 005, 006 | US-DOCX-004 | DOCX-SCR-003* | A §3, §4, F6..F11 |
-| FR-VAL-001..007, GR-008 | US-DOCX-005 | DOCX-SCR-003-validation-failed, -arithmetic-mismatch | A §3, F12, F13 |
-| FR-CNF-001..003, GR-009, 017, 027 | US-DOCX-006 | DOCX-SCR-003-low-confidence | A §4.2, F14 |
-| FR-REV-001..004 | US-DOCX-007 | DOCX-SCR-003* | F15, F16, F17 |
+| FR-CLS-001..004, FR-CLS-008, 009, GR-004 | US-DOCX-003 | DOCX-SCR-003-unknown-type | A §3, F5 |
+| FR-PRS-001..010, FR-EXT-001..011, SCH-015, GR-002, 003, 005, 006 | US-DOCX-004 | DOCX-SCR-003* | A §3, §4, F6..F11 |
+| FR-VAL-001..009, GR-008 | US-DOCX-005 | DOCX-SCR-003-validation-failed, -arithmetic-mismatch | A §3, F12, F13 |
+| FR-CNF-001..004, GR-009, 017, 027 | US-DOCX-006 | DOCX-SCR-003-low-confidence | A §4.2, F14 |
+| FR-REV-001..005 | US-DOCX-007 | DOCX-SCR-003* | F15, F16, F17 |
 | API-005, API-016 | US-DOCX-008 | DOCX-SCR-004* | F16 |
 | SCH-001..006, SCH-009 | US-DOCX-009 | DOCX-SCR-005* | outline §5 |
 | SCH-007, API-007 | US-DOCX-010 | DOCX-SCR-005-test-results | outline §5 |
