@@ -73,8 +73,9 @@ class PageImageRef(BaseModel):
 class FieldGrounding(BaseModel):
     """
     Visual grounding returned by a multimodal extractor for one field path.
-    ``bbox_norm`` is [ymin, xmin, ymax, xmax] on the model's normalized 0-1000 grid over the
-    *preprocessed* page image; Module C maps it to 200-DPI original pixels (GR-002, SCH-013).
+    ``bbox_norm`` is [x1, y1, x2, y2] (left, top, right, bottom) on the model's normalized 0-1000 grid
+    over the *preprocessed* page image (PRD v1.5 FR-EXT-004); Module C maps it to 200-DPI original
+    pixels (x0, y0, x1, y1) with ``CoordinateTransform`` (GR-002, SCH-013, FR-EXT-011).
     """
     page_number: int = Field(default=1, ge=1)
     bbox_norm: Optional[Tuple[float, float, float, float]] = None
@@ -227,6 +228,12 @@ class DocumentMetadata(BaseModel):
         description="Terminal document status (SCH-012)"
     )
     page_count: int = Field(ge=0, description="Total number of pages processed")
+    # v1.5 routed-extraction context (FR-CLS-005..007, FR-RTE-001); None when not applicable.
+    document_category: Optional[str] = Field(default=None, description="structured | unstructured | handwritten | mixed")
+    document_subtype: Optional[str] = None
+    language: Optional[str] = None
+    pages_processed: Optional[int] = Field(default=None, ge=0)
+    pages: Optional[List[Dict[str, Any]]] = Field(default=None, description="Per-page category/type/language/model")
 
 
 class RunMetadata(BaseModel):
@@ -237,6 +244,10 @@ class RunMetadata(BaseModel):
     provenance: Optional[ExecutionProvenance] = Field(
         default=None,
         description="Execution provenance tracking model vs heuristic mode (SCH-007)",
+    )
+    routing: Optional[List[Dict[str, Any]]] = Field(default=None, description="Per-page routing decisions (FR-RTE-004)")
+    confidence_calibrated: Optional[bool] = Field(
+        default=None, description="False while confidence is unavailable/uncalibrated (FR-CNF-001)"
     )
 
 

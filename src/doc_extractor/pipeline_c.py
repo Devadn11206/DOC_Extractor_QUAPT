@@ -26,6 +26,7 @@ from doc_extractor.contracts_c import (
     PageImageRef,
     RunMetadata,
 )
+from doc_extractor.routed_pages import RoutedPageResult, RoutedResultsExtractor
 from doc_extractor.vlm_grounding import conflict_flags, grounding_to_evidence_hints
 from doc_extractor.extractor import SchemaGuidedExtractor, SCHEMA_MAP, find_evidence_for_value
 from doc_extractor.field_assembly import (
@@ -274,6 +275,46 @@ class ModuleCPipeline:
             payload_status="processing",
         )
 
+    def process_routed_pages(
+        self,
+        payload: ModuleBOutputPayload,
+        page_results: Sequence[RoutedPageResult],
+        page_images: Sequence[PageImageRef],
+        *,
+        system_prompt: str = "",
+        document_type: str = "generic",
+        schema_bound: bool = False,
+        force_review: bool = False,
+        expected_fields: Optional[Sequence[str]] = None,
+    ) -> CanonicalExtractionEnvelope:
+        """
+        Adapter-aware canonical entry (PRD v1.5): assembles the envelope from pages that were ALREADY
+        read by routed specialists (VLM adapter, OCR + text adapter, ...), with no further inference.
+
+        The caller does the per-page routing and model calls (so it can stream progress and turn pages
+        upright); everything after that - value normalization, box mapping through each page's own
+        ``PageImageRef`` geometry, evidence gating (a value without a box is nulled and flagged
+        EVIDENCE_MISSING), validation, confidence/review gating, multipage aggregation and the
+        envelope - runs through the same components as ``process`` / ``process_generic``.
+
+        ``schema_bound`` runs the bound DOC schema selected by ``payload.classification``; otherwise the
+        dynamic, schema-less path is used (the v1.5 default).
+        """
+        replay = RoutedResultsExtractor(
+            page_results, prompt_version=getattr(self.extractor, "prompt_version", "1.0.0")
+        )
+        canonical = ModuleCPipeline(extractor=replay, settings=self.settings)
+        if schema_bound:
+            return canonical.process(payload, page_images=page_images)
+        return canonical.process_generic(
+            payload,
+            page_images,
+            system_prompt,
+            document_type=document_type,
+            force_review=force_review,
+            expected_fields=expected_fields,
+        )
+
     @staticmethod
     def partial_coverage_flag(
         provenance: Any,
@@ -419,6 +460,7 @@ class ModuleCPipeline:
         with self._evidence_hint_scope(evidence_hints):
             if doc_type == "DOC-01":
                 self._process_doc_01(extracted_data, payload, fields_envelope, flags)
+                self._process_doc_01_v15_fields(extracted_data, payload, fields_envelope, flags)
             elif doc_type == "DOC-02":
                 self._process_doc_02(extracted_data, payload, fields_envelope, flags)
             elif doc_type == "DOC-03":
@@ -541,6 +583,37 @@ class ModuleCPipeline:
         fields_envelope["account_details.opt_in_services.internet_banking"] = self._create_field_entry(
             "account_details.opt_in_services.internet_banking", net_val, payload, flags, required=False
         )
+
+    def _process_doc_01_v15_fields(
+        self,
+        extracted_data: Any,
+        payload: ModuleBOutputPayload,
+        fields_envelope: Dict[str, ExtractedField],
+        flags: List[FlagItem],
+    ) -> None:
+        """
+        Fields added to the DOC-01 schema in PRD v1.5 (split name rows, Aadhaar, income range, bank
+        details). Optional; deterministic format validation only where a rule exists (Aadhaar, IFSC).
+        """
+        app = getattr(extracted_data, "applicant", None)
+        for attr in ("first_name", "middle_name", "last_name", "gross_annual_income"):
+            if app is not None and hasattr(app, attr):
+                name = f"applicant.{attr}"
+                fields_envelope[name] = self._create_field_entry(name, getattr(app, attr), payload, flags, required=False)
+        if app is not None and hasattr(app, "aadhaar_number"):
+            norm, err = validate_aadhaar(getattr(app, "aadhaar_number"))
+            fields_envelope["applicant.aadhaar_number"] = self._create_field_entry(
+                "applicant.aadhaar_number", norm, payload, flags, error=err, required=False
+            )
+        bank = getattr(extracted_data, "bank_details", None)
+        if bank is not None:
+            for attr in type(bank).model_fields:
+                name = f"bank_details.{attr}"
+                value = getattr(bank, attr)
+                error = None
+                if attr == "ifsc_code":
+                    value, error = validate_ifsc(value)
+                fields_envelope[name] = self._create_field_entry(name, value, payload, flags, error=error, required=False)
 
     def _process_doc_02(
         self,
