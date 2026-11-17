@@ -41,7 +41,12 @@ from doc_extractor.handoff import CoordinateTransform
 from doc_extractor.pipeline import ModuleAPipeline
 from doc_extractor.pipeline_b import ModuleBPipeline
 from doc_extractor.pipeline_c import ModuleCPipeline
-from doc_extractor.validation_rules import normalize_and_format
+from doc_extractor.extractor import free_gpu_memory
+from doc_extractor.validation_rules import (
+    calculate_calibrated_confidence,
+    calibrate_probability,
+    normalize_and_format,
+)
 from doc_extractor.routing import (
     DEFAULT_MODEL,
     LANGUAGES,
@@ -148,6 +153,9 @@ def _bbox_to_pixels(bbox, w: int, h: int):
 
 # Every page is read by default. DOC_MAX_PAGES=N is only an optional limit for quick test runs (0 = no limit).
 MAX_PAGES = int(os.environ.get("DOC_MAX_PAGES", "0"))
+# FR-CNF-001: p**alpha recalibration of token probabilities; fit with validation_rules.fit_calibration_alpha
+CONFIDENCE_ALPHA = float(os.environ.get("DOC_CONFIDENCE_ALPHA", "1.0"))
+REVIEW_THRESHOLD = float(os.environ.get("DOC_REVIEW_THRESHOLD", "0.75"))  # FR-CNF-002
 
 
 def _classification_markdown(pages_info: List[Dict[str, Any]]) -> str:
@@ -429,20 +437,37 @@ def _process_core(
                     if err:
                         failed.append(key)
                 ev = None
+                withheld = False
                 if v is not None and grounded and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
                     ev = {"page": page_no, "bbox": _bbox_to_pixels(bbox, w, h), "text": str(v)[:120]}
+                elif v is not None and not grounded:
+                    # FR-RTE-006 / GR-002: an OCR-text reading with no box from the OCR model is withheld
+                    withheld = True
+                    no_evidence.append(key)
+                    v, null_reason, validation = None, "EVIDENCE_MISSING", "not_applicable"
                 elif v is not None:
-                    no_evidence.append(key)  # GR-002: value without a box
+                    no_evidence.append(key)  # GR-002: VLM value without a box is kept but flagged for review
+                token_p = item.get("confidence")
+                if withheld:
+                    confidence = 0.0
+                elif isinstance(token_p, (int, float)):
+                    # FR-CNF-001: token-logprob probability, recalibrated, halved on a failed validation rule
+                    confidence = calculate_calibrated_confidence(
+                        1.0, calibrate_probability(token_p, CONFIDENCE_ALPHA),
+                        validation_passed=validation != "failed", has_evidence=ev is not None,
+                    )
+                else:
+                    confidence = None
                 entry = {
                     "value": v,
-                    # confidence is not calibrated yet (FR-CNF-001, M6), so no number is claimed
-                    "confidence": None,
+                    "confidence": confidence,
                     "null_reason": null_reason,
                     "review_required": (
-                        v is not None and (
+                        withheld or (v is not None and (
                             category == DocumentCategory.HANDWRITTEN or bool(item.get("uncertain"))
                             or validation == "failed" or ev is None
-                        )
+                            or (confidence is not None and confidence < REVIEW_THRESHOLD)
+                        ))
                     ),
                     "validation": validation,
                     "evidence": ev,
@@ -451,6 +476,7 @@ def _process_core(
                 fields_dict[key] = entry
                 page_fields[key] = entry
 
+            free_gpu_memory()  # no fragmentation across multi-page sweeps
             gallery.append((draw_bounding_boxes(base_img, page_fields), f"Page {page_no}: {category.value}"))
 
         if no_evidence:
@@ -495,7 +521,9 @@ def _process_core(
                     "specialist": ", ".join(specialists),
                     "normalizer": "deterministic-v1",
                 },
-                "confidence_calibrated": False,
+                "confidence_source": "token_logprob",
+                "confidence_alpha": CONFIDENCE_ALPHA,
+                "confidence_calibrated": "DOC_CONFIDENCE_ALPHA" in os.environ,  # True only once alpha is fitted (M6)
                 "routing": routes,
                 "provenance": [p.model_dump() if hasattr(p, "model_dump") else p for p in provs],
             },

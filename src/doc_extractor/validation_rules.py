@@ -5,7 +5,7 @@ Strictly adheres to PRD §5.5 (FR-VAL-001 through FR-VAL-004), §5.6 (FR-CNF-001
 
 from datetime import datetime
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 # Regex patterns
@@ -355,3 +355,39 @@ def calculate_calibrated_confidence(
         score *= 0.50
 
     return max(0.0, min(1.0, round(score, 2)))
+
+
+def expected_calibration_error(
+    confidences: Sequence[float], correct: Sequence[bool], n_bins: int = 10
+) -> float:
+    """PRD 13.3 (M6): bin confidence into 10 equal bins; the gap is |mean confidence - accuracy| per bin,
+    weighted by bin size. Returns a fraction in [0, 1]; multiply by 100 for percentage points."""
+    if len(confidences) != len(correct):
+        raise ValueError("confidences and correct must have the same length")
+    n = len(confidences)
+    if n == 0:
+        return 0.0
+    bins: List[List[Tuple[float, bool]]] = [[] for _ in range(n_bins)]
+    for c, ok in zip(confidences, correct):
+        c = max(0.0, min(1.0, float(c)))
+        bins[min(int(c * n_bins), n_bins - 1)].append((c, bool(ok)))
+    gap = 0.0
+    for b in bins:
+        if b:
+            mean_conf = sum(c for c, _ in b) / len(b)
+            acc = sum(1 for _, ok in b if ok) / len(b)
+            gap += (len(b) / n) * abs(mean_conf - acc)
+    return gap
+
+
+def calibrate_probability(p: float, alpha: float = 1.0) -> float:
+    """Monotone recalibration p**alpha (alpha > 1 lowers over-confident token probabilities)."""
+    return max(0.0, min(1.0, float(p) ** alpha))
+
+
+def fit_calibration_alpha(
+    confidences: Sequence[float], correct: Sequence[bool], grid: Optional[Sequence[float]] = None
+) -> float:
+    """Pick the alpha that minimises ECE on a labelled set. Fit on a dev split, report M6 on the locked set."""
+    grid = grid or [0.25 + 0.05 * i for i in range(0, 76)]
+    return min(grid, key=lambda a: expected_calibration_error([calibrate_probability(c, a) for c in confidences], correct))
