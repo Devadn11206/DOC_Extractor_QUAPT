@@ -357,7 +357,7 @@ extractor = SchemaGuidedExtractor(          # defaults shown
 ### Automated Test Suite
 The repository includes unit, regression, integration and end-to-end test coverage across Modules A, B and C, the schema lifecycle, OCR backends, multipage multimodal extraction (with a faked model call) and the DOC-01/02/03 launch types.
 
-**Result (Phase 1 on PRD v1.5):** see the counts recorded in the integration report; the suite runs without a GPU, torch, model weights or Tesseract. The Qwen-VL runtime (`vlm_runtime.py`) and the OCR + text adapter are covered with fakes; real Qwen-VL / GLM-OCR / GPU behaviour is not covered by any automated test.
+**Result (Phase 1 on PRD v1.5):** 915 tests collected. With the optional `ocr` extra and the Tesseract binary installed: 914 pass, 1 skipped (the opt-in live Ollama test). In a clean environment without torch, `pytesseract` or Tesseract (fresh Python 3.11 and 3.14): 869 pass, 3 skipped (the live Ollama test and the two optional-OCR test files, which skip as a whole). With `pytesseract` but the binary hidden: 910 pass, 5 skipped. The suite runs without a GPU, torch, model weights or Tesseract. The Qwen-VL runtime (`vlm_runtime.py`) and the OCR + text adapter are covered with fakes; real Qwen-VL / GLM-OCR / GPU behaviour is not covered by any automated test.
 
 ```bash
 pip install -e ".[dev]"      # test dependencies
