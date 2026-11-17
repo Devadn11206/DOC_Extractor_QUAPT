@@ -32,6 +32,8 @@ import importlib
 import importlib.metadata
 import logging
 import math
+import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -44,8 +46,39 @@ logger = logging.getLogger("doc_extractor")
 # Constants (single source of truth; README and requirements mirror them)
 # --------------------------------------------------------------------------------------------
 
-QWEN3_VL_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+QWEN3_VL_4B_MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
+QWEN3_VL_8B_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+QWEN3_VL_MODEL_ID = QWEN3_VL_4B_MODEL_ID     # primary documented checkpoint (fits a 16 GB T4 in 4-bit)
 QWEN2_5_VL_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+
+
+def _env_int(name: str, default: int) -> int:
+    """Positive integer from the environment; an unset, malformed or non-positive value uses ``default``."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r (not an integer); using %d", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring %s=%d (must be positive); using %d", name, value, default)
+        return default
+    return value
+
+
+# Default checkpoint for routing and the extractor: DOC_DEFAULT_MODEL, else Qwen3-VL-4B-Instruct. Set
+# DOC_DEFAULT_MODEL=Qwen/Qwen3-VL-8B-Instruct on a bigger (>= 24 GB) GPU for higher accuracy.
+DEFAULT_VLM_MODEL_ID = os.environ.get("DOC_DEFAULT_MODEL") or QWEN3_VL_4B_MODEL_ID
+
+# Cap on the pixels of the page image sent to the vision model. The vision encoder's attention memory grows
+# with the SQUARE of the pixel count, and 2.0 MP already ran a 16 GB T4 out of memory, so the default is
+# 1.3 MP (about 120 DPI for A4). DOC_MAX_IMAGE_PIXELS=4200000 keeps full 200 DPI on a bigger GPU. The cap
+# is applied explicitly and recorded in the run info; it is never lowered silently after an OOM.
+DEFAULT_MAX_IMAGE_PIXELS = _env_int("DOC_MAX_IMAGE_PIXELS", 1_300_000)
+# Classification (category, language, rotation) does not need 200 DPI: a small image is far faster.
+DEFAULT_CLASSIFY_MAX_PIXELS = _env_int("DOC_CLASSIFY_MAX_PIXELS", 500_000)
 
 MIN_TRANSFORMERS_QWEN3_VL = "4.57.1"
 MIN_TRANSFORMERS_QWEN2_5_VL = "4.49.0"
@@ -53,14 +86,32 @@ QWEN_VL_UTILS_BASELINE = "0.0.14"           # exact version of the reproducible 
 MIN_ACCELERATE = "0.26.0"                    # transformers' own ACCELERATE_MIN_VERSION (4.57.1)
 MIN_BITSANDBYTES = "0.43.1"                  # transformers' own floor for 4-bit (4.57.1)
 
-# Pre-flight minimum total VRAM (GiB) to ATTEMPT a load: PRD NFR-007 (~16 GB unquantized,
-# ~6-8 GB with 4-bit). Excludes activations / KV cache, so passing it does not guarantee a page fits.
+# Pre-flight minimum VRAM (GiB) to ATTEMPT a load. These are the PRD NFR-007 figures for an 8B model
+# (~16 GB unquantized, ~6 GB with 4-bit) and are used when the checkpoint's size cannot be read from
+# its name. For a checkpoint whose name states its size (``...-4B-Instruct``) the figure is derived
+# from the parameter count by ``estimate_min_vram_gib``. Excludes activations / KV cache, so passing it
+# does not guarantee a page fits.
 MIN_VRAM_GIB_UNQUANTIZED = 16.0
 MIN_VRAM_GIB_4BIT = 6.0
+BYTES_PER_PARAM_16BIT = 2.0                  # bf16 / fp16 weights: 8B -> 16 GiB
+BYTES_PER_PARAM_NF4 = 0.5                    # 4-bit weights ...
+NF4_FIXED_OVERHEAD_GIB = 2.0                 # ... plus vision tower / embeddings / CUDA context: 8B -> 6 GiB
 
 NATIVE_BF16_MIN_CAPABILITY = (8, 0)         # NVIDIA Ampere (A100, A10, L4, RTX 30xx/40xx)
 
 PRECISIONS = ("auto", "bfloat16", "float16", "float32")
+
+# trust_remote_code executes Python shipped inside a model repository, so it is ALLOWLISTED per model
+# (exact repo id). Qwen3-VL / Qwen2.5-VL and Qwen3-4B load through native Transformers classes and are
+# never allowed to run remote code. Documented exceptions (id -> why):
+TRUST_REMOTE_CODE_ALLOWLIST: Dict[str, str] = {
+    "zai-org/GLM-OCR": (
+        "v1.5 OCRTextAdapter loads GLM-OCR with its repository code (model-card usage; the 'glm_ocr' "
+        "architecture may not exist in the installed Transformers). It is UNVERIFIED on real hardware: "
+        "remove this entry once the installed Transformers is confirmed to load it natively."
+    ),
+}
+TRUST_REMOTE_CODE_ENV = "DOC_TRUST_REMOTE_CODE_MODELS"   # comma-separated extra model ids (explicit opt-in)
 
 
 class VLMRuntimeError(DocumentExtractorError):
@@ -70,7 +121,7 @@ class VLMRuntimeError(DocumentExtractorError):
 
     VLM_DEPENDENCY_MISSING, VLM_TRANSFORMERS_INCOMPATIBLE, VLM_UNSUPPORTED_MODEL, VLM_GPU_REQUIRED,
     VLM_DTYPE_UNSUPPORTED, VLM_QUANTIZATION_UNAVAILABLE, VLM_INSUFFICIENT_VRAM,
-    VLM_PROCESSOR_MISMATCH, VLM_IMAGE_CONFIG_INVALID, VLM_LOAD_FAILED.
+    VLM_PROCESSOR_MISMATCH, VLM_IMAGE_CONFIG_INVALID, VLM_LOAD_FAILED, VLM_REMOTE_CODE_NOT_ALLOWED.
     """
 
     def __init__(self, message: str, code: str, details: Optional[Dict[str, Any]] = None) -> None:
@@ -172,6 +223,63 @@ def resolve_model_class(transformers_module: Any, family: VLMFamily) -> Any:
                      "minimum_transformers": family.min_transformers},
         )
     return cls
+
+
+# --------------------------------------------------------------------------------------------
+# trust_remote_code policy and model sizing
+# --------------------------------------------------------------------------------------------
+
+def trust_remote_code_allowed(model_id: str) -> bool:
+    """True only for allowlisted repos (``TRUST_REMOTE_CODE_ALLOWLIST`` or the explicit env opt-in)."""
+    name = (model_id or "").strip().lower()
+    extra = {m.strip().lower() for m in os.environ.get(TRUST_REMOTE_CODE_ENV, "").split(",") if m.strip()}
+    return name in {k.lower() for k in TRUST_REMOTE_CODE_ALLOWLIST} | extra
+
+
+def resolve_trust_remote_code(model_id: str, requested: bool = False) -> bool:
+    """
+    The ``trust_remote_code`` value to use for ``model_id``: True only for an allowlisted repository,
+    False for everything else. Explicitly requesting it for a non-allowlisted model is refused rather
+    than honoured or silently ignored.
+    """
+    allowed = trust_remote_code_allowed(model_id)
+    if requested and not allowed:
+        raise VLMRuntimeError(
+            f"trust_remote_code=True is not allowed for '{model_id}': it would execute code from the model "
+            "repository. Only allowlisted models may (see vlm_runtime.TRUST_REMOTE_CODE_ALLOWLIST or the "
+            f"{TRUST_REMOTE_CODE_ENV} environment variable); Qwen-VL loads through native Transformers classes.",
+            code="VLM_REMOTE_CODE_NOT_ALLOWED", details={"model_id": model_id},
+        )
+    return allowed
+
+
+def model_params_billions(model_id: str) -> Optional[float]:
+    """Parameter count (billions) stated in a checkpoint name such as ``Qwen3-VL-4B-Instruct``; else None."""
+    tail = (model_id or "").lower().replace("_", "-").rsplit("/", 1)[-1]
+    match = re.search(r"(?<![a-z0-9.])(\d+(?:\.\d+)?)b(?![a-z])", tail)
+    return float(match.group(1)) if match else None
+
+
+def estimate_min_vram_gib(model_id: str, quantized: bool) -> float:
+    """
+    Model-aware pre-flight minimum (GiB) to attempt a load: weights at 2 bytes/parameter unquantized, or
+    0.5 bytes/parameter + a fixed overhead for 4-bit. Reproduces the PRD figures for 8B (16 / 6 GiB) and
+    scales them to the checkpoint (4B: 8 / 4 GiB). An unknown size keeps the conservative 8B figures.
+    """
+    billions = model_params_billions(model_id)
+    if billions is None:
+        return MIN_VRAM_GIB_4BIT if quantized else MIN_VRAM_GIB_UNQUANTIZED
+    if quantized:
+        return round(billions * BYTES_PER_PARAM_NF4 + NF4_FIXED_OVERHEAD_GIB, 2)
+    return round(billions * BYTES_PER_PARAM_16BIT, 2)
+
+
+def resolve_device_map(device_map: str, hardware: "HardwareInfo") -> str:
+    """``single`` (the default; DOC_DEVICE_MAP) puts the whole model on GPU 0, which is faster than
+    sharding layers across cards; ``auto`` / ``balanced`` / ``cuda:N`` are passed through unchanged."""
+    if device_map == "single":
+        return "cuda:0" if hardware.cuda_available else "auto"
+    return device_map
 
 
 # --------------------------------------------------------------------------------------------
@@ -336,24 +444,40 @@ def build_bnb_config(transformers_module: Any, plan: QuantizationPlan, dtype_obj
     )
 
 
-def check_vram(hardware: HardwareInfo, quantized: bool, min_vram_gib: Optional[float] = None) -> None:
-    """Pre-flight VRAM check with an actionable error (PRD NFR-007 figures; see module constants)."""
+def check_vram(
+    hardware: HardwareInfo,
+    quantized: bool,
+    min_vram_gib: Optional[float] = None,
+    model_id: Optional[str] = None,
+    device_map: str = "auto",
+) -> None:
+    """
+    Pre-flight VRAM check with an actionable error. The requirement is model-aware
+    (``estimate_min_vram_gib``) unless ``min_vram_gib`` is given. With a single-device map
+    (``single`` / ``cuda:N``) only that GPU's memory counts; otherwise the memory of all GPUs is summed.
+    """
     if not hardware.cuda_available:
         return
-    needed = min_vram_gib if min_vram_gib is not None else (MIN_VRAM_GIB_4BIT if quantized else MIN_VRAM_GIB_UNQUANTIZED)
-    available = hardware.total_memory_gib
+    needed = min_vram_gib if min_vram_gib is not None else estimate_min_vram_gib(model_id or "", quantized)
+    gpus = hardware.gpus
+    if device_map == "single":
+        gpus = gpus[:1]
+    elif device_map.startswith("cuda:") and device_map[5:].isdigit():
+        gpus = tuple(g for g in gpus if g.index == int(device_map[5:])) or gpus[:1]
+    available = sum(g.total_memory_gib for g in gpus)
     if available + 1e-6 < needed:
         hint = (
             "Use a GPU with more memory." if quantized else
             "Enable 4-bit quantization (load_in_4bit=True), which needs roughly "
-            f"{MIN_VRAM_GIB_4BIT:g} GiB, or use a larger GPU."
+            f"{estimate_min_vram_gib(model_id or '', True):g} GiB, or use a larger GPU."
         )
         raise VLMRuntimeError(
             f"Insufficient GPU memory to load the model: {available:.1f} GiB available across "
-            f"{len(hardware.gpus)} GPU(s), at least {needed:g} GiB required "
+            f"{len(gpus)} GPU(s), at least {needed:g} GiB required "
             f"({'4-bit' if quantized else 'unquantized'}). {hint}",
             code="VLM_INSUFFICIENT_VRAM",
-            details={"available_gib": round(available, 2), "required_gib": needed, "quantized": quantized},
+            details={"available_gib": round(available, 2), "required_gib": needed, "quantized": quantized,
+                     "model_id": model_id},
         )
 
 
@@ -464,12 +588,13 @@ def vision_info_function(qwen_vl_utils_module: Any, family: VLMFamily) -> Callab
 
 @dataclass
 class VLMLoadConfig:
-    model_id: str = QWEN3_VL_MODEL_ID
+    model_id: str = DEFAULT_VLM_MODEL_ID
     load_in_4bit: bool = True
     precision: str = "auto"
     allow_cpu: bool = False
-    device_map: str = "auto"
+    device_map: str = field(default_factory=lambda: os.environ.get("DOC_DEVICE_MAP", "single"))
     trust_remote_code: bool = False
+    attn_implementation: Optional[str] = "sdpa"   # memory-efficient attention; eager materialises huge matrices
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
     min_vram_gib: Optional[float] = None
@@ -534,13 +659,15 @@ def load_qwen_vl(
     hardware = detect_hardware(torch_module)
     dtype_name = select_dtype(hardware, config.precision, allow_cpu=config.allow_cpu)
     plan = plan_quantization(hardware, config.load_in_4bit, dtype_name, version_lookup)
-    check_vram(hardware, plan.enabled, config.min_vram_gib)
+    device_map = resolve_device_map(config.device_map, hardware)
+    check_vram(hardware, plan.enabled, config.min_vram_gib, model_id=config.model_id, device_map=device_map)
+    trust_remote_code = resolve_trust_remote_code(config.model_id, config.trust_remote_code)
     image_config = build_image_config(family, config.min_pixels, config.max_pixels)
     dtype_object = getattr(torch_module, dtype_name)
 
     try:
         processor = transformers_module.AutoProcessor.from_pretrained(
-            config.model_id, trust_remote_code=config.trust_remote_code
+            config.model_id, trust_remote_code=trust_remote_code
         )
     except Exception as exc:  # noqa: BLE001 - re-raised with context
         raise VLMRuntimeError(
@@ -557,9 +684,11 @@ def load_qwen_vl(
 
     kwargs: Dict[str, Any] = {
         "dtype": dtype_object,   # `dtype` is the 4.57 spelling (`torch_dtype` is deprecated)
-        "device_map": config.device_map,
-        "trust_remote_code": config.trust_remote_code,
+        "device_map": device_map,
+        "trust_remote_code": trust_remote_code,
     }
+    if config.attn_implementation:
+        kwargs["attn_implementation"] = config.attn_implementation
     if plan.enabled:
         kwargs["quantization_config"] = build_bnb_config(transformers_module, plan, dtype_object)
     try:
@@ -586,7 +715,9 @@ def load_qwen_vl(
         "loader_class": f"transformers.{family.model_class_name}",
         "dtype": dtype_name,
         "quantization": plan.describe(),
-        "device_map": config.device_map,
+        "device_map": device_map,
+        "attn_implementation": config.attn_implementation,
+        "trust_remote_code": trust_remote_code,
         "devices": hardware.describe(),
         "image": image_config.describe(),
         "versions": collect_runtime_versions(version_lookup),

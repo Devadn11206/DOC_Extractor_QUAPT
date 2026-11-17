@@ -50,15 +50,13 @@ from doc_extractor.schemas import (
 logger = logging.getLogger("doc_extractor.extractor")
 
 
-# Cap on image pixels sent to a vision model. The vision encoder's attention memory grows with the
-# SQUARE of the pixel count: a full 200 DPI A4 page (3.9 MP, ~15k patches) needs one ~14 GB block,
-# which cannot fit a 16 GB T4. 2.0 MP (about 143 DPI for A4) needs roughly a quarter of that.
-# The earlier notebook tests ran at max_pixels=1280*28*28 (1.0 MP). Raise on a bigger GPU:
-# DOC_MAX_IMAGE_PIXELS=4200000 keeps full 200 DPI.
-# 2.0 MP still ran a T4 out of memory during extraction (GPU full), so the default is 1.3 MP.
-MAX_IMAGE_PIXELS = int(os.environ.get("DOC_MAX_IMAGE_PIXELS", "1300000"))
-# Classification (category, language, rotation) does not need 200 DPI: a small image is far faster.
-CLASSIFY_MAX_PIXELS = int(os.environ.get("DOC_CLASSIFY_MAX_PIXELS", "500000"))
+# Cap on the pixels of the image sent to a vision model (default 1.3 MP; override with
+# DOC_MAX_IMAGE_PIXELS, e.g. 4200000 keeps full 200 DPI on a bigger GPU) and on the smaller image used for
+# classification (default 0.5 MP; DOC_CLASSIFY_MAX_PIXELS). The values and the reasoning live in
+# vlm_runtime (single source of truth); they are re-exported here because v1.5 code and the Kaggle docs
+# refer to them as doc_extractor.extractor.MAX_IMAGE_PIXELS / CLASSIFY_MAX_PIXELS.
+MAX_IMAGE_PIXELS = vlm_runtime.DEFAULT_MAX_IMAGE_PIXELS
+CLASSIFY_MAX_PIXELS = vlm_runtime.DEFAULT_CLASSIFY_MAX_PIXELS
 
 
 def parse_json_tolerant(text: str) -> Dict[str, Any]:
@@ -108,12 +106,15 @@ def _flat_to_nested(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def gpu_dtype():
-    """bfloat16 on Ampere or newer; float16 on older GPUs such as the T4 (no native bf16)."""
+    """
+    Torch dtype for side models (the v1.5 adapters): bfloat16 only on GPUs with native support (compute
+    capability >= 8.0, every GPU considered), float16 on older ones such as the T4, float32 without a GPU.
+    One rule, shared with the Qwen-VL loader (``vlm_runtime.select_dtype``).
+    """
     import torch
 
-    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] < 8:
-        return torch.float16
-    return torch.bfloat16
+    hardware = vlm_runtime.detect_hardware(torch)
+    return getattr(torch, vlm_runtime.select_dtype(hardware, "auto", allow_cpu=True))
 
 
 def load_capped_image(image_input, max_pixels: int = MAX_IMAGE_PIXELS):
@@ -508,7 +509,7 @@ class SchemaGuidedExtractor:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
+        model_name: str = vlm_runtime.DEFAULT_VLM_MODEL_ID,
         use_llm: bool = False,
         allow_fallback: bool = True,
         prompt_version: str = "1.0.0",
@@ -542,9 +543,11 @@ class SchemaGuidedExtractor:
         ``"bfloat16"`` / ``"float16"`` / ``"float32"`` that is honoured or rejected, never silently
         changed. ``load_in_4bit`` (default) uses bitsandbytes NF4 with the selected compute dtype and
         fails with an actionable error when unavailable; it never degrades to another precision.
-        ``allow_cpu`` opts in to a (very slow) CPU run. ``min_pixels`` / ``max_pixels`` default to the
-        checkpoint's official image budget. ``trust_remote_code`` defaults to False: Qwen-VL is
-        natively supported by Transformers >= 4.57.1.
+        ``allow_cpu`` opts in to a (very slow) CPU run. ``max_pixels`` defaults to ``MAX_IMAGE_PIXELS``
+        (1.3 MP, DOC_MAX_IMAGE_PIXELS) so a page fits a 16 GB T4; ``min_pixels`` defaults to the
+        checkpoint's official minimum. ``device`` defaults to DOC_DEVICE_MAP (``single`` = GPU 0).
+        ``trust_remote_code`` defaults to False: Qwen-VL is natively supported by Transformers >= 4.57.1
+        and requesting it for a non-allowlisted model is refused (see ``vlm_runtime``).
         """
         self.model_name = model_name
         self.multimodal = (
@@ -568,7 +571,7 @@ class SchemaGuidedExtractor:
         self.precision = precision
         self.allow_cpu = allow_cpu
         self.min_pixels = min_pixels
-        self.max_pixels = max_pixels
+        self.max_pixels = max_pixels if max_pixels is not None else MAX_IMAGE_PIXELS
         self.min_vram_gib = min_vram_gib
         self._model = None
         self._processor = None
@@ -1106,9 +1109,14 @@ class SchemaGuidedExtractor:
         """
         model, processor = self._load_model()
         family = vlm_runtime.resolve_family(self.model_name)
-        image_config = self._image_config or vlm_runtime.build_image_config(
-            family, self.min_pixels, self.max_pixels
-        )
+        if max_pixels is not None:
+            # per-call cap (classification uses the smaller CLASSIFY_MAX_PIXELS image)
+            floor = self.min_pixels if self.min_pixels is not None and self.min_pixels <= max_pixels else None
+            image_config = vlm_runtime.build_image_config(family, floor, max_pixels)
+        else:
+            image_config = self._image_config or vlm_runtime.build_image_config(
+                family, self.min_pixels, self.max_pixels
+            )
 
         if isinstance(image_input, (str, Path)):
             image: Any = str(image_input)
