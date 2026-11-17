@@ -93,10 +93,13 @@ class Settings(BaseModel):
     )
 
     # Module B OCR / layout parser backend (FR-PRS-001, FR-PRS-005, ARC-002)
-    ocr_backend: Literal["tesseract", "pdfium_hybrid", "pdfium", "none"] = Field(
-        default="tesseract",
+    ocr_backend: Literal["passthrough", "tesseract", "pdfium_hybrid", "pdfium", "none"] = Field(
+        default="passthrough",
         description=(
-            "Module B parser backend. 'tesseract': local Tesseract OCR on every page image (default). "
+            "Module B parser backend. 'passthrough' (default): explicit no-OCR mode - empty layouts, "
+            "page images preserved for the vision model, UNKNOWN classification and review required; needs no "
+            "OCR runtime. 'tesseract': local Tesseract OCR on every page image (optional: pip install -e \".[ocr]\" "
+            "plus the Tesseract binary). "
             "'pdfium_hybrid': native PDF text per page with Tesseract OCR fallback. "
             "'pdfium': native PDF text only (no OCR; fails on scanned pages and images). "
             "'none': explicit no-parser mode; the parser reports non-operational and Module B fails closed."

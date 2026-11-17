@@ -3,12 +3,15 @@ Settings-driven selection of the Module B parser engine (ARC-002, FR-PRS-001, FR
 
 This module only *composes* existing parser implementations; it adds no OCR logic:
 
-- ``tesseract``     -> LocalOCRParserAdapter.with_tesseract (existing Tesseract integration)
+- ``passthrough``   -> PassThroughParserEngine (DEFAULT): no OCR, page images preserved, UNKNOWN
+                       classification + review; needs no OCR runtime at all
+- ``tesseract``     -> LocalOCRParserAdapter.with_tesseract (existing Tesseract integration; optional extra)
 - ``pdfium_hybrid`` -> HybridPdfParserAdapter(fallback=Tesseract adapter) (existing PDFium adapter)
 - ``pdfium``        -> PdfiumTextParserAdapter (native PDF text only, no OCR)
 - ``none``          -> NoParserEngine, an explicit and clearly non-operational parser
 
-Backends that need a runtime (Tesseract) are verified when the parser is built, so a
+There is no automatic fallback between backends: the configured one is used or fails with an
+actionable error. Backends that need a runtime (Tesseract) are verified when the parser is built, so a
 missing executable, package or language pack fails immediately with an actionable error
 instead of producing empty pages from a parser that claims to be operational.
 """
@@ -25,9 +28,10 @@ from doc_extractor.parsing.base import (
     ParserEngineError,
     ParserEngineMetadata,
 )
+from doc_extractor.parsing.passthrough import PassThroughParserEngine
 from doc_extractor.parsing.pdfium import HybridPdfParserAdapter, PdfiumTextParserAdapter
 
-SUPPORTED_OCR_BACKENDS = ("tesseract", "pdfium_hybrid", "pdfium", "none")
+SUPPORTED_OCR_BACKENDS = ("passthrough", "tesseract", "pdfium_hybrid", "pdfium", "none")
 
 
 class NoParserEngine(ParserEngine):
@@ -51,7 +55,7 @@ class NoParserEngine(ParserEngine):
         raise ParserEngineError(
             message=(
                 "No parser is configured (ocr_backend='none'). "
-                "Set Settings.ocr_backend to 'tesseract', 'pdfium_hybrid' or 'pdfium' to enable parsing."
+                "Set Settings.ocr_backend to 'passthrough', 'tesseract', 'pdfium_hybrid' or 'pdfium' to enable parsing."
             ),
             engine_name=self.engine_name,
             code="PARSER_NOT_CONFIGURED",
@@ -70,7 +74,7 @@ def _build_tesseract_adapter(settings: Settings) -> LocalOCRParserAdapter:
 
 def build_parser_engine(settings: Optional[Settings] = None) -> ParserEngine:
     """
-    Builds the Module B parser selected by ``settings.ocr_backend`` (default: Tesseract).
+    Builds the Module B parser selected by ``settings.ocr_backend`` (default: explicit pass-through, no OCR).
 
     Raises:
         ConfigurationError: if ``ocr_backend`` is not a supported backend.
@@ -81,6 +85,8 @@ def build_parser_engine(settings: Optional[Settings] = None) -> ParserEngine:
     settings = settings if settings is not None else Settings()
     backend = settings.ocr_backend
 
+    if backend == "passthrough":
+        return PassThroughParserEngine()
     if backend == "tesseract":
         return _build_tesseract_adapter(settings)
     if backend == "pdfium_hybrid":

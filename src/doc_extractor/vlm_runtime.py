@@ -166,7 +166,7 @@ def resolve_model_class(transformers_module: Any, family: VLMFamily) -> Any:
         raise VLMRuntimeError(
             f"The installed transformers ({installed}) does not provide {family.model_class_name}, which "
             f"{family.name} requires. Install transformers>={family.min_transformers}: "
-            f"pip install \"transformers>={family.min_transformers}\" (or pip install -e \".[vlm]\").",
+            f"pip install \"transformers>={family.min_transformers}\" (it is a core dependency: pip install -e .).",
             code="VLM_TRANSFORMERS_INCOMPATIBLE",
             details={"required_class": family.model_class_name, "installed_transformers": installed,
                      "minimum_transformers": family.min_transformers},
@@ -516,8 +516,8 @@ def load_qwen_vl(
     except ImportError as exc:
         raise VLMRuntimeError(
             f"Qwen-VL dependencies are not installed ({exc}). Install PyTorch for your platform FIRST "
-            "(see README: https://pytorch.org/get-started/locally/), then: pip install -e \".[vlm]\" "
-            "(or pip install -r requirements-vlm.txt).",
+            "(see README: https://pytorch.org/get-started/locally/), then: pip install -e . "
+            "(transformers, accelerate, bitsandbytes and qwen-vl-utils are core dependencies).",
             code="VLM_DEPENDENCY_MISSING",
         ) from exc
 

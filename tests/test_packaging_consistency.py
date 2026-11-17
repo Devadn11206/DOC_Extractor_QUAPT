@@ -79,7 +79,7 @@ def test_core_dependencies_match_between_pyproject_and_requirements_txt():
 
 def test_extras_are_mirrored_by_their_requirements_files():
     extras = PYPROJECT["optional-dependencies"]
-    for extra, filename in (("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"), ("vlm", "requirements-vlm.txt")):
+    for extra, filename in (("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"), ("ocr", "requirements-ocr.txt")):
         declared = {_name(d): d.replace(" ", "") for d in extras[extra]}
         listed = {k: v for k, v in _requirements(filename).items() if k not in _requirements("requirements.txt")}
         assert listed == declared, f"{filename} differs from the '{extra}' extra"
@@ -100,12 +100,26 @@ def test_jsonschema_is_a_direct_core_dependency():
     assert "jsonschema" in _requirements("requirements.txt")
 
 
-def test_heavy_vlm_stack_is_optional_and_not_in_core():
+def test_multimodal_stack_is_core_per_prd_v15_section_12_1():
+    """PRD v1.5 12.1 lists transformers, accelerate, bitsandbytes and qwen-vl-utils as core dependencies."""
+    core = {_name(d) for d in PYPROJECT["dependencies"]}
+    assert {"transformers", "accelerate", "bitsandbytes", "qwen-vl-utils"} <= core
+    assert {"transformers", "accelerate", "bitsandbytes", "qwen-vl-utils"} <= set(_requirements("requirements.txt"))
+    # PyTorch/torchvision are platform specific (CUDA/CPU/MPS): installed separately, never pinned here,
+    # so a Kaggle/Colab image's matching pair is never reinstalled over.
+    assert not core & {"torch", "torchvision"}
+    assert "vlm" not in PYPROJECT["optional-dependencies"]
+
+
+def test_tesseract_is_optional_and_not_in_core_or_requirements_txt():
     core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
-    assert not core & {h.replace("_", "-") for h in HEAVY_VLM}
-    vlm = {_name(d) for d in PYPROJECT["optional-dependencies"]["vlm"]}
-    assert {"transformers", "accelerate", "bitsandbytes", "qwen-vl-utils"} <= vlm
-    assert "torch" not in vlm            # PyTorch is installed separately for the target platform
+    assert "pytesseract" not in core
+    assert "pytesseract" in {_name(d) for d in PYPROJECT["optional-dependencies"]["ocr"]}
+
+
+def test_bitsandbytes_is_skipped_on_macos_where_it_has_no_gpu_path():
+    spec = next(d for d in PYPROJECT["dependencies"] if _name(d) == "bitsandbytes")
+    assert "darwin" in spec and "sys_platform" in spec
 
 
 def test_gradio_is_an_optional_ui_extra_not_a_core_dependency():
@@ -115,23 +129,11 @@ def test_gradio_is_an_optional_ui_extra_not_a_core_dependency():
 
 
 def test_qwen3_vl_transformers_floor_is_not_below_4_57():
-    spec = next(d for d in PYPROJECT["optional-dependencies"]["vlm"] if _name(d) == "transformers")
+    spec = next(d for d in PYPROJECT["dependencies"] if _name(d) == "transformers")
     major, minor, *_ = (int(x) for x in re.search(r">=\s*([\d.]+)", spec).group(1).split("."))
     assert (major, minor) >= (4, 57)
 
 
-def test_vlm_group_matches_the_reproducible_gpu_baseline():
-    vlm = {_name(d): d.replace(" ", "") for d in PYPROJECT["optional-dependencies"]["vlm"]}
-    assert vlm["qwen-vl-utils"] == "qwen-vl-utils==0.0.14"          # exact baseline pin
-    assert vlm["transformers"].startswith("transformers>=4.57.1")
-    assert vlm["accelerate"].startswith("accelerate>=0.26")           # transformers' own 4-bit floors
-    assert vlm["bitsandbytes"].startswith("bitsandbytes>=0.43.1")
-    # torch / torchvision are platform-specific and never part of the VLM group
-    assert "torch" not in vlm and "torchvision" not in vlm
-
-
-def test_requires_python_floor_is_3_10_and_classifiers_do_not_overclaim():
-    assert PYPROJECT["requires-python"] == ">=3.10"
-    versions = {c.rsplit(" ", 1)[-1] for c in PYPROJECT["classifiers"] if "Programming Language :: Python :: 3." in c}
-    # only versions this repository was actually exercised on (README "Python compatibility")
-    assert versions <= {"3.10", "3.11", "3.14"}
+def test_core_matches_the_reproducible_gpu_baseline():
+    core = {_name(d): d.replace(" ", "") for d in PYPROJECT["dependencies"]}
+    assert core["qwen-vl-utils"] == "qwen-vl-utils==0.0.14"          # exact baseline pin

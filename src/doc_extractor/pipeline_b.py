@@ -91,8 +91,9 @@ class ModuleBPipeline:
         """
         Args:
             parser: Explicit parser engine. When omitted, the parser is built from
-                ``settings.ocr_backend`` (default: local Tesseract OCR). A missing OCR
-                runtime or invalid backend raises immediately with an actionable error.
+                ``settings.ocr_backend`` (default: the explicit no-OCR pass-through, which
+                needs no OCR runtime). A configured OCR backend whose runtime is missing, or an
+                invalid backend, raises immediately with an actionable error; there is no fallback.
             settings: Project settings used to select/configure the default parser.
         """
         self.storage = storage

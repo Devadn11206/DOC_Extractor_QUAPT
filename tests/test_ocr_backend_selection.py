@@ -22,7 +22,9 @@ import numpy as np
 from PIL import Image
 import pytest
 
-import pytesseract
+pytesseract = pytest.importorskip(
+    "pytesseract", reason="optional OCR extra not installed (pip install -e '.[ocr]')"
+)
 from doc_extractor.config import Settings, load_settings
 from doc_extractor.exceptions import ConfigurationError
 from doc_extractor.handoff import ModuleAHandoffPayload
@@ -105,9 +107,9 @@ def _handoff_from_image_only_pdf(storage: LocalDiskStorage, data: bytes) -> Modu
 # 1. Configuration
 # ----------------------------------------------------------------------------
 
-def test_default_settings_select_tesseract_backend():
+def test_default_settings_select_the_explicit_passthrough_backend():
     s = Settings()
-    assert s.ocr_backend == "tesseract"
+    assert s.ocr_backend == "passthrough"
     assert s.ocr_tesseract_lang == "eng"
     assert s.ocr_tesseract_config == ""
     assert s.ocr_tesseract_cmd is None
@@ -135,8 +137,8 @@ def test_factory_rejects_unsupported_backend_that_bypassed_validation():
 # 2. Backend selection reuses existing adapters
 # ----------------------------------------------------------------------------
 
-def test_default_selects_operational_tesseract_adapter(fake_tesseract_runtime):
-    parser = build_parser_engine()  # no settings -> defaults
+def test_tesseract_backend_selects_operational_tesseract_adapter(fake_tesseract_runtime):
+    parser = build_parser_engine(Settings(ocr_backend="tesseract"))
     assert isinstance(parser, LocalOCRParserAdapter)
     meta = parser.get_metadata()
     assert meta.engine_name == "Tesseract-OCR"
@@ -233,20 +235,20 @@ def test_missing_tesseract_binary_fails_closed_with_actionable_error(monkeypatch
 
     monkeypatch.setattr(pytesseract, "get_tesseract_version", not_found)
     with pytest.raises(ParserEngineError) as exc_info:
-        build_parser_engine()
+        build_parser_engine(Settings(ocr_backend="tesseract"))
     assert exc_info.value.code == "OCR_BINARY_MISSING"
     msg = str(exc_info.value)
     assert "brew install tesseract" in msg and "apt-get install tesseract-ocr" in msg
     assert "ocr_tesseract_cmd" in msg
 
 
-def test_default_module_b_pipeline_fails_clearly_when_tesseract_missing(monkeypatch, temp_storage):
+def test_configured_tesseract_module_b_pipeline_fails_clearly_when_tesseract_missing(monkeypatch, temp_storage):
     def not_found():
         raise pytesseract.TesseractNotFoundError()
 
     monkeypatch.setattr(pytesseract, "get_tesseract_version", not_found)
     with pytest.raises(ParserEngineError) as exc_info:
-        ModuleBPipeline(storage=temp_storage, tenant_id="tenant-ocr")
+        ModuleBPipeline(storage=temp_storage, tenant_id="tenant-ocr", settings=Settings(ocr_backend="tesseract"))
     assert exc_info.value.code == "OCR_BINARY_MISSING"
 
 
@@ -272,14 +274,14 @@ def test_missing_language_pack_fails_closed(monkeypatch):
     monkeypatch.setattr(pytesseract, "get_tesseract_version", lambda: "5.5.3")
     monkeypatch.setattr(pytesseract, "get_languages", lambda config="": ["eng", "osd"])
     with pytest.raises(ParserEngineError) as exc_info:
-        build_parser_engine(Settings(ocr_tesseract_lang="eng+hin"))
+        build_parser_engine(Settings(ocr_backend="tesseract", ocr_tesseract_lang="eng+hin"))
     assert exc_info.value.code == "OCR_LANGUAGE_MISSING"
     assert "hin" in str(exc_info.value)
 
 
 def test_configured_tesseract_cmd_that_does_not_exist_fails_closed():
     original_cmd = pytesseract.pytesseract.tesseract_cmd
-    settings = Settings(ocr_tesseract_cmd="/nonexistent/path/to/tesseract")
+    settings = Settings(ocr_backend="tesseract", ocr_tesseract_cmd="/nonexistent/path/to/tesseract")
     with pytest.raises(ParserEngineError) as exc_info:
         build_parser_engine(settings)
     assert exc_info.value.code == "OCR_BINARY_MISSING"
@@ -324,7 +326,7 @@ def test_injected_parser_takes_precedence_over_settings(temp_storage):
     assert pipeline.parser is injected
 
 
-def test_default_pipeline_with_mocked_tesseract_receives_tokens_blocks_and_pages(
+def test_configured_pipeline_with_mocked_tesseract_receives_tokens_blocks_and_pages(
     fake_tesseract_runtime, monkeypatch, temp_storage
 ):
     words: List[str] = ["BANK", "ACCOUNT", "OPENING", "FORM"]
@@ -341,7 +343,7 @@ def test_default_pipeline_with_mocked_tesseract_receives_tokens_blocks_and_pages
             "level": [5, 5, 5, 5],
         },
     )
-    pipeline = ModuleBPipeline(storage=temp_storage, tenant_id="tenant-ocr")  # normal path
+    pipeline = ModuleBPipeline(storage=temp_storage, tenant_id="tenant-ocr", settings=Settings(ocr_backend="tesseract"))
     out = pipeline.process_handoff(_handoff_from_png(temp_storage, _text_png_bytes()))
 
     assert out.status in ("processing", "needs_review")
@@ -361,8 +363,8 @@ def test_default_pipeline_with_mocked_tesseract_receives_tokens_blocks_and_pages
 # ----------------------------------------------------------------------------
 
 @requires_tesseract
-def test_live_default_pipeline_produces_nonempty_parse_from_image(temp_storage):
-    pipeline = ModuleBPipeline(storage=temp_storage, tenant_id="tenant-ocr")  # default settings
+def test_live_tesseract_pipeline_produces_nonempty_parse_from_image(temp_storage):
+    pipeline = ModuleBPipeline(storage=temp_storage, tenant_id="tenant-ocr", settings=Settings(ocr_backend="tesseract"))
     assert pipeline.parser.get_metadata().is_operational is True
 
     out = pipeline.process_handoff(_handoff_from_png(temp_storage, _text_png_bytes()))

@@ -9,6 +9,7 @@ from doc_extractor.parsing.base import (
     RawOCRToken,
 )
 from doc_extractor.parsing.adapter import LocalOCRParserAdapter
+from doc_extractor.parsing.passthrough import PassThroughParserEngine
 from doc_extractor.parsing.tesseract import (
     TesseractExtractor,
     check_tesseract_available,
@@ -47,6 +48,7 @@ __all__ = [
     "ParserEngineMetadata",
     "RawOCRToken",
     "LocalOCRParserAdapter",
+    "PassThroughParserEngine",
     "tesseract_raw_extractor",
     "TesseractExtractor",
     "check_tesseract_available",

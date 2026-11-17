@@ -12,18 +12,20 @@ Pillow>=9.0.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 
-# Module B: Local OCR (default backend). Also requires the external Tesseract binary:
-#   macOS: brew install tesseract | Debian/Ubuntu: apt-get install tesseract-ocr
-pytesseract>=0.3.10
+# Module B OCR is OPTIONAL (default backend: explicit no-OCR pass-through). To use Tesseract install
+# requirements-ocr.txt (or: pip install -e ".[ocr]") plus the Tesseract binary.
 
 # Module C: Schema-Guided Extraction & Normalization
 instructor>=1.0.0
 litellm>=1.40.0
 
-# NOTE: heavy local-VLM packages (transformers, accelerate, bitsandbytes, qwen-vl-utils) and
-# PyTorch are intentionally NOT core requirements. Install them only where the multimodal
-# Qwen-VL extractor runs: install PyTorch for your platform first, then
-#   pip install -r requirements-vlm.txt  (or: pip install -e ".[vlm]")
+# Multimodal stack: PRD v1.5 section 12.1 lists these as CORE dependencies (1-stage Qwen3-VL).
+# PyTorch and torchvision are NOT listed: install the matching builds for the machine FIRST
+# (https://pytorch.org/get-started/locally/); on Kaggle/Colab keep the preinstalled pair.
+transformers>=4.57.1                        # Qwen3VLForConditionalGeneration ships from 4.57.0 (itself yanked)
+accelerate>=0.26.0                          # floor enforced by transformers for 4-bit loading
+bitsandbytes>=0.43.1; sys_platform != 'darwin'   # NF4 4-bit needs CUDA; skipped on macOS
+qwen-vl-utils==0.0.14                       # process_vision_info(image_patch_size=16) for Qwen3-VL
 
 # Schema Lifecycle: Schema Metamodel & YAML/JSON Serialization (SCH-003) and schema validation
 PyYAML>=6.0.0

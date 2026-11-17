@@ -31,7 +31,9 @@ import numpy as np
 from PIL import Image
 import pytest
 
-import pytesseract
+pytesseract = pytest.importorskip(
+    "pytesseract", reason="optional OCR extra not installed (pip install -e '.[ocr]')"
+)
 from doc_extractor.contracts_b import (
     BoundingBox,
     ModuleAPageRef,

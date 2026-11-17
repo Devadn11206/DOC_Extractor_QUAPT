@@ -599,7 +599,7 @@ def test_missing_pytorch_or_transformers_explains_the_separate_pytorch_install(m
     with pytest.raises(rt.VLMRuntimeError) as exc:
         rt.load_qwen_vl(rt.VLMLoadConfig())
     assert exc.value.code == "VLM_DEPENDENCY_MISSING"
-    assert "PyTorch" in exc.value.message and "[vlm]" in exc.value.message
+    assert "PyTorch" in exc.value.message and "core dependencies" in exc.value.message
 
 
 def test_out_of_memory_during_load_is_reported_as_insufficient_vram():
