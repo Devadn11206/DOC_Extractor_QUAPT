@@ -86,6 +86,7 @@ def test_passthrough_is_not_a_silent_fallback_for_a_configured_ocr_backend(stora
         with pytest.raises(ParserEngineError) as exc:
             ModuleBPipeline(storage, settings=Settings(ocr_backend=backend))
         assert exc.value.code == "OCR_DEPENDENCY_MISSING"
+        assert ".[ocr]" in str(exc.value) and "passthrough" in str(exc.value)   # tells how to opt in, or to stay on the default
 
 
 def test_none_backend_still_fails_closed_unlike_passthrough(storage, no_tesseract):

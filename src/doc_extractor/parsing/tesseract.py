@@ -81,7 +81,8 @@ def check_tesseract_available(
         raise ParserEngineError(
             message=(
                 "The 'pytesseract' Python package is not installed. "
-                "Install project dependencies with 'pip install -e .' or 'pip install pytesseract'."
+                "It is an optional dependency: install it with 'pip install -e \".[ocr]\"' or 'pip install pytesseract' "
+                "(plus the Tesseract binary), or keep the default ocr_backend='passthrough'."
             ),
             engine_name="Tesseract",
             code="OCR_DEPENDENCY_MISSING",
