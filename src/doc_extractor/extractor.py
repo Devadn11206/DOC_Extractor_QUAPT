@@ -534,8 +534,8 @@ class SchemaGuidedExtractor:
     ):
         """
         ``multimodal`` selects whether this extractor reads Module A page images directly
-        (Qwen-VL, PRD v1.3) when page images are supplied. ``None`` infers it from the model:
-        VLM model names (e.g. 'Qwen/Qwen3-VL-8B-Instruct') are multimodal; Ollama/text models
+        (Qwen-VL, PRD v1.3/v1.5) when page images are supplied. ``None`` infers it from the model:
+        VLM model names (e.g. 'Qwen/Qwen3-VL-4B-Instruct') are multimodal; Ollama/text models
         are not and keep extracting from Module B markdown.
 
         Local Qwen-VL runtime (see ``doc_extractor.vlm_runtime``): ``precision`` is ``"auto"`` (BF16
@@ -700,7 +700,7 @@ class SchemaGuidedExtractor:
                 request_id: Optional[str] = None
                 details: Dict[str, Any] = {}
                 if page_images and self.multimodal and self.llm_caller is None:
-                    # PRD v1.3 1-stage path: Qwen-VL reads every explicit Module A page image.
+                    # PRD v1.3/v1.5 1-stage path: Qwen-VL reads every explicit Module A page image.
                     model_result, grounding, provider, details = self._extract_vlm_internal(
                         target_schema, page_images
                     )

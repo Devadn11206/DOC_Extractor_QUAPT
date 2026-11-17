@@ -100,7 +100,7 @@ class QwenVLParserAdapter(ParserEngine):
         prompt_text = (
             "Read all printed and handwritten text in this document page in logical reading order. "
             "For each detected text block, heading, table row, or checkbox label, detect its bounding box "
-            "in the format: [ymin, xmin, ymax, xmax] followed by the text content. "
+            "in the format: [x1, y1, x2, y2] (left, top, right, bottom) followed by the text content. "
             "If a checkbox is checked, output [x]. If unchecked, output [ ]."
         )
 
@@ -167,7 +167,7 @@ class QwenVLParserAdapter(ParserEngine):
         blocks: List[LayoutBlock] = []
         checkboxes: List[CheckboxMark] = []
 
-        # Matches coordinate patterns like [120, 45, 160, 350] or (120, 45, 160, 350)
+        # Matches coordinate patterns like [45, 120, 350, 160] or (45, 120, 350, 160): [x1, y1, x2, y2]
         box_pattern = re.compile(
             r"(?:\[|\()(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:\]|\))\s*(.*)"
         )
@@ -178,9 +178,9 @@ class QwenVLParserAdapter(ParserEngine):
         for line in lines:
             match = box_pattern.search(line)
             if match:
-                ymin_norm, xmin_norm, ymax_norm, xmax_norm, content = match.groups()
-                ymin, xmin = float(ymin_norm), float(xmin_norm)
-                ymax, xmax = float(ymax_norm), float(xmax_norm)
+                x1_norm, y1_norm, x2_norm, y2_norm, content = match.groups()   # [x1, y1, x2, y2]
+                xmin, ymin = float(x1_norm), float(y1_norm)
+                xmax, ymax = float(x2_norm), float(y2_norm)
                 text = content.strip()
             else:
                 # If a line had no explicit coordinates, assign full-width span in sequence
@@ -192,7 +192,7 @@ class QwenVLParserAdapter(ParserEngine):
             if not text:
                 continue
 
-            # Convert Qwen2.5-VL [0, 1000] scale to actual preprocessed image pixels
+            # Convert the [0, 1000] grid to actual preprocessed image pixels (x by width, y by height)
             x0 = max(0.0, min(float(w_px), (xmin / 1000.0) * w_px))
             y0 = max(0.0, min(float(h_px), (ymin / 1000.0) * h_px))
             x1 = max(x0, min(float(w_px), (xmax / 1000.0) * w_px))

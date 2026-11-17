@@ -1,5 +1,5 @@
 """
-Multimodal (Qwen-VL) output handling for Module C (PRD v1.3: ARC-002, GR-002, GR-003, SCH-013).
+Multimodal (Qwen-VL) output handling for Module C (PRD v1.5: ARC-002, GR-002, GR-003, SCH-013).
 
 Two deterministic stages, both reusing existing canonical components:
 
@@ -10,6 +10,12 @@ Two deterministic stages, both reusing existing canonical components:
    pixels via ``CoordinateTransform.map_bbox_preprocessed_to_original`` (inverting the
    deskew/rotation applied by Module A). The hints feed ``field_assembly.assemble_field_entry``,
    which keeps owning validation status, confidence and review gating.
+
+Canonical box convention (PRD v1.5 FR-EXT-004 / GR-002 / FR-EXT-011): model boxes are
+``[x1, y1, x2, y2]`` = (left, top, right, bottom) on a 0-1000 grid relative to the image the model
+saw; evidence boxes are ``(x0, y0, x1, y1)`` pixels of the 200-DPI ORIGINAL page (xyxy, top-left
+origin, X first). Nothing in this module reorders axes: x is always scaled by the width and y by the
+height.
 
 No confidence values are produced here: the model returns none, and none is invented.
 """
@@ -160,18 +166,48 @@ def _coerce_leaf(leaf_name: str, value: Any, leaf_type: Any) -> Any:
 
 
 def _valid_bbox(bbox: Any) -> Optional[Tuple[float, float, float, float]]:
-    """Accepts [ymin, xmin, ymax, xmax] on 0-1000; anything else is treated as ungrounded."""
+    """
+    Accepts ``[x1, y1, x2, y2]`` on 0-1000 (left, top, right, bottom); anything else is ungrounded.
+    Swapped corners (x2 < x1 or y2 < y1) describe the same rectangle and are put in order; a box with
+    no area, a non-numeric entry or a value off the grid (e.g. raw pixels) is treated as ungrounded.
+    """
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return None
     try:
-        ymin, xmin, ymax, xmax = (float(v) for v in bbox)
+        x1, y1, x2, y2 = (float(v) for v in bbox)
     except (TypeError, ValueError):
         return None
-    if min(ymin, xmin, ymax, xmax) < 0.0 or max(ymin, xmin, ymax, xmax) > 1000.0:
+    if min(x1, y1, x2, y2) < 0.0 or max(x1, y1, x2, y2) > 1000.0:
         return None  # not on the normalized grid (e.g. raw pixels)
-    if ymax <= ymin or xmax <= xmin:
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    if x2 <= x1 or y2 <= y1:
         return None
-    return ymin, xmin, ymax, xmax
+    return x1, y1, x2, y2
+
+
+def unrotate_bbox_norm(
+    bbox_norm: Tuple[float, float, float, float], clockwise_deg: int
+) -> Tuple[float, float, float, float]:
+    """
+    Maps a ``[x1, y1, x2, y2]`` box (0-1000) read on an image that was turned UPRIGHT by rotating the
+    stored page clockwise by ``clockwise_deg`` (0/90/180/270) back to the stored page's frame, so the
+    Module A geometry (``CoordinateTransform``) can be applied to it. Corners are re-ordered afterwards.
+    """
+    x1, y1, x2, y2 = bbox_norm
+    deg = int(clockwise_deg) % 360
+    if deg == 0:
+        return bbox_norm
+    if deg == 90:
+        pts = [(y1, 1000.0 - x1), (y2, 1000.0 - x2)]
+    elif deg == 180:
+        pts = [(1000.0 - x1, 1000.0 - y1), (1000.0 - x2, 1000.0 - y2)]
+    elif deg == 270:
+        pts = [(1000.0 - y1, x1), (1000.0 - y2, x2)]
+    else:
+        raise ValueError(f"rotation must be 0, 90, 180 or 270 degrees clockwise, got {clockwise_deg}")
+    (ax, ay), (bx, by) = pts
+    return min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)
 
 
 def _assign(tree: Dict[str, Any], canonical_path: str, value: Any) -> None:
@@ -511,13 +547,13 @@ def _hint_for(item: FieldGrounding, by_page: Dict[int, PageImageRef]) -> Optiona
     if ref is None or item.bbox_norm is None:
         return None
     page = ref.page_ref
-    ymin, xmin, ymax, xmax = item.bbox_norm
+    x1, y1, x2, y2 = item.bbox_norm                       # canonical [x1, y1, x2, y2] on 0-1000
     width, height = page.preprocessed_width_px, page.preprocessed_height_px
-    bbox_prep = (
-        xmin * width / 1000.0,
-        ymin * height / 1000.0,
-        xmax * width / 1000.0,
-        ymax * height / 1000.0,
+    bbox_prep = (                                         # preprocessed-image pixels (x0, y0, x1, y1)
+        x1 * width / 1000.0,
+        y1 * height / 1000.0,
+        x2 * width / 1000.0,
+        y2 * height / 1000.0,
     )
     x0, y0, x1, y1 = CoordinateTransform.map_bbox_preprocessed_to_original(
         bbox=bbox_prep,

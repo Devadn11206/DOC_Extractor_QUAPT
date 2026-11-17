@@ -1,6 +1,6 @@
 """
 Qwen-VL runtime readiness: model loading, hardware-aware precision and image-processor settings
-(PRD v1.3 ARC-002 / NFR-007 / NFR-008, GR-016).
+(PRD v1.5 ARC-002 / NFR-007 / NFR-008, GR-016).
 
 Everything here is import-safe without PyTorch or Transformers: ``torch`` / ``transformers`` are
 imported lazily (or injected, which is how the unit tests run on a machine without a GPU). Nothing
@@ -18,9 +18,11 @@ Verified facts this module encodes (checked against the published package source
   here, so a full 200-DPI A4 page (~3.9 MP) is never silently down-scaled.
 * ``qwen-vl-utils`` already resizes the image (aspect ratio kept, rounded to the patch factor), so the
   processor is called with ``do_resize=False`` to avoid resizing twice.
-* The Qwen3-VL model emits boxes as ``[ymin, xmin, ymax, xmax]`` on a 0-1000 grid *relative to the
-  image it saw*; that is independent of any resize, which is why the grounding code can map them with
-  the Module A page geometry (see ``vlm_grounding``).
+* The Qwen3-VL model emits boxes as ``[x1, y1, x2, y2]`` (left, top, right, bottom) on a 0-1000 grid
+  *relative to the image it saw* (PRD v1.5; upstream commit 27d8451 fixed the order); that is independent
+  of any resize, which is why the grounding code can map them with the Module A page geometry (see
+  ``vlm_grounding``). The family's declared convention is ``VLMFamily.bbox_order`` / ``bbox_grid`` and is
+  recorded in the run info; Qwen2.5-VL's is taken from the PRD and is UNVERIFIED (see ``FAMILY_QWEN2_5_VL``).
 * Native BF16 needs an NVIDIA Ampere-or-newer GPU (compute capability >= 8.0). A Tesla T4 (7.5) must
   use FP16. ``torch.cuda.is_bf16_supported()`` is NOT used: recent PyTorch reports True on older GPUs
   by emulation, which is slow and not what we want to rely on.
@@ -141,6 +143,15 @@ class VLMFamily:
     min_transformers: str
     default_min_pixels: int
     default_max_pixels: int
+    # Box convention the family's model is PROMPTED for and expected to emit, validated per family
+    # (the canonical internal form is always [x1, y1, x2, y2] on 0-1000; see vlm_grounding).
+    bbox_order: str = "xyxy"
+    bbox_grid: int = 1000
+    bbox_verified: bool = True     # False: taken from the PRD, not confirmed against the real model
+
+    @property
+    def bbox_convention(self) -> Dict[str, Any]:
+        return {"order": self.bbox_order, "grid": self.bbox_grid, "verified": self.bbox_verified}
 
     @property
     def image_factor(self) -> int:
@@ -165,6 +176,9 @@ FAMILY_QWEN2_5_VL = VLMFamily(
     min_transformers=MIN_TRANSFORMERS_QWEN2_5_VL,
     default_min_pixels=3136,
     default_max_pixels=12845056,
+    # PRD v1.5 states the same [x1,y1,x2,y2] / 0-1000 contract for Qwen2.5-VL, but it has not been
+    # confirmed against the real model here (Qwen2.5-VL is commonly documented with absolute pixels).
+    bbox_verified=False,
 )
 
 
@@ -720,6 +734,7 @@ def load_qwen_vl(
         "trust_remote_code": trust_remote_code,
         "devices": hardware.describe(),
         "image": image_config.describe(),
+        "bbox_convention": family.bbox_convention,
         "versions": collect_runtime_versions(version_lookup),
         "qwen_vl_utils_matches_baseline":
             package_version("qwen-vl-utils", version_lookup) == QWEN_VL_UTILS_BASELINE,
