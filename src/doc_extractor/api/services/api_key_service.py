@@ -13,17 +13,19 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 from doc_extractor.api.contracts.records import ApiKeyCreationResult, ApiKeySummary
 from doc_extractor.api.exceptions import (
     ApiValidationError,
+    AuditUnavailableError,
     ForbiddenError,
     TenantResourceNotFoundError,
 )
 from doc_extractor.api.ports.audit import AuditLogger
 from doc_extractor.api.ports.authentication import ApiPrincipal
 from doc_extractor.api.ports.repositories import ApiKeyRepository
+from doc_extractor.exceptions import ConfigurationError
 from doc_extractor.api.token_core import (
     DEFAULT_TOKEN_PREFIX,
     create_api_key_record,
@@ -53,10 +55,22 @@ class ApiKeyService:
     def __init__(
         self,
         repository: ApiKeyRepository,
-        audit_logger: Optional[AuditLogger] = None,
+        audit_logger: AuditLogger,
     ) -> None:
+        # Creating and revoking credentials are mandatory-audit operations: an audit logger is required, never optional,
+        # so the service cannot silently run unaudited.
+        if audit_logger is None:
+            raise ConfigurationError("ApiKeyService requires an audit logger: key creation and revocation are mandatory-audit operations.")
         self._repository = repository
         self._audit_logger = audit_logger
+
+    async def _record_mandatory_audit(self, operation: str, effect_if_failed: str, **event: Any) -> None:
+        """Write a mandatory audit event; a failure is raised as AuditUnavailableError (never swallowed, never the raw error)."""
+        try:
+            await self._audit_logger.log_action(**event)
+        except Exception as exc:
+            logger.error("Mandatory audit write failed for %s (%s)", operation, type(exc).__name__)   # no secret, no error text
+            raise AuditUnavailableError(operation, effect=effect_if_failed) from exc
 
     def _verify_creator_authz(
         self,
@@ -171,20 +185,25 @@ class ApiKeyService:
 
         persisted = await self._repository.create(creator.tenant_id, record)
 
-        # 6. Audit event (SEC-012: no secret, no hash)
-        if self._audit_logger:
+        # 6. Mandatory audit event (SEC-008/SEC-012: no secret, no hash). If it cannot be written the new key is revoked
+        #    again and the secret is never returned: no credential may exist without its audit record.
+        try:
+            await self._record_mandatory_audit(
+                "api_key.created", "rolled_back",
+                actor_id=creator.principal_id,
+                tenant_id=creator.tenant_id,
+                action="api_key.created",
+                resource_id=persisted.key_id,
+                resource_type="api_key",
+                metadata={"outcome_code": "SUCCESS"},
+                outcome="SUCCESS",
+            )
+        except AuditUnavailableError:
             try:
-                await self._audit_logger.log_action(
-                    actor_id=creator.principal_id,
-                    tenant_id=creator.tenant_id,
-                    action="api_key.created",
-                    resource_id=persisted.key_id,
-                    resource_type="api_key",
-                    metadata={"outcome_code": "SUCCESS"},
-                    outcome="SUCCESS",
-                )
-            except Exception as exc:  # pragma: no cover
-                logger.warning("Audit logging failed for api_key.created: %s", exc)
+                await self._repository.revoke(creator.tenant_id, persisted.key_id)
+            except Exception as rollback_error:
+                logger.error("Could not revoke key %s after an audit failure (%s): revoke it manually", persisted.key_id, type(rollback_error).__name__)
+            raise
 
         # 7. Return creation result disclosing the secret ONCE. It is never cached, stored or replayed
         #    (security decision D8 is open: no idempotent replay of this call is offered).
@@ -267,19 +286,18 @@ class ApiKeyService:
 
         success = await self._repository.revoke(creator.tenant_id, key_id)
 
-        if self._audit_logger:
-            try:
-                await self._audit_logger.log_action(
-                    actor_id=creator.principal_id,
-                    tenant_id=creator.tenant_id,
-                    action="api_key.revoked",
-                    resource_id=key_id,
-                    resource_type="api_key",
-                    metadata={"outcome_code": "SUCCESS"},
-                    outcome="SUCCESS",
-                )
-            except Exception as exc:  # pragma: no cover
-                logger.warning("Audit logging failed for api_key.revoked: %s", exc)
+        # Revocation only ever reduces access, so it stays applied if the audit write fails; the caller is told (503,
+        # effect "applied") instead of being given a clean success for an unaudited change.
+        await self._record_mandatory_audit(
+            "api_key.revoked", "applied",
+            actor_id=creator.principal_id,
+            tenant_id=creator.tenant_id,
+            action="api_key.revoked",
+            resource_id=key_id,
+            resource_type="api_key",
+            metadata={"outcome_code": "SUCCESS"},
+            outcome="SUCCESS",
+        )
 
         return success
 

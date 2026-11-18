@@ -45,6 +45,18 @@ A job message never embeds a hand-off, page image or extracted content. Do not a
 - An object-store backend must keep the same guarantees: a deterministic key per exact identity, identity verified on
   access, no aliasing.
 
+## Audit semantics
+
+| Operation | Audit | If the audit write fails |
+| --- | --- | --- |
+| API-key creation | **Mandatory** | The new key is revoked again and its secret is never returned; the caller gets `503 AUDIT_UNAVAILABLE` (effect `rolled_back`) |
+| API-key revocation | **Mandatory** | The key stays revoked (access only shrinks); the caller gets `503 AUDIT_UNAVAILABLE` (effect `applied`) |
+| Authentication failure | Best effort | Logged, never fatal: a failed write must not lock every client out |
+
+There is no silent fallback: an unconfigured audit logger is `503 SERVICE_UNAVAILABLE` (port `AuditLogger`). `SafeStructuredAuditLogger` is a
+**log-only** sink: it can be configured explicitly, but it is not an audit store and it swallows its own write errors, so production needs a
+durable logger over `AuditRepository` (Team Member 3). The sink's own error text is never logged or returned.
+
 ## What depends on Team Member 3 (not implemented here)
 
 | Area | Needed from Team Member 3 |

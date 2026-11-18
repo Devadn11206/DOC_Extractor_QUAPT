@@ -15,10 +15,9 @@ from doc_extractor.api.config import ApiSettings, get_api_settings
 from doc_extractor.api.exceptions import (
     AuthenticationRequiredError,
     ForbiddenError,
-    InternalServerError,
     PortNotConfiguredError,
 )
-from doc_extractor.api.ports.audit import AuditLogger, SafeStructuredAuditLogger
+from doc_extractor.api.ports.audit import AuditLogger
 from doc_extractor.api.ports.authentication import (
     ApiPrincipal,
     AuthenticationProvider,
@@ -57,22 +56,21 @@ def get_auth_provider(request: Request) -> AuthenticationProvider:
     if provider is not None:
         return provider
 
-    # If api_key_repo is configured, auto-construct ApiKeyAuthenticationProvider (TASK-5.7-B)
+    # If api_key_repo is configured, auto-construct ApiKeyAuthenticationProvider (TASK-5.7-B). The audit logger must be
+    # configured explicitly: there is no silent fallback to a log-only logger.
     api_key_repo = getattr(request.app.state, "api_key_repo", None)
     if api_key_repo is not None:
-        from doc_extractor.api.ports.audit import SafeStructuredAuditLogger
+        audit_logger = getattr(request.app.state, "audit_logger", None)
+        if audit_logger is None:
+            raise PortNotConfiguredError("AuditLogger")
         from doc_extractor.api.providers.api_key_auth import ApiKeyAuthenticationProvider
 
-        audit_logger = getattr(request.app.state, "audit_logger", None) or SafeStructuredAuditLogger()
         provider = ApiKeyAuthenticationProvider(repository=api_key_repo, audit_logger=audit_logger)
         request.app.state.auth_provider = provider
         return provider
 
-    # Fail closed: No provider configured and no repository to construct one
-    raise InternalServerError(
-        message="Authentication provider is not configured on the application.",
-        code="AUTH_PROVIDER_UNCONFIGURED",
-    )
+    # Fail closed: no provider configured and no repository to construct one. Typed 503, not a bare 500.
+    raise PortNotConfiguredError("AuthenticationProvider")
 
 
 async def get_current_principal(
@@ -214,10 +212,14 @@ def get_queue_consumer(request: Request) -> QueueConsumer:
 
 
 def get_audit_logger(request: Request) -> AuditLogger:
-    """Dependency injection provider for structured AuditLogger."""
+    """
+    Dependency injection provider for the structured AuditLogger. Audit is mandatory for the operations that need it, so
+    an unconfigured logger is a typed 503, never a silent downgrade to log-only. (Configuring SafeStructuredAuditLogger
+    explicitly is a deliberate choice of a log-only sink; a durable AuditRepository-backed logger is Team Member 3's.)
+    """
     logger = getattr(request.app.state, "audit_logger", None)
     if logger is None:
-        return SafeStructuredAuditLogger()
+        raise PortNotConfiguredError("AuditLogger")
     return logger
 
 

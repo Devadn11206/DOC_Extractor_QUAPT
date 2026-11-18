@@ -295,6 +295,27 @@ class PortNotConfiguredError(ApiHttpError):
         self.port = port
 
 
+class AuditUnavailableError(ApiHttpError):
+    """
+    A MANDATORY audit record could not be written (SEC-008). The operation is never reported as a clean success: the
+    service refuses (HTTP 503) instead of continuing unaudited. ``details`` names the operation and whether its effect
+    was applied or rolled back; never a secret, an identifier of document content, or the underlying error text.
+    """
+
+    status_code = 503
+
+    def __init__(self, operation: str, effect: str = "rolled_back", request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="The audit trail is unavailable; the operation could not be recorded.",
+            code="AUDIT_UNAVAILABLE",
+            status_code=503,
+            request_id=request_id,
+            details={"operation": operation, "effect": effect},
+        )
+        self.operation = operation
+        self.effect = effect
+
+
 # Status code mapping for existing DocumentExtractorError hierarchy and PRD §19
 _STATUS_CODE_MAP: Dict[Any, int] = {
     AuthenticationRequiredError: 401,

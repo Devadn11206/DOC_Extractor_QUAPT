@@ -81,8 +81,8 @@ def test_the_message_names_the_port_but_no_document_content(client):
     assert "QueueProducer" in message
 
 
-def test_an_unconfigured_authentication_provider_keeps_its_existing_failure_mode():
-    """Not part of this change: the auth provider is not an infrastructure port and stays 500 AUTH_PROVIDER_UNCONFIGURED."""
+def test_an_unconfigured_authentication_provider_is_a_typed_503_that_fails_closed():
+    """The authentication provider is a port too: no principal is ever invented, and the answer is typed."""
     app = create_app(ApiSettings(app_env="development"))
 
     @app.get("/probe/guarded")
@@ -90,4 +90,6 @@ def test_an_unconfigured_authentication_provider_keeps_its_existing_failure_mode
         return {}
 
     response = TestClient(app, raise_server_exceptions=False).get("/probe/guarded", headers={"Authorization": "Bearer x"})
-    assert (response.status_code, response.json()["error"]["code"]) == (500, "AUTH_PROVIDER_UNCONFIGURED")
+    error = response.json()["error"]
+    assert response.status_code == 503 and error["code"] == "SERVICE_UNAVAILABLE"
+    assert error["details"] == {"port": "AuthenticationProvider"}

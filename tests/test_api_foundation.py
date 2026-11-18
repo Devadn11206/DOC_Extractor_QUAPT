@@ -522,14 +522,15 @@ def test_validation_error_envelope(client: TestClient):
 
 @pytest.mark.security
 def test_auth_unconfigured_provider_fails_closed():
-    """Verify that an app with no auth provider configured fails closed with 500 AUTH_PROVIDER_UNCONFIGURED."""
+    """An app with no auth provider configured fails closed with a typed 503 naming the port (never a bare 500)."""
     raw_app = create_app()
     raw_app.include_router(sample_router)
     c = TestClient(raw_app, raise_server_exceptions=False)
     response = c.get("/test/guarded-scope", headers={"Authorization": "Bearer some-token"})
-    assert response.status_code == 500
+    assert response.status_code == 503
     data = response.json()
-    assert data["error"]["code"] == "AUTH_PROVIDER_UNCONFIGURED"
+    assert data["error"]["code"] == "SERVICE_UNAVAILABLE"
+    assert data["error"]["details"] == {"port": "AuthenticationProvider"}
 
 
 @pytest.mark.security
