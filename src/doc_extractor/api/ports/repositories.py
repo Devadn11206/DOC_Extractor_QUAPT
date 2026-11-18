@@ -11,10 +11,10 @@ Adheres to:
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
+from doc_extractor.models import DocumentRecord, DocumentStatus, IngestionState
 from doc_extractor.api.contracts.records import (
     ApiKeyRecord,
     AuditEventRecord,
-    DocumentRecord,
     ReviewTaskRecord,
     WebhookDeliveryRecord,
     WebhookSubscriptionRecord,
@@ -23,32 +23,43 @@ from doc_extractor.api.contracts.records import (
 
 @runtime_checkable
 class DocumentMetadataRepository(Protocol):
-    """Repository port for persisting and querying document metadata."""
+    """
+    Repository port for the durable document records.
+
+    The record type is Module A's canonical ``doc_extractor.models.DocumentRecord`` (frozen; the SCH-012 status and the
+    internal ingestion state live there). The API never keeps a competing document model: HTTP responses are built
+    with ``DocumentResource.from_record``. Implementations (Team Member 3) MUST scope every call by ``tenant_id`` and
+    treat a record of another tenant as absent (SEC-006: 404, never 403).
+    """
 
     async def get_by_id(self, tenant_id: str, document_id: str) -> Optional[DocumentRecord]:
-        """Retrieve a single document metadata record scoped strictly to the tenant."""
+        """Retrieve a single document record scoped strictly to the tenant."""
         ...
 
     async def create(self, tenant_id: str, record: DocumentRecord) -> DocumentRecord:
-        """Persist a new document metadata record."""
+        """Persist a new document record; ``record.tenant_id`` must equal ``tenant_id``."""
         ...
 
     async def update_status(
         self,
         tenant_id: str,
         document_id: str,
-        status: str,
-        error_details: Optional[Dict[str, Any]] = None,
-        storage_path: Optional[str] = None,
+        status: DocumentStatus,
+        internal_state: Optional[IngestionState] = None,
+        error: Optional[Dict[str, Any]] = None,
         page_count: Optional[int] = None,
     ) -> Optional[DocumentRecord]:
-        """Update processing status and error diagnostics for a document."""
+        """
+        Move a document to a new SCH-012 status (the legal moves are ``doc_extractor.models.VALID_STATUS_TRANSITIONS``)
+        and return the updated record, or None when the tenant has no such document. ``error`` is the API-010 error
+        dict of Module A (code, message, request_id, details).
+        """
         ...
 
     async def list_by_tenant(
         self,
         tenant_id: str,
-        status: Optional[str] = None,
+        status: Optional[DocumentStatus] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> List[DocumentRecord]:

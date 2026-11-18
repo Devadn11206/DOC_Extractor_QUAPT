@@ -28,11 +28,12 @@ from pydantic import BaseModel, Field
 from doc_extractor.api.app import create_app
 from doc_extractor.api.config import ApiSettings, load_api_settings
 from doc_extractor.api.contracts.errors import ErrorEnvelope
+from doc_extractor.models import DocumentRecord, DocumentStatus, IngestionState
 from doc_extractor.api.contracts.records import (
     ApiKeyRecord,
     AuditEventRecord,
     DocumentProcessingMessage,
-    DocumentRecord,
+    DocumentResource,
     QueueEnvelope,
     ReviewTaskRecord,
     WebhookDeliveryRecord,
@@ -537,13 +538,16 @@ def test_record_models_reject_extra_fields():
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        DocumentRecord(
+        DocumentResource(
             document_id="doc_1",
-            tenant_id="tenant_1",
+            status=DocumentStatus.PROCESSING,
             filename="doc.pdf",
             mime_type="application/pdf",
             file_size_bytes=100,
-            sha256_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            page_count=1,
+            sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
             # pyrefly: ignore[unexpected-keyword]
             unexpected_injection_field="malicious",
         )
@@ -774,7 +778,7 @@ def test_principal_m4_interoperability():
 # ============================================================================
 
 class MockDocumentMetadataRepo:
-    """Mock fulfilling DocumentMetadataRepository protocol."""
+    """Mock fulfilling DocumentMetadataRepository, over Module A's canonical (frozen) DocumentRecord."""
 
     def __init__(self):
         self._store: Dict[str, DocumentRecord] = {}
@@ -793,30 +797,32 @@ class MockDocumentMetadataRepo:
         self,
         tenant_id: str,
         document_id: str,
-        status: str,
-        error_details: Optional[Dict[str, Any]] = None,
-        storage_path: Optional[str] = None,
+        status: DocumentStatus,
+        internal_state: Optional[IngestionState] = None,
+        error: Optional[Dict[str, Any]] = None,
         page_count: Optional[int] = None,
     ) -> Optional[DocumentRecord]:
+        import dataclasses
         rec = await self.get_by_id(tenant_id, document_id)
         if not rec:
             return None
-        updated = rec.model_copy(update={
-            "status": status,
-            "error_details": error_details,
-            "updated_at": datetime.now(timezone.utc),
-        })
+        changes: Dict[str, Any] = {"status": status, "error": error, "updated_at": datetime.now(timezone.utc).isoformat()}
+        if internal_state is not None:
+            changes["internal_state"] = internal_state
+        if page_count is not None:
+            changes["page_count"] = page_count
+        updated = dataclasses.replace(rec, **changes)
         self._store[document_id] = updated
         return updated
 
     async def list_by_tenant(
         self,
         tenant_id: str,
-        status: Optional[str] = None,
+        status: Optional[DocumentStatus] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> List[DocumentRecord]:
-        return [r for r in self._store.values() if r.tenant_id == tenant_id]
+        return [r for r in self._store.values() if r.tenant_id == tenant_id and (status is None or r.status == status)]
 
     async def delete(self, tenant_id: str, document_id: str) -> bool:
         if document_id in self._store and self._store[document_id].tenant_id == tenant_id:
@@ -880,16 +886,22 @@ def test_repository_protocol_contracts():
 
 @pytest.mark.unit
 def test_document_metadata_repository_operations():
-    """Verify DocumentRecord model validation and basic repository operations."""
+    """Verify the port works over Module A's canonical DocumentRecord and keeps tenants apart."""
     async def _run():
         repo = MockDocumentMetadataRepo()
+        now = datetime.now(timezone.utc).isoformat()
         doc = DocumentRecord(
             document_id="doc_123456",
             tenant_id="tenant_alpha",
-            filename="invoice.pdf",
-            mime_type="application/pdf",
+            file_hash_sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            claimed_filename="invoice.pdf",
             file_size_bytes=1024,
-            sha256_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            page_count=1,
+            mime_type="application/pdf",
+            status=DocumentStatus.PROCESSING,
+            internal_state=IngestionState.QUEUED,
+            created_at=now,
+            updated_at=now,
         )
         created = await repo.create("tenant_alpha", doc)
         assert created.document_id == "doc_123456"

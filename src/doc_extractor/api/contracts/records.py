@@ -9,35 +9,69 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from doc_extractor.models import DocumentRecord as ModuleADocumentRecord
+from doc_extractor.models import DocumentStatus
+
 
 def utc_now() -> datetime:
     """Helper returning timezone-aware current UTC time."""
     return datetime.now(timezone.utc)
 
 
-class DocumentRecord(BaseModel):
-    """Metadata record for an ingested/processed document."""
-    model_config = ConfigDict(extra="forbid")
+class DocumentResource(BaseModel):
+    """
+    API RESPONSE DTO for one document (API-002 / API-015). It is NOT a domain model and NOT persisted.
 
-    document_id: str = Field(..., min_length=1, description="Unique document identifier")
-    tenant_id: str = Field(..., min_length=1, description="Owning tenant identifier")
-    status: str = Field(default="queued", description="Processing lifecycle status (SCH-012)")
-    filename: str = Field(..., min_length=1, description="Original filename without path")
-    mime_type: str = Field(..., description="Verified MIME type")
-    file_size_bytes: int = Field(..., ge=0, description="Size of file in bytes")
-    page_count: int = Field(default=0, ge=0, description="Total number of pages rendered")
-    sha256_hash: str = Field(..., min_length=64, max_length=64, description="Cryptographic SHA-256 hash")
-    created_at: datetime = Field(default_factory=utc_now, description="UTC ingestion timestamp")
-    updated_at: datetime = Field(default_factory=utc_now, description="UTC last-update timestamp")
-    storage_path: Optional[str] = Field(None, description="Tenant-isolated relative filesystem path")
-    schema_id: Optional[str] = Field(None, description="Associated extraction schema ID")
-    schema_version: Optional[str] = Field(None, description="Associated schema version")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Redacted, non-PII metadata")
-    error_details: Optional[Dict[str, Any]] = Field(None, description="Error diagnostics if failed")
+    The canonical, durable record of a document is Module A's ``doc_extractor.models.DocumentRecord`` (written at
+    ingestion, with the SCH-012 status and the internal ingestion state). This DTO is mapped from it with
+    ``from_record`` and deliberately omits ``tenant_id`` and ``internal_state`` (never exposed) and reduces the error to
+    its code and message (API-011: no details). There is no second document model: add a field to Module A's record
+    first (for example document type and schema binding, PRD section 20), then to this DTO.
+    """
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    document_id: str = Field(..., min_length=1)
+    status: DocumentStatus = Field(..., description="SCH-012 status as Module A defines it (queued / rejected_malware: PRD decision D4)")
+    filename: str = Field(..., min_length=1, description="The filename the client claimed, without path")
+    mime_type: str
+    file_size_bytes: int = Field(..., ge=0)
+    page_count: int = Field(..., ge=0)
+    sha256: str = Field(..., min_length=64, max_length=64)
+    created_at: datetime
+    updated_at: datetime
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+    @classmethod
+    def from_record(cls, record: ModuleADocumentRecord) -> "DocumentResource":
+        """Map Module A's canonical record to the response shape."""
+        if not isinstance(record, ModuleADocumentRecord):
+            raise TypeError("DocumentResource is mapped from Module A's doc_extractor.models.DocumentRecord")
+        error = record.error or {}
+        return cls(
+            document_id=record.document_id,
+            status=record.status,
+            filename=record.claimed_filename,
+            mime_type=record.mime_type,
+            file_size_bytes=record.file_size_bytes,
+            page_count=record.page_count,
+            sha256=record.file_hash_sha256,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            error_code=error.get("code"),
+            error_message=error.get("message"),
+        )
 
 
 class ReviewTaskRecord(BaseModel):
-    """Human-in-the-loop review task record for the extraction workbench."""
+    """
+    Human-in-the-loop review task (FR-REV, API-005, API-016). The review domain's OWN entity: no authoritative model
+    of a review task exists elsewhere (Module B's ``ReviewerOverrideRequest`` is a one-shot document-type override,
+    not a task with an owner and a life cycle), so this is not a duplicate.
+
+    PROVISIONAL: the status vocabulary below mixes task state with document outcome and the PRD does not yet define
+    task states (decision D11); it is expected to change before any adapter persists it.
+    """
     model_config = ConfigDict(extra="forbid")
 
     task_id: str = Field(..., min_length=1, description="Unique review task identifier")
@@ -190,7 +224,11 @@ class WebhookDeliveryRecord(BaseModel):
 
 
 class AuditEventRecord(BaseModel):
-    """Structured audit trail event record (SEC-012, no PII/PHI)."""
+    """
+    One platform audit event (SEC-008/SEC-012: identifiers and codes only). Distinct from M4's ``LifecycleEvent``,
+    which records schema-lifecycle transitions inside the schema domain; both feed the audit store (owner:
+    Team Member 3), neither replaces the other.
+    """
     model_config = ConfigDict(extra="forbid")
 
     event_id: str = Field(..., min_length=1, description="Unique audit event identifier")
@@ -207,8 +245,12 @@ class AuditEventRecord(BaseModel):
 
 class DocumentProcessingMessage(BaseModel):
     """
-    Durable typed message payload for asynchronous document processing (ARC-003).
-    Correlates document_id, tenant_id, and event_id with idempotency and retry semantics.
+    Durable JOB message: "process this document" travelling API -> broker -> worker (ARC-003). It carries identifiers
+    and execution options only, never page images or extraction content, and it survives restarts and redelivery.
+
+    It is NOT Module A's stage hand-off. ``doc_extractor.handoff.ModuleAHandoffPayload`` is the in-process result of
+    Module A's ingestion, passed to Module B within one pipeline run (``QueueAdapter``, in-memory), and carries the
+    page geometry. A job message refers to a document by id; the worker reads the persisted hand-off by that id.
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -225,7 +267,7 @@ class DocumentProcessingMessage(BaseModel):
 
 
 class QueueEnvelope(BaseModel):
-    """Wrapper envelope returned by queue consumers holding lease and receipt handle."""
+    """Delivery wrapper of a durable job message: lease and receipt handle for ack/nack (ARC-003). Broker-facing only."""
     model_config = ConfigDict(extra="forbid")
 
     receipt_handle: str = Field(..., min_length=1, description="Opaque lease/receipt handle for ack/nack")
