@@ -28,15 +28,9 @@ from doc_extractor.exceptions import (
 
 # Import approved M4 schema lifecycle exceptions for canonical HTTP mapping
 try:
-    from schema_lifecycle.exceptions import (
-        SchemaNotApprovedError,
-        SchemaNotFoundError,
-        SchemaValidationError,
-    )
+    from schema_lifecycle import exceptions as _m4
 except ImportError:  # pragma: no cover
-    SchemaNotApprovedError = None
-    SchemaNotFoundError = None
-    SchemaValidationError = None
+    _m4 = None
 
 
 class ApiHttpError(DocumentExtractorError):
@@ -296,21 +290,45 @@ _STATUS_CODE_MAP: Dict[Any, int] = {
     DocumentProcessingError: 500,
 }
 
-if SchemaNotApprovedError is not None:
-    _STATUS_CODE_MAP[SchemaNotApprovedError] = 409  # PRD §19: 409 SCHEMA_NOT_APPROVED
-if SchemaNotFoundError is not None:
-    _STATUS_CODE_MAP[SchemaNotFoundError] = 404
-if SchemaValidationError is not None:
-    _STATUS_CODE_MAP[SchemaValidationError] = 422
+# M4 schema-lifecycle exceptions: every class has an explicit HTTP status. Each keeps its OWN domain code
+# (UNAUTHENTICATED, FORBIDDEN, SCHEMA_SELF_APPROVAL, ... are already the PRD section 19 names); only the
+# status was missing, which made them answer HTTP 500. Keyed by class name so a missing M4 package only
+# skips the mapping. tests/test_api_m4_exception_mapping.py fails when M4 gains an unmapped exception.
+_M4_STATUS_BY_CLASS_NAME: Dict[str, int] = {
+    "SchemaLifecycleError": 400,             # generic lifecycle failure (fallback for the base class)
+    "SchemaValidationError": 422,            # SCH-001/002 metamodel violation
+    "SchemaSerializationError": 422,         # SCH-003 unparseable schema document
+    "SchemaVersionError": 422,               # unparseable or invalid version
+    "InvalidStateTransitionError": 409,      # SCH-004 transition not allowed from the current state
+    "SchemaPromotionNotAllowedError": 409,   # promotion without the approval service
+    "SchemaNotApprovedError": 409,           # PRD section 19: 409 SCHEMA_NOT_APPROVED
+    "SchemaNotFoundError": 404,
+    "SchemaRollbackError": 422,              # SCH-006 rollback targets an invalid version
+    "TenantAccessError": 403,                # cross-tenant ID guessing returns 404 through tenant-scoped lookups
+    "UnauthenticatedError": 401,             # PRD section 19: 401 UNAUTHENTICATED
+    "ForbiddenActionError": 403,             # PRD section 19: 403 FORBIDDEN
+    "SchemaSelfApprovalError": 403,          # PRD section 19: 403 SCHEMA_SELF_APPROVAL
+    "BenchmarkVerificationError": 422,       # SCH-005/007 harness result does not qualify
+}
+
+if _m4 is not None:
+    for _name, _status in _M4_STATUS_BY_CLASS_NAME.items():
+        _cls = getattr(_m4, _name, None)
+        if _cls is not None:
+            _STATUS_CODE_MAP[_cls] = _status
 
 
 def get_status_code_for_exception(exc: Exception) -> int:
-    """Derive HTTP status code from exception class hierarchy."""
+    """
+    Derive the HTTP status for an exception: an explicit ``status_code`` first, then the nearest class in
+    the exception's MRO that has a mapping (so a subclass such as ``SchemaSelfApprovalError`` is never
+    shadowed by its parent), else 500.
+    """
     if hasattr(exc, "status_code") and isinstance(exc.status_code, int):
         return exc.status_code
-    for exc_cls, code in _STATUS_CODE_MAP.items():
-        if isinstance(exc, exc_cls):
-            return code
+    for exc_cls in type(exc).__mro__:
+        if exc_cls in _STATUS_CODE_MAP:
+            return _STATUS_CODE_MAP[exc_cls]
     return 500
 
 
