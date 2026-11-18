@@ -30,6 +30,8 @@ ENV_VARIABLES: Dict[str, str] = {
 }
 _LIST_FIELDS = frozenset({"cors_origins"})
 ENV_PREFIX = "DOC_API_"
+ENVIRONMENT_VARIABLE = "DOC_API_ENV"
+ENVIRONMENT_CHOICES = ("development", "staging", "production")
 
 
 def settings_from_environment(environ: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
@@ -147,11 +149,23 @@ def load_api_settings(env_overrides: Optional[Dict[str, Any]] = None) -> ApiSett
     Values come from the ``DOC_API_*`` environment variables (``settings_from_environment``); ``env_overrides`` passed in
     code win over the environment.
 
+    The deployment environment is NEVER assumed: ``DOC_API_ENV`` (or an explicit ``app_env`` passed in code) is required,
+    so a deployment that forgot to set it stops at start-up instead of silently running as ``development`` (interactive
+    docs on, permissive guards). Code that builds ``ApiSettings(app_env=...)`` itself, as the tests do, is unaffected.
+
     Raises:
-        ConfigurationError: When the environment or the supplied settings fail validation.
+        ConfigurationError: When the environment or the supplied settings fail validation, or no environment is named.
     """
     try:
         data = {**settings_from_environment(), **(env_overrides or {})}
+        if "app_env" not in data:
+            raise ConfigurationError(
+                message=(
+                    f"{ENVIRONMENT_VARIABLE} is not set. Set it explicitly to one of {', '.join(ENVIRONMENT_CHOICES)}: "
+                    "the API never assumes an environment."
+                ),
+                details={"variable": ENVIRONMENT_VARIABLE, "allowed": list(ENVIRONMENT_CHOICES)},
+            )
         return ApiSettings(**data)
     except ConfigurationError:
         raise                                       # already typed (unknown/empty DOC_API_* variable): keep its details

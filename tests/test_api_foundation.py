@@ -253,7 +253,7 @@ def client(test_app: FastAPI) -> TestClient:
 @pytest.mark.unit
 def test_app_initialization_defaults():
     """Verify application factory initializes correctly with default configuration."""
-    app = create_app()
+    app = create_app(ApiSettings(app_env="development"))
     assert app.title == "Document Extraction Engine REST API"
     assert app.version == "1.0.0"
     assert app.docs_url == "/docs"
@@ -288,14 +288,14 @@ def test_production_debug_guard():
 def test_production_egress_guard():
     """Ensure external egress is strictly rejected per ARC-001/SEC-011."""
     with pytest.raises(ConfigurationError) as exc_info:
-        load_api_settings({"allow_external_egress": True})
+        load_api_settings({"app_env": "development", "allow_external_egress": True})
     assert "External egress (allow_external_egress=True) violates ARC-001/SEC-011" in str(exc_info.value)
 
 
 @pytest.mark.unit
 def test_app_lifespan():
     """Verify application startup and shutdown lifespan execution."""
-    app = create_app()
+    app = create_app(ApiSettings(app_env="development"))
     with TestClient(app) as test_client:
         response = test_client.get("/health")
         assert response.status_code == 200
@@ -523,7 +523,7 @@ def test_validation_error_envelope(client: TestClient):
 @pytest.mark.security
 def test_auth_unconfigured_provider_fails_closed():
     """An app with no auth provider configured fails closed with a typed 503 naming the port (never a bare 500)."""
-    raw_app = create_app()
+    raw_app = create_app(ApiSettings(app_env="development"))
     raw_app.include_router(sample_router)
     c = TestClient(raw_app, raise_server_exceptions=False)
     response = c.get("/test/guarded-scope", headers={"Authorization": "Bearer some-token"})
@@ -1017,7 +1017,7 @@ def test_durable_queue_lifecycle():
 @pytest.mark.unit
 def test_openapi_generation():
     """Verify OpenAPI 3.x schema generation conforms to standards."""
-    app = create_app()
+    app = create_app(ApiSettings(app_env="development"))
     openapi_spec = app.openapi()
     assert openapi_spec["openapi"].startswith("3.")
     assert openapi_spec["info"]["title"] == "Document Extraction Engine REST API"
@@ -1296,7 +1296,7 @@ def test_audit_logger_serialization_resilience():
 def test_cors_rejects_wildcard_with_credentials_in_settings():
     """Ensure ApiSettings rejects wildcard origin ('*') combined with allow_credentials=True."""
     with pytest.raises(ConfigurationError) as exc_info:
-        load_api_settings({"cors_origins": ["*"], "cors_allow_credentials": True})
+        load_api_settings({"app_env": "development", "cors_origins": ["*"], "cors_allow_credentials": True})
     assert "Wildcard CORS origin ('*') cannot be combined with credentials" in str(exc_info.value)
 
 

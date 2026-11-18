@@ -53,7 +53,8 @@ def create_app(settings: Optional[ApiSettings] = None) -> FastAPI:
     Application factory building the FastAPI HTTP application.
 
     Args:
-        settings: Optional pre-loaded ApiSettings. If omitted, loaded from environment.
+        settings: Optional pre-loaded ApiSettings. If omitted, loaded from the environment, where DOC_API_ENV is REQUIRED
+        (there is no default environment; see ``load_api_settings``).
 
     Returns:
         Configured FastAPI instance with middleware, routes, and exception handlers.

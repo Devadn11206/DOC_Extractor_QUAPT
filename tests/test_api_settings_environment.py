@@ -50,7 +50,8 @@ def test_values_are_read_from_the_environment(monkeypatch):
     assert settings.api_prefix == "/api/v2" and settings.log_level == "WARNING"
 
 
-def test_nothing_set_keeps_the_development_defaults():
+def test_an_explicit_development_environment_keeps_the_development_defaults(monkeypatch):
+    monkeypatch.setenv("DOC_API_ENV", "development")
     settings = load_api_settings()
     assert settings.app_env == "development" and settings.docs_url == "/docs" and settings.cors_origins == []
 
@@ -63,7 +64,8 @@ def test_explicit_values_passed_in_code_win_over_the_environment(monkeypatch):
 def test_unrelated_doc_variables_are_ignored(monkeypatch):
     for name in ("DOC_MAX_PAGES", "DOC_DEFAULT_MODEL", "DOC_APP_ENV", "DOC_DEBUG"):
         monkeypatch.setenv(name, "production" if "ENV" in name else "1")
-    assert load_api_settings().app_env == "development"        # only the DOC_API_ allow-list is read
+    monkeypatch.setenv("DOC_API_ENV", "staging")
+    assert load_api_settings().app_env == "staging"            # only the DOC_API_ allow-list is read: DOC_APP_ENV=production is ignored
 
 
 # -- failing closed ---------------------------------------------------------------------------------
@@ -76,6 +78,7 @@ def test_an_unknown_doc_api_variable_is_refused_so_a_typo_cannot_leave_the_api_i
 
 
 def test_create_app_refuses_to_start_on_a_typo_too(monkeypatch):
+    monkeypatch.setenv("DOC_API_ENV", "development")
     monkeypatch.setenv("DOC_API_DOCS_ENABELD", "false")
     with pytest.raises(ConfigurationError):
         create_app()
@@ -152,6 +155,7 @@ def test_staging_can_opt_in_explicitly(monkeypatch):
 
 
 def test_development_can_switch_documentation_off(monkeypatch):
+    monkeypatch.setenv("DOC_API_ENV", "development")
     monkeypatch.setenv("DOC_API_DOCS_ENABLED", "false")
     assert doc_urls(TestClient(create_app())) == (404, 404, 404)
 
@@ -184,3 +188,63 @@ def test_readme_names_the_production_switch_and_the_default_posture():
     from pathlib import Path
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     assert "DOC_API_ENV=production uvicorn --factory" in readme and "development" in readme
+
+
+# -- the environment is never assumed (review finding R8) -----------------------------------------------------------------
+
+def test_an_unset_environment_is_refused_instead_of_defaulting_to_development():
+    with pytest.raises(ConfigurationError) as exc:
+        load_api_settings()
+    assert "DOC_API_ENV" in exc.value.message and "never assumes" in exc.value.message
+    assert exc.value.details == {"variable": "DOC_API_ENV", "allowed": ["development", "staging", "production"]}
+
+
+def test_create_app_without_settings_and_without_an_environment_refuses_to_start():
+    with pytest.raises(ConfigurationError):
+        create_app()
+
+
+def test_other_api_variables_do_not_substitute_for_the_environment(monkeypatch):
+    monkeypatch.setenv("DOC_API_DEBUG", "false")
+    monkeypatch.setenv("DOC_API_DOCS_ENABLED", "true")             # would be the dangerous combination if development were assumed
+    with pytest.raises(ConfigurationError):
+        load_api_settings()
+
+
+def test_the_settings_dependency_fails_closed_too_when_no_environment_is_set():
+    with pytest.raises(ConfigurationError):
+        api_config.get_api_settings()
+
+
+def test_an_explicit_app_env_passed_in_code_is_a_sufficient_declaration():
+    assert load_api_settings({"app_env": "production"}).app_env == "production"
+    assert ApiSettings(app_env="development").docs_url == "/docs"   # direct construction (tests) stays explicit and unaffected
+
+
+def test_a_failed_environment_load_is_not_cached(monkeypatch):
+    with pytest.raises(ConfigurationError):
+        api_config.get_api_settings()
+    monkeypatch.setenv("DOC_API_ENV", "production")
+    assert api_config.get_api_settings().app_env == "production"
+
+
+# -- development documentation is off in production, however it is asked for ---------------------------------------------
+
+@pytest.mark.parametrize("kwargs", [
+    {}, {"docs_url": "/docs"}, {"redoc_url": "/redoc"}, {"openapi_url": "/openapi.json"},
+    {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}, {"docs_enabled": None, "docs_url": "/api-docs"},
+    {"docs_enabled": False, "docs_url": "/docs"},
+])
+def test_production_serves_no_documentation_whatever_the_url_settings(kwargs):
+    settings = ApiSettings(app_env="production", **kwargs)
+    assert (settings.docs_url, settings.redoc_url, settings.openapi_url) == (None, None, None)
+    client = TestClient(create_app(settings))
+    assert doc_urls(client) == (404, 404, 404) and client.get("/api-docs").status_code == 404
+
+
+def test_production_from_the_environment_serves_no_documentation_even_with_every_other_variable_set(monkeypatch):
+    monkeypatch.setenv("DOC_API_ENV", "production")
+    monkeypatch.setenv("DOC_API_DEBUG", "false")
+    monkeypatch.setenv("DOC_API_PREFIX", "/api/v1")
+    monkeypatch.setenv("DOC_API_CORS_ORIGINS", "https://app.example.com")
+    assert doc_urls(TestClient(create_app())) == (404, 404, 404)
