@@ -22,6 +22,9 @@ tomllib = pytest.importorskip("tomllib" if sys.version_info >= (3, 11) else "tom
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
+# Packages shipped by this distribution (src/): never third-party. engine_errors is the shared error-base leaf.
+FIRST_PARTY = ("doc_extractor", "schema_lifecycle", "engine_errors")
+
 # import name -> distribution name (only where they differ)
 DIST_OF_MODULE = {
     "PIL": "pillow",
@@ -67,7 +70,7 @@ def _third_party_imports():
                 mods = [node.module]
             for mod in mods:
                 top = mod.split(".")[0]
-                if top not in std and top not in ("doc_extractor", "schema_lifecycle"):
+                if top not in std and top not in FIRST_PARTY:
                     found.setdefault(top, str(path.relative_to(ROOT)))
     return found
 
@@ -172,3 +175,9 @@ def test_the_api_extra_leaves_the_existing_groups_unchanged():
     assert {_name(d) for d in extras["ui"]} == {"gradio"}
     assert {_name(d) for d in extras["ocr"]} == {"pytesseract"}
     assert {_name(d) for d in extras["dev"]} == {"pytest", "pytest-cov", "httpx"}
+
+
+def test_every_first_party_package_in_src_is_declared_as_first_party_and_vice_versa():
+    """A new top-level package under src/ must be listed in FIRST_PARTY, or its imports would count as third-party."""
+    packages = {p.name for p in (ROOT / "src").iterdir() if p.is_dir() and (p / "__init__.py").exists()}
+    assert packages == set(FIRST_PARTY)

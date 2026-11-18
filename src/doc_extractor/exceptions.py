@@ -9,50 +9,8 @@ Adheres to:
 
 from typing import Any, Dict, Optional
 
-
-class DocumentExtractorError(Exception):
-    """
-    Base exception for all Document Extraction Engine errors.
-    
-    Ensures safe error formatting:
-    1. Holds machine-readable standard error codes.
-    2. Enforces that messages do not expose document content or PII.
-    3. Formats to the PRD standard error envelope.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        code: str = "INTERNAL_ERROR",
-        request_id: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.code = code
-        self.request_id = request_id
-        self.details = details or {}
-
-    def to_envelope(self) -> Dict[str, Any]:
-        """
-        Return the standardized error envelope required by PRD API-010:
-        {
-            "error": {
-                "code": "...",
-                "message": "...",
-                "request_id": "...",
-                "details": { ... }
-            }
-        }
-        """
-        return {
-            "error": {
-                "code": self.code,
-                "message": self.message,
-                "request_id": self.request_id,
-                "details": self.details,
-            }
-        }
+# One shared base for Module A and M4 (see engine_errors): a re-export, not a copy.
+from engine_errors import DocumentExtractorError  # noqa: F401
 
 
 class ConfigurationError(DocumentExtractorError):

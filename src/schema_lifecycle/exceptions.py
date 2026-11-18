@@ -5,33 +5,9 @@ Conforms to PRD §7.2 API-010 error envelopes and API-011 (no PII in errors).
 
 from typing import Any, Dict, List, Optional
 
-try:
-    from doc_extractor.exceptions import DocumentExtractorError
-except ImportError:
-    class DocumentExtractorError(Exception):  # pragma: no cover
-        """Fallback base exception when doc_extractor is not in pythonpath."""
-        def __init__(
-            self,
-            message: str,
-            code: str = "INTERNAL_ERROR",
-            request_id: Optional[str] = None,
-            details: Optional[Dict[str, Any]] = None,
-        ) -> None:
-            super().__init__(message)
-            self.message = message
-            self.code = code
-            self.request_id = request_id
-            self.details = details or {}
-
-        def to_envelope(self) -> Dict[str, Any]:
-            return {
-                "error": {
-                    "code": self.code,
-                    "message": self.message,
-                    "request_id": self.request_id,
-                    "details": self.details,
-                }
-            }
+# The shared base lives in a leaf package so importing this module never imports doc_extractor (which
+# imports schema_lifecycle back). It used to fall back to a private copy of the class on ImportError.
+from engine_errors import DocumentExtractorError
 
 
 class SchemaLifecycleError(DocumentExtractorError):

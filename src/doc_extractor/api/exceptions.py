@@ -27,10 +27,7 @@ from doc_extractor.exceptions import (
 )
 
 # Import approved M4 schema lifecycle exceptions for canonical HTTP mapping
-try:
-    from schema_lifecycle import exceptions as _m4
-except ImportError:  # pragma: no cover
-    _m4 = None
+from schema_lifecycle import exceptions as _m4  # same distribution: a failed import must fail loudly
 
 
 class ApiHttpError(DocumentExtractorError):
@@ -335,11 +332,8 @@ _M4_STATUS_BY_CLASS_NAME: Dict[str, int] = {
     "BenchmarkVerificationError": 422,       # SCH-005/007 harness result does not qualify
 }
 
-if _m4 is not None:
-    for _name, _status in _M4_STATUS_BY_CLASS_NAME.items():
-        _cls = getattr(_m4, _name, None)
-        if _cls is not None:
-            _STATUS_CODE_MAP[_cls] = _status
+for _name, _status in _M4_STATUS_BY_CLASS_NAME.items():
+    _STATUS_CODE_MAP[getattr(_m4, _name)] = _status      # AttributeError if M4 renames a class: loud, not silent
 
 
 def get_status_code_for_exception(exc: Exception) -> int:

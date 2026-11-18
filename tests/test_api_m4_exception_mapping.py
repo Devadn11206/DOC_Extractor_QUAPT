@@ -114,3 +114,80 @@ def test_existing_non_m4_mappings_are_unchanged():
     assert get_status_code_for_exception(ScannerUnavailableError("x")) == 503
     assert get_status_code_for_exception(StorageError("x")) == 500
     assert get_status_code_for_exception(ValueError("not a domain error")) == 500
+
+
+# -- M1: the mapping must not depend on which package is imported first -----------------------------
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+
+# The six cases that answered 500 INTERNAL_ERROR when schema_lifecycle was imported before doc_extractor.
+PREVIOUSLY_FAILING_SIX = {
+    "SchemaSelfApprovalError": (403, "SCHEMA_SELF_APPROVAL"),
+    "ForbiddenActionError": (403, "FORBIDDEN"),
+    "UnauthenticatedError": (401, "UNAUTHENTICATED"),
+    "InvalidStateTransitionError": (409, "INVALID_STATE_TRANSITION"),
+    "SchemaNotApprovedError": (409, "SCHEMA_NOT_APPROVED"),
+    "SchemaNotFoundError": (404, "SCHEMA_NOT_FOUND"),
+}
+
+_PROBE = """
+import inspect, json
+from fastapi.testclient import TestClient
+from doc_extractor.api.app import create_app
+from doc_extractor.api.config import ApiSettings
+from schema_lifecycle import exceptions as m4
+
+def classes():
+    out, stack = [], [m4.SchemaLifecycleError]
+    while stack:
+        c = stack.pop(); out.append(c); stack.extend(c.__subclasses__())
+    return sorted(set(out), key=lambda c: c.__name__)
+
+def make(cls):
+    kw = {n: "x" for n, p in inspect.signature(cls.__init__).parameters.items()
+          if n != "self" and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD) and p.default is p.empty}
+    return cls(**kw)
+
+app = create_app(ApiSettings(app_env="development"))
+for cls in classes():
+    def route(cls=cls):
+        def handler(): raise make(cls)
+        return handler
+    app.get(f"/p/{cls.__name__}")(route())
+client = TestClient(app, raise_server_exceptions=False)
+print(json.dumps({c.__name__: [client.get(f"/p/{c.__name__}").status_code, client.get(f"/p/{c.__name__}").json()["error"]["code"]] for c in classes()}))
+"""
+
+_ORDERS = [
+    ("doc_extractor",),
+    ("schema_lifecycle",),
+    ("schema_lifecycle.exceptions",),
+    ("schema_lifecycle.metamodel",),
+    ("schema_lifecycle.manager", "doc_extractor.api"),
+]
+
+
+def _probe(order):
+    prelude = "".join(f"import {name}\n" for name in order)
+    env = {**os.environ, "PYTHONPATH": str(_ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
+    run = subprocess.run([sys.executable, "-c", prelude + _PROBE], capture_output=True, text=True, env=env, cwd=str(_ROOT))
+    assert run.returncode == 0, run.stderr[-800:]
+    return {name: tuple(value) for name, value in json.loads(run.stdout.strip().splitlines()[-1]).items()}
+
+
+@pytest.mark.parametrize("order", _ORDERS, ids=lambda o: ">".join(o))
+def test_every_m4_exception_maps_identically_in_every_import_order(order):
+    assert _probe(order) == EXPECTED
+
+
+@pytest.mark.parametrize("order", [("schema_lifecycle",), ("schema_lifecycle.exceptions",)], ids=lambda o: ">".join(o))
+def test_the_six_previously_failing_cases_now_return_their_status_and_domain_code(order):
+    seen = _probe(order)
+    for name, expected in PREVIOUSLY_FAILING_SIX.items():
+        assert seen[name] == expected, f"{name}: {seen[name]} != {expected} (schema_lifecycle imported first)"
