@@ -19,7 +19,13 @@ from fastapi.testclient import TestClient  # noqa: E402
 from doc_extractor.api.app import create_app  # noqa: E402
 from doc_extractor.api.config import ApiSettings  # noqa: E402
 from doc_extractor.api.exceptions import GENERIC_INTERNAL_MESSAGE, get_status_code_for_exception  # noqa: E402
-from doc_extractor.exceptions import TenantStorageIsolationError, TenantStorageUnavailableError  # noqa: E402
+from doc_extractor.exceptions import (  # noqa: E402
+    CrossTenantStorageAccessError,
+    InvalidTenantIdentifierError,
+    StorageError,
+    TenantStorageIsolationError,
+    TenantStorageUnavailableError,
+)
 from doc_extractor.storage import LocalDiskStorage  # noqa: E402
 
 ISOLATION_REASONS = [
@@ -121,3 +127,57 @@ def test_an_unwritable_root_over_http_is_generic_not_a_bare_500_with_os_text(tmp
     assert response.status_code == 500 and body_without_request_id(response) == GENERIC_BODY
     assert "reason=tenant_directory_not_creatable" in caplog.text
     assert "/private/server/layout" not in response.text and "/private/server/layout" not in caplog.text
+
+
+def test_a_generic_storage_error_with_path_answers_with_generic_internal_error(caplog):
+    app, client = build_client()
+
+    @app.get("/p/storage_fault")
+    def fault():
+        raise StorageError("Failed to persist document record: [Errno 13] Permission denied: '/private/etc/secrets/vault'")
+
+    with caplog.at_level(logging.DEBUG):
+        response = client.get("/p/storage_fault")
+    assert response.status_code == 500 and body_without_request_id(response) == GENERIC_BODY
+    assert "STORAGE_FAILED" in caplog.text
+    assert "/private/etc/secrets/vault" not in response.text
+    assert "/private/etc/secrets/vault" not in caplog.text
+
+
+def test_storage_error_details_are_not_disclosed_to_client():
+    app, client = build_client()
+
+    @app.get("/p/storage_details")
+    def fault():
+        raise StorageError("Storage failure", details={"document_id": "secret_doc_42", "file_path": "/var/data/leak"})
+
+    response = client.get("/p/storage_details")
+    assert response.status_code == 500 and body_without_request_id(response) == GENERIC_BODY
+    assert response.json()["error"]["details"] == {}
+    assert "secret_doc_42" not in response.text
+    assert "/var/data/leak" not in response.text
+
+
+def test_invalid_tenant_identifier_error_remains_422_with_typed_reason():
+    app, client = build_client()
+
+    @app.get("/p/invalid_tenant")
+    def invalid():
+        raise InvalidTenantIdentifierError("too_long")
+
+    response = client.get("/p/invalid_tenant")
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_TENANT_IDENTIFIER"
+    assert response.json()["error"]["details"] == {"reason": "too_long"}
+
+
+def test_cross_tenant_storage_access_error_remains_concealed_404():
+    app, client = build_client()
+
+    @app.get("/p/cross_tenant")
+    def cross():
+        raise CrossTenantStorageAccessError()
+
+    response = client.get("/p/cross_tenant")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "DOCUMENT_NOT_FOUND"

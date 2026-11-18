@@ -267,7 +267,7 @@ class LocalDiskStorage(StorageBackend):
             if temp_file.exists():
                 temp_file.unlink(missing_ok=True)
             raise StorageError(
-                message=f"Failed to persist page image: {str(exc)}",
+                message="Failed to persist page image.",
                 details={"document_id": document_id, "page_number": page_number},
             ) from exc
 
@@ -328,7 +328,7 @@ class LocalDiskStorage(StorageBackend):
             if temp_meta.exists():
                 temp_meta.unlink(missing_ok=True)
             raise StorageError(
-                message=f"Failed to persist preprocessed page artifact: {str(exc)}",
+                message="Failed to persist preprocessed page artifact.",
                 details={"document_id": document_id, "page_number": page_number},
             ) from exc
 
@@ -352,7 +352,7 @@ class LocalDiskStorage(StorageBackend):
                 return json.load(f)
         except Exception as exc:
             raise StorageError(
-                message=f"Failed to load transformation metadata: {str(exc)}",
+                message="Failed to load transformation metadata.",
                 details={"document_id": document_id, "page_number": page_number},
             ) from exc
 
@@ -445,7 +445,7 @@ class LocalDiskStorage(StorageBackend):
             if temp_file.exists():
                 temp_file.unlink(missing_ok=True)
             raise StorageError(
-                message=f"Failed to persist document record: {str(exc)}",
+                message="Failed to persist document record.",
                 details={"document_id": record.document_id},
             ) from exc
 
@@ -460,7 +460,7 @@ class LocalDiskStorage(StorageBackend):
                 return json.load(f)
         except Exception as exc:
             raise StorageError(
-                message=f"Failed to read document record: {str(exc)}",
+                message="Failed to read document record.",
                 details={"document_id": document_id},
             ) from exc
 
@@ -498,7 +498,7 @@ class LocalDiskStorage(StorageBackend):
             if temp_file.exists():
                 temp_file.unlink(missing_ok=True)
             raise StorageError(
-                message=f"Failed to persist handoff payload: {str(exc)}",
+                message="Failed to persist handoff payload.",
                 details={"document_id": payload.document_id},
             ) from exc
 
@@ -513,7 +513,7 @@ class LocalDiskStorage(StorageBackend):
                 return json.load(f)
         except Exception as exc:
             raise StorageError(
-                message=f"Failed to read handoff payload: {str(exc)}",
+                message="Failed to read handoff payload.",
                 details={"document_id": document_id},
             ) from exc
 

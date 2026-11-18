@@ -408,10 +408,10 @@ def concealed_not_found(exc: BaseException) -> Optional[Tuple[str, str]]:
 
 
 # Storage faults that are the OPERATOR's business, not the caller's: an isolation check failed (alias of another identity,
-# symlink, marker mismatch) or the storage root cannot be read or written. Their reason strings describe the server's
-# storage layout, and "directory_alias_collision" even hints that another identity's directory exists, so the client gets
+# symlink, marker mismatch), the storage root cannot be read or written, or a general storage failure occurred.
+# Their reason strings or messages describe the server's storage layout or internal paths, so the client gets
 # the same generic 500 as any internal fault (API-011). The reason is logged server-side only.
-_SERVER_SIDE_ONLY = (TenantStorageIsolationError, TenantStorageUnavailableError)
+_SERVER_SIDE_ONLY = (TenantStorageIsolationError, TenantStorageUnavailableError, StorageError)
 GENERIC_INTERNAL_MESSAGE = "An unexpected internal server error occurred."
 
 
@@ -550,7 +550,12 @@ async def document_extractor_error_handler(request: Request, exc: DocumentExtrac
         retry_after = sanitize_retry_after(exc.retry_after_seconds)
         if retry_after is not None:
             extra_headers["Retry-After"] = retry_after
-    if isinstance(exc, _SERVER_SIDE_ONLY):
+    concealed = concealed_not_found(exc)
+    if concealed is not None:                        # cross-tenant: same body as a missing resource, no details, no identifiers
+        return build_error_response(
+            code=concealed[0], message=concealed[1], status_code=404, request_id=req_id, details={}, headers=extra_headers
+        )
+    if isinstance(exc, _SERVER_SIDE_ONLY) and not isinstance(exc, InvalidTenantIdentifierError):
         # Diagnostics stay on the server: the machine-readable reason and the request id, never the tenant or any path.
         logger.error(
             "Storage fault answered with a generic 500: %s reason=%s request_id=%s",
@@ -558,11 +563,6 @@ async def document_extractor_error_handler(request: Request, exc: DocumentExtrac
         )
         return build_error_response(
             code="INTERNAL_ERROR", message=GENERIC_INTERNAL_MESSAGE, status_code=500, request_id=req_id, details={}
-        )
-    concealed = concealed_not_found(exc)
-    if concealed is not None:                        # cross-tenant: same body as a missing resource, no details, no identifiers
-        return build_error_response(
-            code=concealed[0], message=concealed[1], status_code=404, request_id=req_id, details={}, headers=extra_headers
         )
     return build_error_response(
         code=exc.code,
