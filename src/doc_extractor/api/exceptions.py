@@ -189,8 +189,14 @@ class FileTooLargeError(ApiHttpError):
         super().__init__(message=message, code=code, status_code=413, request_id=request_id, details=details)
 
 
-class ConflictError(ApiHttpError):
-    """Raised when a state conflict or idempotency fingerprint mismatch occurs (HTTP 409)."""
+class ApiConflictError(ApiHttpError):
+    """
+    Raised when a request conflicts with the current state of a resource (HTTP 409, code ``CONFLICT``).
+
+    NOT Module A's ``doc_extractor.exceptions.ConflictError`` (an idempotency key reused with a different request, code
+    ``IDEMPOTENCY_KEY_CONFLICT``), which is a different condition that also answers 409. The names used to be identical.
+    Both codes stay as they are until the owners decide M5-D01 (the PRD names ``IDEMPOTENCY_CONFLICT``).
+    """
 
     status_code = 409
 
@@ -322,6 +328,10 @@ class AuditUnavailableError(ApiHttpError):
         self.effect = effect
 
 
+# Backward-compatible name: importing ``ConflictError`` from this module still works and is the same class.
+ConflictError = ApiConflictError
+
+
 # Status code mapping for existing DocumentExtractorError hierarchy and PRD §19
 _STATUS_CODE_MAP: Dict[Any, int] = {
     AuthenticationRequiredError: 401,
@@ -330,7 +340,7 @@ _STATUS_CODE_MAP: Dict[Any, int] = {
     CrossTenantStorageAccessError: 404,   # idem
     NotFoundError: 404,
     TenantResourceNotFoundError: 404,
-    ConflictError: 409,
+    ApiConflictError: 409,
     IngestionConflictError: 409,
     UnsupportedFileError: 400,          # PRD §19: 400 UNSUPPORTED_FILE
     SecurityCheckFailedError: 400,

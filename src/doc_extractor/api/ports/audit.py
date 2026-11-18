@@ -27,22 +27,11 @@ from typing import Any, Dict, Optional, Protocol, runtime_checkable
 from uuid import uuid4
 
 from doc_extractor.api.contracts.records import AuditEventRecord
+from doc_extractor.models import DocumentStatus, IngestionState
 
-# Approved document lifecycle states (SCH-012, IngestionState, PRD §20)
-APPROVED_DOCUMENT_STATUSES = frozenset({
-    "queued",
-    "validating",
-    "preprocessing",
-    "ready_for_extraction",
-    "processing",
-    "auto_approved",
-    "needs_review",
-    "reviewed",
-    "rejected",
-    "rejected_unsupported",
-    "rejected_malware",
-    "failed",
-})
+# Approved document lifecycle states: DERIVED from the authoritative enums (Module A's DocumentStatus, the SCH-012 values, and
+# IngestionState, the internal states), never typed by hand, so a status added there is audited without a second edit here.
+APPROVED_DOCUMENT_STATUSES = frozenset({status.value for status in DocumentStatus} | {state.value for state in IngestionState})
 
 # Approved MIME types and canonical short extension values (Settings.allowed_mime_types, FR-ING-002)
 APPROVED_FILE_TYPES = frozenset({

@@ -57,13 +57,21 @@ def test_the_validation_error_does_not_echo_the_tenant_id():
     assert "tenant_a" not in str(exc.value).replace("tenant_id", "")
 
 
-def test_an_api_key_record_with_an_unsafe_tenant_is_refused_with_401_not_500():
+def test_an_api_key_record_with_an_unsafe_tenant_cannot_even_be_created():
+    from pydantic import ValidationError
+    token = generate_api_secret(nbytes=32)
+    with pytest.raises(ValidationError) as exc:
+        create_api_key_record(token=token, tenant_id="tenant_a/../tenant_b", name="k", scopes=["documents:read"], roles=["integrator"])
+    assert token.raw_secret not in str(exc.value) and "tenant_b" not in str(exc.value)           # the rejected input is not echoed
+
+
+def test_a_corrupt_stored_key_row_with_an_unsafe_tenant_is_still_refused_with_401_not_500():
+    """Second boundary: a repository adapter may hand back a row that was never validated (a corrupt or tampered store)."""
     repo, audit = MockApiKeyRepository(), MockAuditLogger()
     token = generate_api_secret(nbytes=32)
-    record = create_api_key_record(
-        token=token, tenant_id="tenant_a/../tenant_b", name="k", scopes=["documents:read"], roles=["integrator"]
-    )
-    asyncio.run(repo.create("tenant_a/../tenant_b", record))
+    record = create_api_key_record(token=token, tenant_id="tenant_a", name="k", scopes=["documents:read"], roles=["integrator"])
+    asyncio.run(repo.create("tenant_a", record))
+    record.tenant_id = "tenant_a/../tenant_b"                        # the stored row is altered after validation (no validate_assignment)
     provider = ApiKeyAuthenticationProvider(repository=repo, audit_logger=audit)
     with pytest.raises(InvalidTokenError) as exc:
         asyncio.run(provider.authenticate(f"Bearer {token.raw_secret}"))

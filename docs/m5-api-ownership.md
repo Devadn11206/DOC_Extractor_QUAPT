@@ -11,10 +11,10 @@ missing, or when a second `DocumentRecord` appears.
 | `DocumentRecord` | `doc_extractor.models` | **The one durable document record**: SCH-012 status, internal ingestion state, hash, claimed filename, idempotency key, error. Frozen. | Written at ingestion by `StorageBackend.save_document_record`; the API reads it through the `DocumentMetadataRepository` port | Module A (Phase 1) |
 | `DocumentResource` | `doc_extractor.api.contracts.records` | **Response DTO** mapped from `DocumentRecord` (`from_record`). Omits `tenant_id` and `internal_state`; reduces the error to code and message (API-011). Not a domain model. | Never | API (Team Member 2) |
 | `IdempotencyRecord` | `doc_extractor.models` | Upload idempotency (FR-ING-006, API-013), 24 h window | `IdempotencyStore` | Module A |
-| `ReviewTaskRecord` | `doc_extractor.api.contracts.records` | The review domain's **own** entity. No authoritative model of a review task exists (Module B's `ReviewerOverrideRequest` is a one-shot type override, not a task). **Provisional**: its status vocabulary is open (decision D11). | `ReviewTaskRepository` port (no adapter yet) | API / Team Member 2, vocabulary: PRD owner |
-| `ApiKeyRecord`, `ApiKeySummary`, `ApiKeyCreationResult`, `ApiKeyCreateRequest`, `ApiKeyRevokeResponse` | `...records` | API credentials: only a SHA-256 hash is stored; the secret is shown once and never cached or replayed (decision D8 open) | `ApiKeyRepository` port | API |
-| `WebhookSubscriptionRecord`, `WebhookDeliveryRecord` | `...records` | Webhook subscriptions and delivery attempts (PRD 7.1). `secret_hash` cannot sign an HMAC: replace with a secret reference before an adapter exists (decision D9) | Ports, no adapter yet | API; secret storage: Team Member 3 |
-| `AuditEventRecord` | `...records` | One platform audit event: identifiers and codes only (SEC-008, SEC-012). Corrections carrying old/new values are decision D7. | `AuditRepository` port | API shape; store and hash chain: Team Member 3 |
+| `ReviewTaskRecord` | `doc_extractor.api.contracts.records` | The review domain's **own** entity. No authoritative model of a review task exists (Module B's `ReviewerOverrideRequest` is a one-shot type override, not a task). **Provisional**: its status vocabulary is open (decision M5-D11). | `ReviewTaskRepository` port (no adapter yet) | API / Team Member 2, vocabulary: PRD owner |
+| `ApiKeyRecord`, `ApiKeySummary`, `ApiKeyCreationResult`, `ApiKeyCreateRequest`, `ApiKeyRevokeResponse` | `...records` | API credentials: only a SHA-256 hash is stored; the secret is shown once and never cached or replayed (decision M5-D08 open) | `ApiKeyRepository` port | API |
+| `WebhookSubscriptionRecord`, `WebhookDeliveryRecord` | `...records` | Webhook subscriptions and delivery attempts (PRD 7.1). `secret_hash` cannot sign an HMAC: replace with a secret reference before an adapter exists (decision M5-D09) | Ports, no adapter yet | API; secret storage: Team Member 3 |
+| `AuditEventRecord` | `...records` | One platform audit event: identifiers and codes only (SEC-008, SEC-012). Corrections carrying old/new values are decision M5-D07. | `AuditRepository` port | API shape; store and hash chain: Team Member 3 |
 | `LifecycleEvent` | `schema_lifecycle.events` | Schema-lifecycle transitions inside the schema domain. Feeds the audit store; does not replace `AuditEventRecord` | M4 repository | M4 |
 | `CanonicalExtractionEnvelope` | `doc_extractor.contracts_c` | The extraction result (PRD 6.3). **Not modified by the API.** | By the document/run store (Team Member 3) | Module C (Phase 1) |
 
@@ -34,6 +34,20 @@ then to `DocumentResource`. Do not reintroduce a parallel API record.
 | Adapter | `LocalMemoryQueueAdapter` | None yet (broker choice: Team Member 3) |
 
 A job message never embeds a hand-off, page image or extracted content. Do not add a third queue abstraction.
+
+## Record rules
+
+- **One tenant rule.** Every model that carries a `tenant_id` (principal, tenant context, API-key records, review task,
+  webhook records, audit event, job message) inherits `doc_extractor.api.contracts.tenant_bound.TenantBoundModel`, which
+  applies `require_path_safe_tenant_id` at creation, `model_copy`, `copy`, `__replace__` and `model_construct`, and never echoes a
+  rejected value. The rule is a safety bound, not a tenant-ID format (that policy is decision M5-D16).
+- **A job message's `payload` is options, not content.** snake_case keys; values are null, bool, int, finite float, a string of at
+  most 256 characters, or a flat list of at most 100 such scalars; at most 32 keys and 4096 bytes as JSON; no nested objects or
+  bytes (`PAYLOAD_MAX_*` in `api/contracts/records.py`). Content never travels through the queue.
+- **Audit statuses are derived** from Module A's `DocumentStatus` and `IngestionState`, not typed by hand.
+- **Two conflicts, two names.** Module A's `ConflictError` is an idempotency key reused with a different request (code
+  `IDEMPOTENCY_KEY_CONFLICT`); the API's `ApiConflictError` is a conflict with a resource's state (code `CONFLICT`; `ConflictError` stays
+  importable from `doc_extractor.api.exceptions` as an alias). Both answer 409. The codes are unchanged until M5-D01 is decided.
 
 ## Tenant isolation contract (SEC-006)
 
@@ -82,7 +96,7 @@ The service logic *is* written to fail closed, but only a logger that raises can
 | Queue | Broker, lease longer than a GPU job or heartbeats, retries and dead-letter behind `document.failed` |
 | Locking | Cross-process idempotency (unique tenant+key), compare-and-set for status and task claim |
 | Object storage | A backend for `StorageBackend` that serves page images and keeps the isolation contract above; encryption (SEC-005) |
-| Audit | A real `AuditRepository` with the hash chain (SEC-008); where corrections' old/new values may live (D7) |
+| Audit | A real `AuditRepository` with the hash chain (SEC-008); where corrections' old/new values may live (M5-D07) |
 | Operations | Environment/secret source for production settings, a real malware scanner (SEC-009), a rate-limit store (API-012), Prometheus metrics |
 
 Until those exist, ports answer **503 `SERVICE_UNAVAILABLE`**. Nothing falls back to a weaker mode silently.

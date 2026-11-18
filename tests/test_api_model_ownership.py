@@ -59,7 +59,7 @@ def test_the_api_package_defines_no_class_named_documentrecord():
 
 def test_no_model_or_queue_type_name_is_defined_both_in_the_api_package_and_in_the_engine():
     """Exception classes are excluded on purpose: ``ConflictError`` exists in both hierarchies and is part of the
-    still-open error-code decision (D1); this test is about data models and queues."""
+    still-open error-code decision (M5-D01); this test is about data models and queues."""
     def non_exceptions(found):
         return {name for name in found if not name.endswith("Error")}
     api_classes = non_exceptions(_classes_defined_in(API_DIR))
@@ -68,11 +68,12 @@ def test_no_model_or_queue_type_name_is_defined_both_in_the_api_package_and_in_t
     assert api_classes & engine_classes == set(), "an API type shadows an engine type of the same name"
 
 
-def test_the_only_remaining_exception_name_clash_is_the_known_conflicterror():
+def test_no_exception_name_is_defined_both_in_the_api_package_and_in_the_engine():
+    """``ConflictError`` used to exist in both hierarchies with different meanings; the API's is now ``ApiConflictError``."""
     found = _classes_defined_in(ROOT / "src" / "doc_extractor")
     clashes = {name for name, where in found.items()
                if name.endswith("Error") and any("/api/" in w for w in where) and any("/api/" not in w for w in where)}
-    assert clashes == {"ConflictError"}            # error-code vocabulary: PRD decision D1, not changed here
+    assert clashes == set()
 
 
 def test_the_repository_port_is_typed_with_module_as_canonical_record_and_enums():
