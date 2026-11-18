@@ -10,6 +10,13 @@ Adheres to:
 - Captures: actor_id, tenant_id, action, resource_id, resource_type, timestamp,
   request_id, outcome, and allowlisted operational metadata.
 - Cryptographic hash-chains and write-once immutable storage belong to M7.
+
+Delivery guarantee (read this before relying on audit for anything mandatory):
+- ``AuditLogger`` is a port. A caller that treats an audit write as MANDATORY (API-key creation and revocation) can only
+  fail closed if the logger RAISES when the event could not be recorded: the failure must propagate.
+- ``SafeStructuredAuditLogger`` below is a BEST-EFFORT log sink. It writes through Python's ``logging`` and swallows
+  its own serialization/logging failures, so a mandatory operation using it is NOT fail-closed and is NOT durably audited.
+  A durable, append-only logger over ``AuditRepository`` that raises on failure is Team Member 3's (SEC-008).
 """
 
 import logging
@@ -239,7 +246,13 @@ def sanitize_audit_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any
 
 @runtime_checkable
 class AuditLogger(Protocol):
-    """Protocol for recording operational and security audit events."""
+    """
+    Protocol for recording operational and security audit events.
+
+    Contract for MANDATORY audit (SEC-008): ``log_event`` / ``log_action`` must RAISE when the event was not durably
+    recorded. An implementation that swallows write failures is best-effort and should say so with a class attribute
+    ``propagates_failures = False`` (``SafeStructuredAuditLogger`` does); ``ApiKeyService`` warns when it is given one.
+    """
 
     async def log_event(self, event: AuditEventRecord) -> None:
         """Record a pre-constructed audit event."""
@@ -262,18 +275,30 @@ class AuditLogger(Protocol):
 
 class SafeStructuredAuditLogger:
     """
-    Reference implementation of AuditLogger that formats structured events
-    and logs them via Python's logging subsystem with strict allowlist redaction.
+    BEST-EFFORT audit log sink. NOT a durable audit store and NOT suitable as the sink of a mandatory audit.
+
+    It formats structured events, applies the strict allowlist redaction, and writes them through Python's ``logging``.
+    Contract, precisely:
+    - A failure while serializing or logging an event is caught and logged (exception TYPE only, never its text, which
+      could carry a secret or a path); ``log_event`` then returns normally. The caller is never told the event was lost.
+    - An INVALID event (``log_action`` builds an ``AuditEventRecord`` first) still raises: that is a caller bug.
+    - Nothing is persisted, hash-chained or retained: it is exactly as durable as the process's log handlers.
+
+    Therefore an operation that must not succeed unaudited (API-key creation and revocation) is NOT fail-closed with
+    this sink: only a logger whose write failures propagate gives that guarantee. ``propagates_failures = False``
+    declares this; ``ApiKeyService`` logs a warning when it is configured with such a sink.
     """
+
+    propagates_failures = False
 
     def __init__(self, logger: Optional[logging.Logger] = None) -> None:
         self._logger = logger or logging.getLogger("doc_extractor.audit")
 
     async def log_event(self, event: AuditEventRecord) -> None:
         """
-        Record a pre-constructed audit event with fail-safe error handling.
-        Policy: Audit serialization failures log an error event instead of crashing
-        the business transaction, ensuring traceability without operational outage.
+        Record a pre-constructed audit event, BEST-EFFORT.
+        Serialization and logging failures are logged (exception type only) and swallowed: they do not propagate,
+        so a caller cannot detect that the event was lost.
         """
         try:
             sanitized_meta = sanitize_audit_metadata(event.metadata)
@@ -298,7 +323,7 @@ class SafeStructuredAuditLogger:
                 "AUDIT_FAILURE: Failed to serialize audit event %s (%s): %s",
                 getattr(event, "event_id", "unknown"),
                 getattr(event, "action", "unknown"),
-                str(exc),
+                type(exc).__name__,                       # the type only: the text of an exception may carry a secret or a path
                 extra={
                     "request_id": getattr(event, "request_id", None),
                     "tenant_id": getattr(event, "tenant_id", "unknown"),

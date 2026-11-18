@@ -61,6 +61,12 @@ class ApiKeyService:
         # so the service cannot silently run unaudited.
         if audit_logger is None:
             raise ConfigurationError("ApiKeyService requires an audit logger: key creation and revocation are mandatory-audit operations.")
+        if getattr(audit_logger, "propagates_failures", None) is False:
+            logger.warning(
+                "ApiKeyService is configured with a best-effort audit sink (%s): a failed audit write is NOT reported, so key "
+                "creation and revocation are not fail-closed and not durably audited. Configure a logger that raises on failure.",
+                type(audit_logger).__name__,
+            )
         self._repository = repository
         self._audit_logger = audit_logger
 

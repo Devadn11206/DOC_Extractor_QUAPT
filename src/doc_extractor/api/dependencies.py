@@ -57,7 +57,7 @@ def get_auth_provider(request: Request) -> AuthenticationProvider:
         return provider
 
     # If api_key_repo is configured, auto-construct ApiKeyAuthenticationProvider (TASK-5.7-B). The audit logger must be
-    # configured explicitly: there is no silent fallback to a log-only logger.
+    # configured explicitly: nothing is substituted for a missing logger.
     api_key_repo = getattr(request.app.state, "api_key_repo", None)
     if api_key_repo is not None:
         audit_logger = getattr(request.app.state, "audit_logger", None)
@@ -214,8 +214,9 @@ def get_queue_consumer(request: Request) -> QueueConsumer:
 def get_audit_logger(request: Request) -> AuditLogger:
     """
     Dependency injection provider for the structured AuditLogger. Audit is mandatory for the operations that need it, so
-    an unconfigured logger is a typed 503, never a silent downgrade to log-only. (Configuring SafeStructuredAuditLogger
-    explicitly is a deliberate choice of a log-only sink; a durable AuditRepository-backed logger is Team Member 3's.)
+    an unconfigured logger is a typed 503: nothing is substituted. Configuring SafeStructuredAuditLogger explicitly is a
+    deliberate choice of a BEST-EFFORT sink whose write failures do not propagate, so those operations are then not
+    fail-closed; a durable AuditRepository-backed logger that raises on failure is Team Member 3's.
     """
     logger = getattr(request.app.state, "audit_logger", None)
     if logger is None:

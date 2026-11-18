@@ -47,15 +47,30 @@ A job message never embeds a hand-off, page image or extracted content. Do not a
 
 ## Audit semantics
 
-| Operation | Audit | If the audit write fails |
-| --- | --- | --- |
-| API-key creation | **Mandatory** | The new key is revoked again and its secret is never returned; the caller gets `503 AUDIT_UNAVAILABLE` (effect `rolled_back`) |
-| API-key revocation | **Mandatory** | The key stays revoked (access only shrinks); the caller gets `503 AUDIT_UNAVAILABLE` (effect `applied`) |
-| Authentication failure | Best effort | Logged, never fatal: a failed write must not lock every client out |
+Two different things must not be confused: **best-effort audit logging** and **mandatory durable auditing**.
 
-There is no silent fallback: an unconfigured audit logger is `503 SERVICE_UNAVAILABLE` (port `AuditLogger`). `SafeStructuredAuditLogger` is a
-**log-only** sink: it can be configured explicitly, but it is not an audit store and it swallows its own write errors, so production needs a
-durable logger over `AuditRepository` (Team Member 3). The sink's own error text is never logged or returned.
+| | Best-effort logging | Mandatory durable auditing |
+| --- | --- | --- |
+| Implementation in this repository | `SafeStructuredAuditLogger` (writes through Python `logging`) | **None.** A logger over `AuditRepository` is Team Member 3's (SEC-008) |
+| A failed write | Caught and logged (exception *type* only); the caller is **not** told | **Must raise**, so the caller can refuse or roll back |
+| Durable, append-only, hash-chained | No: exactly as durable as the process's log handlers | Required |
+| Fail-closed | **No** | Yes, because failures propagate |
+
+The service logic *is* written to fail closed, but only a logger that raises can make it effective:
+
+| Operation | Audit requirement | If the logger **raises** | If the logger is best-effort (`SafeStructuredAuditLogger`) |
+| --- | --- | --- | --- |
+| API-key creation | Mandatory | The new key is revoked again and its secret is never returned; the caller gets `503 AUDIT_UNAVAILABLE` (effect `rolled_back`) | The key is created and returned; a lost write is **not** detected. Only an *invalid* event still raises |
+| API-key revocation | Mandatory | The key stays revoked (access only shrinks); the caller gets `503 AUDIT_UNAVAILABLE` (effect `applied`) | The key is revoked; a lost write is **not** detected |
+| Authentication failure | Best effort | Logged, never fatal: a failed write must not lock every client out | Same |
+
+- There is no silent fallback: an unconfigured audit logger is `503 SERVICE_UNAVAILABLE` (port `AuditLogger`). Nothing is
+  substituted for it.
+- A logger that does not propagate failures declares `propagates_failures = False`; `ApiKeyService` logs a warning when it
+  is built with one. This is a signal, not enforcement: whether such a sink may be used at all is an audit-storage policy
+  decision for Team Member 3 and the owners (decision M5-D15 in `docs/m5-open-decisions.md`).
+- `SafeStructuredAuditLogger` logs the *type* of its own write failure and never its text (which could carry a secret or a path).
+- The API key router (API-019) is not mounted (decision M5-D08), so no HTTP route currently exercises these paths.
 
 ## What depends on Team Member 3 (not implemented here)
 
