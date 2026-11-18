@@ -11,15 +11,13 @@ Adheres to:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 from doc_extractor.api.contracts.records import ApiKeyCreationResult, ApiKeySummary
 from doc_extractor.api.exceptions import (
     ApiValidationError,
-    ConflictError,
     ForbiddenError,
     TenantResourceNotFoundError,
 )
@@ -59,7 +57,6 @@ class ApiKeyService:
     ) -> None:
         self._repository = repository
         self._audit_logger = audit_logger
-        self._idempotency_cache: Dict[Tuple[str, str], Tuple[str, ApiKeyCreationResult, float]] = {}
 
     def _verify_creator_authz(
         self,
@@ -125,17 +122,16 @@ class ApiKeyService:
         expires_at: Optional[datetime] = None,
         expires_in_days: Optional[int] = None,
         prefix: str = DEFAULT_TOKEN_PREFIX,
-        idempotency_key: Optional[str] = None,
     ) -> ApiKeyCreationResult:
         """
         Create a new scoped API key for the creator's tenant.
 
         Security Guarantees:
-        - Plaintext secret token is returned in ApiKeyCreationResult exactly once.
+        - Plaintext secret token is returned in ApiKeyCreationResult exactly once and is never
+          retained: no cache, no replay (security decision D8 is open).
         - Only cryptographic SHA-256 hash is persisted.
         - Creator cannot escalate privileges beyond their own grants.
         - Maximum lifetime cannot exceed 90 days.
-        - Idempotent request replay within 24h supported per PRD API-013.
         """
         # 1. Authorize creator
         self._verify_creator_authz(creator, required_scope="api_keys:write", action_name="create API keys")
@@ -157,35 +153,10 @@ class ApiKeyService:
             target_exp = now_utc + timedelta(days=expires_in_days)
         valid_exp = validate_key_expiration(target_exp, created_at=now_utc)
 
-        # 4. Check idempotency per PRD API-013 if idempotency_key is provided
-        cache_key: Optional[Tuple[str, str]] = None
-        fingerprint: Optional[str] = None
-        now_ts = now_utc.timestamp()
-
-        if idempotency_key is not None and idempotency_key.strip():
-            clean_idem = idempotency_key.strip()
-            cache_key = (creator.tenant_id, clean_idem)
-            exp_desc = f"days:{expires_in_days}" if expires_at is None and expires_in_days is not None else (valid_exp.isoformat() if expires_at else "default")
-            fp_payload = f"{name.strip()}|{','.join(clean_scopes)}|{','.join(clean_roles)}|{exp_desc}|{prefix}"
-            fingerprint = hashlib.sha256(fp_payload.encode("utf-8")).hexdigest()
-
-            if cache_key in self._idempotency_cache:
-                stored_fp, stored_result, exp_ts = self._idempotency_cache[cache_key]
-                if now_ts < exp_ts:
-                    if stored_fp == fingerprint:
-                        return stored_result
-                    raise ConflictError(
-                        message="Idempotency key reused with conflicting request payload.",
-                        code="CONFLICT",
-                        details={"idempotency_key": clean_idem},
-                    )
-                else:
-                    del self._idempotency_cache[cache_key]
-
-        # 5. Generate 256-bit CSPRNG token
+        # 4. Generate 256-bit CSPRNG token
         token = generate_api_secret(nbytes=32, prefix=prefix)
 
-        # 6. Build and persist ApiKeyRecord (strictly hash-only)
+        # 5. Build and persist ApiKeyRecord (strictly hash-only)
         record = create_api_key_record(
             token=token,
             tenant_id=creator.tenant_id,
@@ -200,7 +171,7 @@ class ApiKeyService:
 
         persisted = await self._repository.create(creator.tenant_id, record)
 
-        # 7. Audit event (SEC-012: no secret, no hash)
+        # 6. Audit event (SEC-012: no secret, no hash)
         if self._audit_logger:
             try:
                 await self._audit_logger.log_action(
@@ -215,8 +186,9 @@ class ApiKeyService:
             except Exception as exc:  # pragma: no cover
                 logger.warning("Audit logging failed for api_key.created: %s", exc)
 
-        # 8. Return creation result disclosing secret ONCE
-        result = ApiKeyCreationResult(
+        # 7. Return creation result disclosing the secret ONCE. It is never cached, stored or replayed
+        #    (security decision D8 is open: no idempotent replay of this call is offered).
+        return ApiKeyCreationResult(
             key_id=persisted.key_id,
             tenant_id=persisted.tenant_id,
             name=persisted.name,
@@ -228,16 +200,6 @@ class ApiKeyService:
             created_by=persisted.created_by,
             raw_secret=token.raw_secret,
         )
-
-        # Store in idempotency cache (24 hours TTL per PRD API-013)
-        if cache_key is not None and fingerprint is not None:
-            self._idempotency_cache[cache_key] = (fingerprint, result, now_ts + 86400.0)
-            if len(self._idempotency_cache) > 1000:
-                self._idempotency_cache = {
-                    k: v for k, v in self._idempotency_cache.items() if now_ts < v[2]
-                }
-
-        return result
 
     async def list_api_keys(
         self,
