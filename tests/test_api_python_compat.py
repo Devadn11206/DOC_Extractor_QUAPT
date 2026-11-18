@@ -11,6 +11,7 @@ These checks do not depend on the interpreter running them:
 
 import ast
 import builtins
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -115,26 +116,35 @@ def test_api_package_parses_with_the_python_3_10_grammar(path):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
 
 
+def _can_run_the_api(exe: str) -> bool:
+    """True when ``exe`` has the API dependencies, so importing the API there is a meaningful check."""
+    try:
+        probe = subprocess.run([exe, "-c", "import fastapi, pydantic, httpx"], capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
 def _interpreters():
+    """The running interpreter, plus every other CPython 3.10-3.13 on PATH that can actually run the API.
+    Others are not skipped, they are simply not part of the parametrization (nothing to check there)."""
     found = {sys.executable}
     for minor in (10, 11, 12, 13):
         exe = shutil.which(f"python3.{minor}")
-        if exe:
+        if exe and _can_run_the_api(exe):
             found.add(exe)
-    return sorted(found)
+    return sorted(found, key=lambda exe: (exe != sys.executable, exe))
 
 
-@pytest.mark.parametrize("exe", _interpreters())
+@pytest.mark.parametrize("exe", _interpreters(), ids=lambda exe: "running-interpreter" if exe == sys.executable else Path(exe).name)
 def test_api_package_imports_in_a_fresh_interpreter(exe):
+    if exe == sys.executable and importlib.util.find_spec("fastapi") is None:
+        pytest.skip("optional API extra not installed (pip install -e '.[dev,api]')")   # fails in a DOC_FAIL_ON_SKIP=1 job
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
-    probe = subprocess.run(
-        [exe, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True, text=True, env=env
-    )
+    probe = subprocess.run([exe, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True, text=True, env=env)
     assert probe.returncode == 0
     run = subprocess.run(
         [exe, "-c", "import doc_extractor.api, doc_extractor.api.dependencies, doc_extractor.api.app"],
         capture_output=True, text=True, env=env, cwd=str(ROOT),
     )
-    if run.returncode != 0 and "ModuleNotFoundError" in run.stderr and "doc_extractor" not in run.stderr.split("ModuleNotFoundError")[-1].split("\n")[0]:
-        pytest.skip(f"{exe} does not have the API dependencies installed: {run.stderr.strip().splitlines()[-1]}")
     assert run.returncode == 0, run.stderr[-600:]
