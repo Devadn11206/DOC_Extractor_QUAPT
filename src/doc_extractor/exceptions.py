@@ -167,6 +167,22 @@ class StorageError(DocumentExtractorError):
         )
 
 
+class CrossTenantStorageAccessError(StorageError):
+    """
+    A storage reference names another tenant's data or escapes the caller's tenant directory. Distinct from
+    ``TenantStorageIsolationError`` (an integrity fault in the tenant's own location): the REST API answers this one
+    exactly like a missing resource (404, SEC-006) so another tenant's data cannot be probed.
+    """
+
+    def __init__(self, details: Optional[Dict[str, Any]] = None, request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="Cross-tenant access or path escape forbidden.",
+            code="CROSS_TENANT_ACCESS_FORBIDDEN",
+            request_id=request_id,
+            details=details,
+        )
+
+
 class InvalidTenantIdentifierError(StorageError, ValueError):
     """
     A tenant identifier is not usable as an isolation boundary (empty, oversized, or able to leave its own

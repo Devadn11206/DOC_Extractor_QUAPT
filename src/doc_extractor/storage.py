@@ -16,7 +16,7 @@ from typing import Any, BinaryIO, List, Optional, Union
 import uuid
 
 from doc_extractor.config import Settings
-from doc_extractor.exceptions import StorageError, TenantStorageIsolationError
+from doc_extractor.exceptions import CrossTenantStorageAccessError, StorageError, TenantStorageIsolationError
 from doc_extractor.tenancy import TenantDirectoryResolver, ensure_inside_tenant, require_path_safe_tenant_id
 
 
@@ -394,18 +394,17 @@ class LocalDiskStorage(StorageBackend):
             )
         tenant_segment, _, relative = storage_uri.partition("/")
         if tenant_segment != self.tenant_id or relative.startswith("/"):
-            raise StorageError(
-                message="Cross-tenant access or path escape forbidden.",
-                details={"storage_uri": storage_uri, "tenant_id": self.tenant_id},
-            )
+            raise CrossTenantStorageAccessError(details={"storage_uri": storage_uri, "tenant_id": self.tenant_id})
         tenant_dir = self._tenant_dir(create=False)
         try:
             return ensure_inside_tenant(tenant_dir, tenant_dir / relative if relative else tenant_dir).resolve()
         except TenantStorageIsolationError as exc:
-            raise StorageError(
-                message="Cross-tenant access or path escape forbidden.",
-                details={"storage_uri": storage_uri, "tenant_id": self.tenant_id, "reason": exc.details.get("reason")},
-            ) from exc
+            reason = exc.details.get("reason")
+            if reason in ("path_outside_tenant_directory", "path_resolves_outside_tenant_directory"):
+                raise CrossTenantStorageAccessError(
+                    details={"storage_uri": storage_uri, "tenant_id": self.tenant_id, "reason": reason}
+                ) from exc
+            raise                                       # a symlink inside tenant storage: an integrity fault, kept loud
 
     def save_document_record(self, record: Any) -> None:
         doc_dir = self._get_document_dir(record.document_id)

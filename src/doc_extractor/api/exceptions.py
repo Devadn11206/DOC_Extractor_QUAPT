@@ -10,7 +10,7 @@ Adheres to:
 import math
 import re
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -20,6 +20,7 @@ from doc_extractor.exceptions import (
     ConfigurationError,
     ConflictError as IngestionConflictError,
     DocumentExtractorError,
+    CrossTenantStorageAccessError,
     DocumentProcessingError,
     InvalidTenantIdentifierError,
     LLMExecutionError,
@@ -298,7 +299,8 @@ class PortNotConfiguredError(ApiHttpError):
 _STATUS_CODE_MAP: Dict[Any, int] = {
     AuthenticationRequiredError: 401,
     ForbiddenError: 403,
-    TenantAccessDeniedError: 403,
+    TenantAccessDeniedError: 404,         # SEC-006: concealed as not found, see concealed_not_found()
+    CrossTenantStorageAccessError: 404,   # idem
     NotFoundError: 404,
     TenantResourceNotFoundError: 404,
     ConflictError: 409,
@@ -332,7 +334,7 @@ _M4_STATUS_BY_CLASS_NAME: Dict[str, int] = {
     "SchemaNotApprovedError": 409,           # PRD section 19: 409 SCHEMA_NOT_APPROVED
     "SchemaNotFoundError": 404,
     "SchemaRollbackError": 422,              # SCH-006 rollback targets an invalid version
-    "TenantAccessError": 403,                # cross-tenant ID guessing returns 404 through tenant-scoped lookups
+    "TenantAccessError": 403,                # M4 raises it only for a missing/blank tenant context (not cross-tenant: see concealed_not_found)
     "UnauthenticatedError": 401,             # PRD section 19: 401 UNAUTHENTICATED
     "ForbiddenActionError": 403,             # PRD section 19: 403 FORBIDDEN
     "SchemaSelfApprovalError": 403,          # PRD section 19: 403 SCHEMA_SELF_APPROVAL
@@ -343,12 +345,38 @@ for _name, _status in _M4_STATUS_BY_CLASS_NAME.items():
     _STATUS_CODE_MAP[getattr(_m4, _name)] = _status      # AttributeError if M4 renames a class: loud, not silent
 
 
+# SEC-006: access to ANOTHER tenant's resource must answer exactly like a resource that does not exist (404, never 403),
+# so identifiers cannot be probed across tenants. Only genuine cross-tenant signals are concealed; every other
+# permission denial keeps its 403 and its code.
+_CONCEALED_AS_NOT_FOUND: Dict[type, Tuple[str, str]] = {
+    TenantAccessDeniedError: ("DOCUMENT_NOT_FOUND", "Document not found."),
+    CrossTenantStorageAccessError: ("DOCUMENT_NOT_FOUND", "Document not found."),
+}
+
+# M4 reports a cross-tenant attempt only as a plain ForbiddenActionError whose message starts like this (it also puts
+# both tenant identifiers in that message, which must never reach a client). tests/test_api_cross_tenant_not_found.py
+# triggers the real M4 code path, so a wording change in M4 fails there instead of silently reverting to 403.
+M4_CROSS_TENANT_MARKER = "Cross-tenant access violation"
+
+
+def concealed_not_found(exc: BaseException) -> Optional[Tuple[str, str]]:
+    """(code, message) of the not-found response that conceals a cross-tenant access, else None."""
+    for cls in type(exc).__mro__:
+        if cls in _CONCEALED_AS_NOT_FOUND:
+            return _CONCEALED_AS_NOT_FOUND[cls]
+    if isinstance(exc, _m4.ForbiddenActionError) and M4_CROSS_TENANT_MARKER in str(getattr(exc, "message", "")):
+        return ("SCHEMA_NOT_FOUND", "Schema not found.")
+    return None
+
+
 def get_status_code_for_exception(exc: Exception) -> int:
     """
     Derive the HTTP status for an exception: an explicit ``status_code`` first, then the nearest class in
     the exception's MRO that has a mapping (so a subclass such as ``SchemaSelfApprovalError`` is never
     shadowed by its parent), else 500.
     """
+    if concealed_not_found(exc) is not None:
+        return 404
     if hasattr(exc, "status_code") and isinstance(exc.status_code, int):
         return exc.status_code
     for exc_cls in type(exc).__mro__:
@@ -462,6 +490,11 @@ async def document_extractor_error_handler(request: Request, exc: DocumentExtrac
         retry_after = sanitize_retry_after(exc.retry_after_seconds)
         if retry_after is not None:
             extra_headers["Retry-After"] = retry_after
+    concealed = concealed_not_found(exc)
+    if concealed is not None:                        # cross-tenant: same body as a missing resource, no details, no identifiers
+        return build_error_response(
+            code=concealed[0], message=concealed[1], status_code=404, request_id=req_id, details={}, headers=extra_headers
+        )
     return build_error_response(
         code=exc.code,
         message=exc.message,

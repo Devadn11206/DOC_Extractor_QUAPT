@@ -407,7 +407,7 @@ def test_request_id_untrusted_header_discarded(client: TestClient):
     [
         ("not_found", 404, "DOCUMENT_NOT_FOUND"),
         ("forbidden", 403, "FORBIDDEN"),
-        ("tenant_denied", 403, "TENANT_ACCESS_DENIED"),
+        ("tenant_denied", 404, "DOCUMENT_NOT_FOUND"),      # SEC-006: cross-tenant access is concealed as not found
         ("tenant_resource_not_found", 404, "DOCUMENT_NOT_FOUND"),
         ("auth_required", 401, "AUTHENTICATION_REQUIRED"),
         ("conflict", 409, "CONFLICT"),
