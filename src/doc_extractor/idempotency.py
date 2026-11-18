@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple, Union
 
 from doc_extractor.exceptions import ConflictError, StorageError
 from doc_extractor.models import IdempotencyRecord
-from doc_extractor.tenancy import tenant_id_path_problem
+from doc_extractor.tenancy import TenantDirectoryResolver, ensure_inside_tenant
 
 
 class IdempotencyStore(ABC):
@@ -55,11 +55,13 @@ class LocalIdempotencyStore(IdempotencyStore):
         self.base_dir = Path(base_dir).resolve()
         self.window_seconds = window_seconds
         self._lock = threading.Lock()
-        self._key_locks: Dict[str, threading.Lock] = {}
+        # keyed by the (tenant, key) PAIR: a joined string such as 'a:b' + 'c' vs 'a' + 'b:c' would alias
+        self._key_locks: Dict[Tuple[str, str], threading.Lock] = {}
+        self._resolver = TenantDirectoryResolver(self.base_dir)
 
     def get_key_lock(self, tenant_id: str, idempotency_key: str) -> threading.Lock:
         """Returns a thread lock specific to (tenant_id, idempotency_key)."""
-        composite = f"{tenant_id}:{idempotency_key}"
+        composite = (tenant_id, idempotency_key)
         with self._lock:
             if composite not in self._key_locks:
                 self._key_locks[composite] = threading.Lock()
@@ -67,19 +69,14 @@ class LocalIdempotencyStore(IdempotencyStore):
 
     def _get_record_path(self, tenant_id: str, idempotency_key: str) -> Path:
         import hashlib
-        # Reject, never "sanitize": Path(tenant_id).name used to collapse "tenant_a/../tenant_b" into
-        # "tenant_b" and so address another tenant's records (SEC-006).
-        problem = tenant_id_path_problem(tenant_id)
-        if problem is not None:
-            raise StorageError(
-                message="Unsafe tenant identifier for the idempotency store.",
-                details={"reason": problem},
-            )
-        safe_tenant = tenant_id
+        # Same verified, collision-proof tenant directory as LocalDiskStorage (doc_extractor.tenancy): an unsafe
+        # identity is refused with a typed error (never "sanitized": Path(tenant_id).name used to collapse
+        # "tenant_a/../tenant_b" into "tenant_b"), colliding identities cannot share records, symlinks are refused.
+        tenant_dir = self._resolver.resolve(tenant_id, create=True)
+        idempotency_dir = ensure_inside_tenant(tenant_dir, tenant_dir / "idempotency")
+        idempotency_dir.mkdir(parents=True, exist_ok=True)
         key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
-        tenant_dir = (self.base_dir / safe_tenant / "idempotency").resolve()
-        tenant_dir.mkdir(parents=True, exist_ok=True)
-        return tenant_dir / f"{key_hash}.json"
+        return ensure_inside_tenant(tenant_dir, idempotency_dir / f"{key_hash}.json")
 
     def get_record(self, tenant_id: str, idempotency_key: str) -> Optional[IdempotencyRecord]:
         file_path = self._get_record_path(tenant_id, idempotency_key)

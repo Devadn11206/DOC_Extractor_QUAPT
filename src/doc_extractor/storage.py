@@ -16,8 +16,8 @@ from typing import Any, BinaryIO, List, Optional, Union
 import uuid
 
 from doc_extractor.config import Settings
-from doc_extractor.exceptions import StorageError
-from doc_extractor.tenancy import tenant_id_path_problem
+from doc_extractor.exceptions import StorageError, TenantStorageIsolationError
+from doc_extractor.tenancy import TenantDirectoryResolver, ensure_inside_tenant, require_path_safe_tenant_id
 
 
 @dataclass(frozen=True)
@@ -121,34 +121,35 @@ class StorageBackend(ABC):
 class LocalDiskStorage(StorageBackend):
     """
     Local filesystem storage backend for development and on-premise container storage.
-    
+
     Structure:
-    {base_dir}/{tenant_id}/{document_id}/pages/page_{page_number:04d}.png
-    
+    {base_dir}/{tenant_key}/{document_id}/pages/page_{page_number:04d}.png
+
+    ``tenant_key`` is derived from the EXACT tenant identity (see ``doc_extractor.tenancy``): a tenant made only
+    of ``[a-z0-9_-]`` keeps its own name (so existing data stays where it is), any other identity maps to
+    ``h+<hash>`` plus a verified identity marker. Logical storage URIs stay ``{tenant_id}/{document_id}/...``.
+
     Guarantees:
     - Path traversal prevention.
+    - Tenant isolation that survives case-insensitive and Unicode-normalizing filesystems (no identity is
+      case-folded or normalized; colliding identities are refused or kept apart).
+    - Symlinks inside a tenant's storage are refused and every resolved path must stay inside that tenant.
     - Document ID isolation.
     - Atomic writes via temporary files to avoid partial reads.
     - Note: In production, backing filesystem should be encrypted with AES-256 (SEC-005).
     """
 
     def __init__(self, base_dir: Union[str, Path], tenant_id: str = "default_tenant") -> None:
-        self._require_safe_tenant(tenant_id)
+        require_path_safe_tenant_id(tenant_id)         # typed InvalidTenantIdentifierError (a StorageError)
         self.base_dir = Path(base_dir).resolve()
         self.tenant_id = tenant_id
+        self._resolver = TenantDirectoryResolver(self.base_dir)
 
-    @staticmethod
-    def _require_safe_tenant(tenant_id: str) -> None:
-        """The tenant ID is a directory name: refuse one that could address another tenant (SEC-006)."""
-        problem = tenant_id_path_problem(tenant_id)
-        if problem is not None:
-            raise StorageError(
-                message="Unsafe tenant identifier for storage.",
-                details={"reason": problem},
-            )
+    def _tenant_dir(self, *, create: bool = True) -> Path:
+        """The verified directory of ``self.tenant_id`` (re-validated each time, so a reassigned attribute is caught)."""
+        return self._resolver.resolve(self.tenant_id, create=create)
 
     def _get_document_dir(self, document_id: str) -> Path:
-        self._require_safe_tenant(self.tenant_id)      # also guards a tenant_id reassigned after construction
         # Check for path traversal characters before stripping
         if "/" in document_id or "\\" in document_id or ".." in document_id:
             raise StorageError(
@@ -161,14 +162,19 @@ class LocalDiskStorage(StorageBackend):
                 message="Invalid document ID format.",
                 details={"document_id": document_id},
             )
-        doc_dir = (self.base_dir / self.tenant_id / safe_doc_id).resolve()
-        # Verify that doc_dir remains within base_dir
-        if not str(doc_dir).startswith(str(self.base_dir)):
-            raise StorageError(
-                message="Path traversal attempt detected in document storage path.",
-                details={"document_id": document_id},
-            )
-        return doc_dir
+        tenant_dir = self._tenant_dir(create=True)
+        # No symlink anywhere on the way, and the resolved path must stay inside THIS tenant's directory.
+        return ensure_inside_tenant(tenant_dir, tenant_dir / safe_doc_id)
+
+    def _inside(self, path: Path) -> Path:
+        """``path`` (below this tenant's directory) with the symlink and containment checks applied."""
+        return ensure_inside_tenant(self._tenant_dir(create=False), path)
+
+    def _subdir(self, doc_dir: Path, name: str, *, create: bool = False) -> Path:
+        path = self._inside(doc_dir / name)
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def store_original_document(
         self,
@@ -177,8 +183,7 @@ class LocalDiskStorage(StorageBackend):
     ) -> StoredArtifact:
         """Persist the original PDF atomically inside tenant-scoped storage."""
         doc_dir = self._get_document_dir(document_id)
-        source_dir = doc_dir / "source"
-        source_dir.mkdir(parents=True, exist_ok=True)
+        source_dir = self._subdir(doc_dir, "source", create=True)
 
         target_file = source_dir / "original.pdf"
         temp_file = source_dir / f".tmp_original_{uuid.uuid4().hex}"
@@ -225,8 +230,7 @@ class LocalDiskStorage(StorageBackend):
             )
 
         doc_dir = self._get_document_dir(document_id)
-        pages_dir = doc_dir / "pages"
-        pages_dir.mkdir(parents=True, exist_ok=True)
+        pages_dir = self._subdir(doc_dir, "pages", create=True)
 
         target_file = pages_dir / f"page_{page_number:04d}.{format_extension}"
         artifact_id = f"art_{uuid.uuid4().hex[:12]}"
@@ -275,8 +279,7 @@ class LocalDiskStorage(StorageBackend):
             )
 
         doc_dir = self._get_document_dir(document_id)
-        prep_dir = doc_dir / "preprocessed"
-        prep_dir.mkdir(parents=True, exist_ok=True)
+        prep_dir = self._subdir(doc_dir, "preprocessed", create=True)
 
         target_img = prep_dir / f"page_{page_number:04d}_preprocessed.{format_extension}"
         target_meta = prep_dir / f"page_{page_number:04d}_metadata.json"
@@ -323,7 +326,7 @@ class LocalDiskStorage(StorageBackend):
 
     def get_page_metadata(self, document_id: str, page_number: int) -> Optional[dict]:
         doc_dir = self._get_document_dir(document_id)
-        meta_file = doc_dir / "preprocessed" / f"page_{page_number:04d}_metadata.json"
+        meta_file = self._inside(doc_dir / "preprocessed" / f"page_{page_number:04d}_metadata.json")
         if not meta_file.exists():
             return None
         try:
@@ -338,19 +341,19 @@ class LocalDiskStorage(StorageBackend):
 
     def cleanup_preprocessed(self, document_id: str) -> None:
         doc_dir = self._get_document_dir(document_id)
-        prep_dir = doc_dir / "preprocessed"
+        prep_dir = self._subdir(doc_dir, "preprocessed")
         if prep_dir.exists():
             shutil.rmtree(prep_dir, ignore_errors=True)
 
     def list_page_images(self, document_id: str) -> List[StoredArtifact]:
         doc_dir = self._get_document_dir(document_id)
-        pages_dir = doc_dir / "pages"
+        pages_dir = self._subdir(doc_dir, "pages")
         if not pages_dir.exists():
             return []
 
         artifacts: List[StoredArtifact] = []
         for file in sorted(pages_dir.glob("page_*.*")):
-            if file.is_file() and not file.name.startswith(".tmp_"):
+            if file.is_file() and not file.is_symlink() and not file.name.startswith(".tmp_"):
                 # Parse page number from page_0001.png
                 parts = file.stem.split("_")
                 try:
@@ -381,23 +384,28 @@ class LocalDiskStorage(StorageBackend):
         Safely resolves a logical URI ({tenant_id}/{doc_id}/...) to local filesystem path.
         Guarantees:
         - Prevents directory traversal (e.g. '..', leading slashes).
-        - Verifies that target path belongs strictly to self.tenant_id.
+        - The first segment must be exactly self.tenant_id (never another tenant, never an alias of it).
+        - The result stays inside this tenant's directory, with no symlink on the way.
         """
         if ".." in storage_uri or "\\" in storage_uri or storage_uri.startswith("/"):
             raise StorageError(
                 message="Unsafe storage URI detected.",
                 details={"storage_uri": storage_uri},
             )
-        resolved = (self.base_dir / storage_uri).resolve()
-        expected_tenant_dir = (self.base_dir / self.tenant_id).resolve()
-        try:
-            resolved.relative_to(expected_tenant_dir)
-        except ValueError:
+        tenant_segment, _, relative = storage_uri.partition("/")
+        if tenant_segment != self.tenant_id or relative.startswith("/"):
             raise StorageError(
                 message="Cross-tenant access or path escape forbidden.",
                 details={"storage_uri": storage_uri, "tenant_id": self.tenant_id},
             )
-        return resolved
+        tenant_dir = self._tenant_dir(create=False)
+        try:
+            return ensure_inside_tenant(tenant_dir, tenant_dir / relative if relative else tenant_dir).resolve()
+        except TenantStorageIsolationError as exc:
+            raise StorageError(
+                message="Cross-tenant access or path escape forbidden.",
+                details={"storage_uri": storage_uri, "tenant_id": self.tenant_id, "reason": exc.details.get("reason")},
+            ) from exc
 
     def save_document_record(self, record: Any) -> None:
         doc_dir = self._get_document_dir(record.document_id)
@@ -421,7 +429,7 @@ class LocalDiskStorage(StorageBackend):
 
     def get_document_record(self, document_id: str) -> Optional[Any]:
         doc_dir = self._get_document_dir(document_id)
-        target_file = doc_dir / "document_record.json"
+        target_file = self._inside(doc_dir / "document_record.json")
         if not target_file.exists():
             return None
         try:
@@ -435,14 +443,14 @@ class LocalDiskStorage(StorageBackend):
             ) from exc
 
     def find_document_by_hash(self, file_hash: str) -> Optional[Any]:
-        tenant_dir = (self.base_dir / self.tenant_id).resolve()
+        tenant_dir = self._tenant_dir(create=False)
         if not tenant_dir.exists():
             return None
         import json
         for doc_dir in tenant_dir.iterdir():
-            if doc_dir.is_dir() and doc_dir.name != "idempotency":
+            if doc_dir.is_dir() and not doc_dir.is_symlink() and doc_dir.name != "idempotency":
                 rec_file = doc_dir / "document_record.json"
-                if rec_file.exists():
+                if rec_file.exists() and not rec_file.is_symlink():
                     try:
                         with open(rec_file, "r", encoding="utf-8") as f:
                             data = json.load(f)
@@ -474,7 +482,7 @@ class LocalDiskStorage(StorageBackend):
 
     def get_handoff_payload(self, document_id: str) -> Optional[dict]:
         doc_dir = self._get_document_dir(document_id)
-        target_file = doc_dir / "module_a_handoff.json"
+        target_file = self._inside(doc_dir / "module_a_handoff.json")
         if not target_file.exists():
             return None
         try:

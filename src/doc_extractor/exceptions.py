@@ -167,6 +167,37 @@ class StorageError(DocumentExtractorError):
         )
 
 
+class InvalidTenantIdentifierError(StorageError, ValueError):
+    """
+    A tenant identifier is not usable as an isolation boundary (empty, oversized, or able to leave its own
+    directory). It is a ``ValueError`` too, so model validators turn it into a typed validation error, and a
+    ``StorageError`` so storage callers can catch it. The offending value is never echoed.
+    """
+
+    def __init__(self, reason: str, request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="Invalid tenant identifier.",
+            code="INVALID_TENANT_IDENTIFIER",
+            request_id=request_id,
+            details={"reason": reason},
+        )
+
+
+class TenantStorageIsolationError(StorageError):
+    """
+    A tenant's storage location failed an isolation check: it would collide with another identity on this
+    filesystem, is a symlink or leaves the tenant boundary, or carries another tenant's identity marker.
+    """
+
+    def __init__(self, reason: str, request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="Tenant storage isolation check failed.",
+            code="TENANT_STORAGE_ISOLATION_FAILED",
+            request_id=request_id,
+            details={"reason": reason},
+        )
+
+
 class LLMExecutionError(DocumentExtractorError):
     """
     Raised when LLM grammar-constrained extraction fails and fallback is disabled (SCH-007).

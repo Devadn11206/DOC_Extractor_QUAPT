@@ -18,11 +18,13 @@ from doc_extractor.exceptions import (
     ConflictError as IngestionConflictError,
     DocumentExtractorError,
     DocumentProcessingError,
+    InvalidTenantIdentifierError,
     LLMExecutionError,
     MalwareDetectedError,
     ScannerUnavailableError,
     SecurityCheckFailedError,
     StorageError,
+    TenantStorageIsolationError,
     UnsupportedFileError,
 )
 
@@ -306,6 +308,8 @@ _STATUS_CODE_MAP: Dict[Any, int] = {
     RateLimitExceededError: 429,        # PRD §19: 429 RATE_LIMITED
     ApiValidationError: 422,
     ConfigurationError: 500,
+    InvalidTenantIdentifierError: 422,    # typed validation error (subclass of StorageError: listed first by MRO)
+    TenantStorageIsolationError: 500,     # integrity fault with its own typed code, never a bare OS error
     StorageError: 500,
     LLMExecutionError: 502,
     DocumentProcessingError: 500,

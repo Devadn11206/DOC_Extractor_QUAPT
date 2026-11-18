@@ -1,11 +1,9 @@
 """
-SEC-006: a tenant identifier names a storage directory, so no tenant ID may address another tenant's.
-Reproduced regression: ``ApiPrincipal(tenant_id="tenant_a/../tenant_b")`` was accepted and
-``LocalDiskStorage`` resolved it into tenant_b's folder; ``LocalIdempotencyStore`` silently collapsed it
-to "tenant_b" (``Path(tenant_id).name``).
+SEC-006 at the API's principal boundary (needs the optional ``api`` extra). The storage-side isolation tests need
+no FastAPI and live in ``tests/test_tenant_isolation.py``.
 
-The guard rejects only values that can leave their directory. It does NOT define a tenant-ID format, so
-ordinary identifiers must keep working (several are asserted below).
+Reproduced regression: ``ApiPrincipal(tenant_id="tenant_a/../tenant_b")`` was accepted. The guard rejects only values
+that can leave their directory; it does NOT define a tenant-ID format, so ordinary identifiers keep working.
 """
 
 import pytest
@@ -13,7 +11,6 @@ import pytest
 pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
 
 import asyncio
-from datetime import datetime, timezone
 
 from pydantic import ValidationError
 
@@ -21,49 +18,14 @@ from doc_extractor.api.exceptions import InvalidTokenError
 from doc_extractor.api.ports.authentication import ApiPrincipal, TenantContext
 from doc_extractor.api.providers.api_key_auth import ApiKeyAuthenticationProvider
 from doc_extractor.api.token_core import create_api_key_record, generate_api_secret
-from doc_extractor.exceptions import StorageError
-from doc_extractor.idempotency import LocalIdempotencyStore
-from doc_extractor.models import IdempotencyRecord
-from doc_extractor.storage import LocalDiskStorage
-from doc_extractor.tenancy import require_path_safe_tenant_id, tenant_id_path_problem
 from tests.test_api_key_service import MockApiKeyRepository, MockAuditLogger
 
 UNSAFE = [
     "", ".", "..", "tenant_a/../tenant_b", "../x", "a/b", "/abs", "a\\b", "..\\x",
-    "a\x00b", "a\nb", "a\tb", "a\x7fb",
+    "a\x00b", "a\nb", "a\tb", "a\x7fb", "x" * 400,
 ]
 # Valid tenant IDs of any style stay valid: the guard is not a format rule.
 ORDINARY = ["tenant_alpha", "default_tenant", "t-1", "org:123", "Acme Corp", "a..b", "...", "tenant.alpha", "测试"]
-
-
-# -- the shared guard -----------------------------------------------------------------------------
-
-@pytest.mark.parametrize("tenant_id", UNSAFE)
-def test_unsafe_tenant_ids_are_rejected(tenant_id):
-    assert tenant_id_path_problem(tenant_id, windows=False) is not None
-    with pytest.raises(ValueError):
-        require_path_safe_tenant_id(tenant_id, windows=False)
-
-
-@pytest.mark.parametrize("tenant_id", ORDINARY)
-def test_ordinary_tenant_ids_are_not_restricted(tenant_id):
-    assert tenant_id_path_problem(tenant_id, windows=False) is None
-    assert tenant_id_path_problem(tenant_id, windows=True) is None or ":" in tenant_id
-    assert require_path_safe_tenant_id(tenant_id, windows=False) == tenant_id
-
-
-def test_a_drive_prefix_is_rejected_only_under_windows_semantics():
-    assert tenant_id_path_problem("C:", windows=True) == "drive_prefix"
-    assert tenant_id_path_problem("C:", windows=False) is None          # a plain name on POSIX
-    assert tenant_id_path_problem("org:123", windows=True) is None      # not a drive
-
-
-def test_non_strings_are_rejected_and_the_value_is_never_echoed():
-    assert tenant_id_path_problem(None) == "not_a_string"
-    assert tenant_id_path_problem(123) == "not_a_string"
-    with pytest.raises(ValueError) as exc:
-        require_path_safe_tenant_id("tenant_a/../tenant_b")
-    assert "tenant_a" not in str(exc.value)
 
 
 # -- principal boundary ---------------------------------------------------------------------------
@@ -109,65 +71,50 @@ def test_an_api_key_record_with_an_unsafe_tenant_is_refused_with_401_not_500():
     assert token.raw_secret not in repr(audit.__dict__)
 
 
-# -- storage boundary -----------------------------------------------------------------------------
+# -- typed HTTP behaviour of the tenant errors ------------------------------------------------------
 
-@pytest.mark.parametrize("tenant_id", UNSAFE)
-def test_storage_refuses_an_unsafe_tenant_id(tmp_path, tenant_id):
-    with pytest.raises(StorageError):
-        LocalDiskStorage(tmp_path, tenant_id=tenant_id)
-
-
-def test_the_reproduced_traversal_no_longer_reaches_another_tenants_documents(tmp_path):
-    victim = LocalDiskStorage(tmp_path, tenant_id="tenant_b")
-    victim._get_document_dir("doc_1").mkdir(parents=True)
-    (victim._get_document_dir("doc_1") / "document_record.json").write_text("{}")
-    with pytest.raises(StorageError):
-        LocalDiskStorage(tmp_path, tenant_id="tenant_a/../tenant_b")
+def test_tenant_errors_have_explicit_typed_http_statuses():
+    from doc_extractor.api.exceptions import get_status_code_for_exception
+    from doc_extractor.exceptions import InvalidTenantIdentifierError, StorageError, TenantStorageIsolationError
+    assert get_status_code_for_exception(InvalidTenantIdentifierError("too_long")) == 422     # not the 500 of its StorageError parent
+    assert get_status_code_for_exception(TenantStorageIsolationError("directory_alias_collision")) == 500
+    assert get_status_code_for_exception(StorageError("x")) == 500
 
 
-def test_a_tenant_id_reassigned_after_construction_is_still_checked(tmp_path):
-    storage = LocalDiskStorage(tmp_path, tenant_id="tenant_a")
-    storage.tenant_id = "tenant_a/../tenant_b"
-    with pytest.raises(StorageError):
-        storage._get_document_dir("doc_1")
+def test_an_oversized_tenant_id_reaching_storage_answers_422_with_a_typed_code_over_http(tmp_path):
+    from fastapi.testclient import TestClient
+    from doc_extractor.api.app import create_app
+    from doc_extractor.api.config import ApiSettings
+    from doc_extractor.storage import LocalDiskStorage
+
+    app = create_app(ApiSettings(app_env="development"))
+
+    @app.get("/probe/oversized")
+    def oversized():
+        LocalDiskStorage(tmp_path, tenant_id="x" * 5000)
+
+    response = TestClient(app, raise_server_exceptions=False).get("/probe/oversized")
+    error = response.json()["error"]
+    assert response.status_code == 422 and error["code"] == "INVALID_TENANT_IDENTIFIER"
+    assert error["details"] == {"reason": "too_long"} and "xxxx" not in response.text           # never echoed
 
 
-def test_two_ordinary_tenants_still_get_disjoint_directories(tmp_path):
-    a = LocalDiskStorage(tmp_path, tenant_id="tenant_a")._get_document_dir("doc_1")
-    b = LocalDiskStorage(tmp_path, tenant_id="org:123")._get_document_dir("doc_1")
-    assert a != b and a.parent != b.parent
-    assert tmp_path.resolve() in a.parents and tmp_path.resolve() in b.parents
+def test_an_isolation_failure_over_http_is_a_typed_500_that_names_no_tenant(tmp_path):
+    from fastapi.testclient import TestClient
+    from doc_extractor.api.app import create_app
+    from doc_extractor.api.config import ApiSettings
+    from doc_extractor.storage import LocalDiskStorage
 
+    (tmp_path / "tenant_v").mkdir()
+    import os
+    os.symlink(tmp_path / "tenant_v", tmp_path / "tenant_s")
+    app = create_app(ApiSettings(app_env="development"))
 
-def test_storage_error_does_not_echo_the_tenant_id(tmp_path):
-    with pytest.raises(StorageError) as exc:
-        LocalDiskStorage(tmp_path, tenant_id="tenant_a/../tenant_b")
-    assert "tenant_b" not in exc.value.message and "tenant_b" not in str(exc.value.details)
+    @app.get("/probe/symlink")
+    def symlink():
+        LocalDiskStorage(tmp_path, tenant_id="tenant_s")._get_document_dir("doc_1")
 
-
-# -- idempotency store boundary -------------------------------------------------------------------
-
-def _record(tenant_id):
-    now = datetime.now(timezone.utc).timestamp()
-    return IdempotencyRecord(
-        idempotency_key="k1", tenant_id=tenant_id, request_fingerprint="f", document_id="doc_1",
-        response_payload={}, created_at_utc=now, expires_at_utc=now + 3600,
-    )
-
-
-@pytest.mark.parametrize("tenant_id", ["tenant_a/../tenant_b", "../x", "a/b", ".."])
-def test_the_idempotency_store_rejects_instead_of_collapsing_the_tenant_id(tmp_path, tenant_id):
-    store = LocalIdempotencyStore(tmp_path)
-    with pytest.raises(StorageError):
-        store.get_record(tenant_id, "k1")
-    with pytest.raises(StorageError):
-        store.save_record(_record(tenant_id))
-    with pytest.raises(StorageError):
-        store.delete_record(tenant_id, "k1")
-
-
-def test_idempotency_records_of_two_tenants_stay_separate(tmp_path):
-    store = LocalIdempotencyStore(tmp_path)
-    store.save_record(_record("tenant_a"))
-    assert store.get_record("tenant_a", "k1") is not None
-    assert store.get_record("tenant_b", "k1") is None          # the old collapse would have exposed it here
+    response = TestClient(app, raise_server_exceptions=False).get("/probe/symlink")
+    error = response.json()["error"]
+    assert response.status_code == 500 and error["code"] == "TENANT_STORAGE_ISOLATION_FAILED"
+    assert error["details"] == {"reason": "tenant_directory_is_a_symlink"} and "tenant_v" not in response.text
