@@ -41,7 +41,46 @@ class PrincipalType(str, Enum):
     SYSTEM = "system"
 
 
-class TenantContext(BaseModel):
+class _TenantBoundModel(BaseModel):
+    """
+    Base of every model that carries the authoritative ``tenant_id``.
+
+    The tenant is checked when the model is created (a field validator) AND on every other way of producing an
+    instance that pydantic does not validate: ``model_copy(update=...)``, the deprecated ``copy(update=...)``,
+    ``copy.replace`` (``__replace__``) and ``model_construct``. Without this, ``principal.model_copy(update=
+    {"tenant_id": "a/../b"})`` yielded a principal that no validator had seen.
+
+    ``object.__setattr__`` on a frozen instance cannot be intercepted from Python; the storage layer
+    (``doc_extractor.tenancy``) re-verifies the tenant at use, so that is a second, independent boundary.
+    """
+
+    @field_validator("tenant_id", check_fields=False)
+    @classmethod
+    def _tenant_id_must_be_usable(cls, value: str) -> str:
+        """Tenant IDs name storage directories: reject values that could address another tenant (SEC-006)."""
+        return require_path_safe_tenant_id(value)
+
+    def model_copy(self, *, update: Optional[Dict[str, Any]] = None, deep: bool = False):  # type: ignore[override]
+        clone = super().model_copy(update=update, deep=deep)
+        require_path_safe_tenant_id(getattr(clone, "tenant_id", None))
+        return clone
+
+    def copy(self, *, include=None, exclude=None, update=None, deep: bool = False):  # type: ignore[override]
+        if include is not None or exclude is not None:
+            raise TypeError("include/exclude are not supported: use model_copy(update=...)")
+        return self.model_copy(update=update, deep=deep)
+
+    def __replace__(self, **changes: Any):
+        return self.model_copy(update=changes)
+
+    @classmethod
+    def model_construct(cls, _fields_set=None, **values: Any):  # type: ignore[override]
+        instance = super().model_construct(_fields_set, **values)
+        require_path_safe_tenant_id(getattr(instance, "tenant_id", None))
+        return instance
+
+
+class TenantContext(_TenantBoundModel):
     """
     Immutable representation of an authenticated tenant boundary.
     Guaranteed to originate exclusively from a verified principal.
@@ -53,14 +92,8 @@ class TenantContext(BaseModel):
     name: Optional[str] = Field(None, description="Optional tenant display name")
     is_active: bool = Field(default=True, description="Whether tenant is currently in good standing")
 
-    @field_validator("tenant_id")
-    @classmethod
-    def _tenant_id_must_be_path_safe(cls, value: str) -> str:
-        """Tenant IDs name storage directories: reject values that could address another tenant (SEC-006)."""
-        return require_path_safe_tenant_id(value)
 
-
-class ApiPrincipal(BaseModel):
+class ApiPrincipal(_TenantBoundModel):
     """
     Authoritative authenticated principal representing the caller.
 
@@ -77,12 +110,6 @@ class ApiPrincipal(BaseModel):
     is_active: bool = Field(default=True, description="Active status; inactive principals fail closed")
     mfa_verified: bool = Field(default=False, description="Whether credential verified MFA (SEC-001)")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Redacted principal metadata")
-
-    @field_validator("tenant_id")
-    @classmethod
-    def _tenant_id_must_be_path_safe(cls, value: str) -> str:
-        """The principal is the only source of tenant identity, so it is checked where it is created."""
-        return require_path_safe_tenant_id(value)
 
     @property
     def tenant_context(self) -> TenantContext:

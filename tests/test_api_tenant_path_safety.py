@@ -118,3 +118,83 @@ def test_an_isolation_failure_over_http_is_a_typed_500_that_names_no_tenant(tmp_
     error = response.json()["error"]
     assert response.status_code == 500 and error["code"] == "TENANT_STORAGE_ISOLATION_FAILED"
     assert error["details"] == {"reason": "tenant_directory_is_a_symlink"} and "tenant_v" not in response.text
+
+
+# -- the validator cannot be bypassed by copying or constructing a principal ------------------------
+
+import copy
+import sys
+
+import pytest
+
+UNSAFE_FOR_COPY = ["tenant_a/../tenant_b", "../x", "a\\b", "", "x" * 400, "a\x00b"]
+MODELS = [
+    pytest.param(lambda tid="tenant_a": ApiPrincipal(principal_id="k", tenant_id=tid), id="ApiPrincipal"),
+    pytest.param(lambda tid="tenant_a": TenantContext(tenant_id=tid), id="TenantContext"),
+]
+
+
+@pytest.mark.parametrize("make", MODELS)
+@pytest.mark.parametrize("tenant_id", UNSAFE_FOR_COPY)
+def test_model_copy_cannot_install_an_unsafe_tenant_id(make, tenant_id):
+    original = make()
+    with pytest.raises(ValueError):
+        original.model_copy(update={"tenant_id": tenant_id})
+    assert original.tenant_id == "tenant_a"                      # the original is untouched
+
+
+@pytest.mark.parametrize("make", MODELS)
+@pytest.mark.parametrize("tenant_id", UNSAFE_FOR_COPY)
+def test_the_deprecated_copy_and_model_construct_cannot_install_an_unsafe_tenant_id(make, tenant_id):
+    original = make()
+    with pytest.raises(ValueError):
+        original.copy(update={"tenant_id": tenant_id})
+    with pytest.raises(ValueError):
+        type(original).model_construct(**{**original.model_dump(), "tenant_id": tenant_id})
+
+
+@pytest.mark.parametrize("make", MODELS)
+def test_model_construct_without_a_tenant_is_refused_not_left_half_built(make):
+    with pytest.raises(ValueError):
+        type(make()).model_construct(principal_id="k")
+
+
+@pytest.mark.parametrize("make", MODELS)
+def test_replace_cannot_install_an_unsafe_tenant_id(make):
+    """``__replace__`` is what ``copy.replace`` calls (Python 3.13+); test it directly on every version."""
+    with pytest.raises(ValueError):
+        make().__replace__(tenant_id="tenant_a/../tenant_b")
+    if hasattr(copy, "replace"):                       # no skip: the extra assertion simply applies where it exists
+        with pytest.raises(ValueError):
+            copy.replace(make(), tenant_id="tenant_a/../tenant_b")
+    assert make().__replace__(tenant_id="org:9").tenant_id == "org:9"
+
+
+@pytest.mark.parametrize("make", MODELS)
+def test_a_valid_change_through_copy_is_still_allowed_and_leaves_the_original_alone(make):
+    original = make()
+    changed = original.model_copy(update={"tenant_id": "Org:7"})
+    assert changed.tenant_id == "Org:7" and original.tenant_id == "tenant_a"
+    assert type(original.copy(update={"tenant_id": "tenant_b"})) is type(original)
+
+
+def test_other_fields_are_unaffected_by_the_copy_guard():
+    principal = ApiPrincipal(principal_id="k", tenant_id="tenant_a", scopes={"documents:read"})
+    clone = principal.model_copy(update={"scopes": {"documents:write"}})
+    assert clone.scopes == {"documents:write"} and principal.scopes == {"documents:read"} and clone.tenant_id == "tenant_a"
+
+
+def test_a_frozen_principal_still_refuses_attribute_assignment():
+    principal = ApiPrincipal(principal_id="k", tenant_id="tenant_a")
+    with pytest.raises(ValidationError):
+        principal.tenant_id = "tenant_b"
+
+
+def test_object_setattr_cannot_be_intercepted_so_storage_is_the_independent_second_boundary(tmp_path):
+    """Documented limit: a forged instance is still refused where the tenant becomes a directory."""
+    from doc_extractor.exceptions import InvalidTenantIdentifierError
+    from doc_extractor.storage import LocalDiskStorage
+    principal = ApiPrincipal(principal_id="k", tenant_id="tenant_a")
+    object.__setattr__(principal, "tenant_id", "tenant_a/../tenant_b")
+    with pytest.raises(InvalidTenantIdentifierError):
+        LocalDiskStorage(tmp_path, tenant_id=principal.tenant_id)
