@@ -7,6 +7,9 @@ Adheres to:
 - Preserves full compatibility with DocumentExtractorError hierarchy.
 """
 
+import math
+import re
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Optional
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -354,6 +357,56 @@ def get_status_code_for_exception(exc: Exception) -> int:
     return 500
 
 
+# Protocol headers an exception may carry to the client. Everything else on an exception is dropped, so internal
+# headers can never leak into a response; nothing is invented except WWW-Authenticate on a 401 (RFC 9110 requires it).
+_PRESERVED_HEADERS = {"retry-after": "Retry-After", "www-authenticate": "WWW-Authenticate", "allow": "Allow"}
+_MAX_HEADER_VALUE = 512
+
+
+def _clean_header_value(value: Any) -> Optional[str]:
+    text = str(value).strip()
+    if not text or len(text) > _MAX_HEADER_VALUE or any(ch in text for ch in "\r\n\x00"):
+        return None
+    return text
+
+
+def sanitize_retry_after(value: Any) -> Optional[str]:
+    """
+    A valid ``Retry-After`` (API-012): a non-negative number of seconds, or an HTTP-date. A negative value is clamped
+    to 0, as the domain rate-limit path always did; anything that is neither (text, NaN, header injection) is dropped
+    rather than sent, because a malformed header is worse than none.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(max(0, value))
+    if isinstance(value, float):
+        return str(max(0, int(value))) if math.isfinite(value) else None
+    text = _clean_header_value(value)
+    if text is None:
+        return None
+    if re.fullmatch(r"-?\d+", text):
+        return str(max(0, int(text)))
+    try:
+        parsedate_to_datetime(text)                           # an HTTP-date
+        return text
+    except (TypeError, ValueError):
+        return None
+
+
+def preserved_headers(raw: Any) -> Dict[str, str]:
+    """The Retry-After, WWW-Authenticate and Allow headers of an exception, validated; nothing else."""
+    kept: Dict[str, str] = {}
+    for name, value in (raw or {}).items():
+        canonical = _PRESERVED_HEADERS.get(str(name).lower())
+        if canonical is None:
+            continue
+        cleaned = sanitize_retry_after(value) if canonical == "Retry-After" else _clean_header_value(value)
+        if cleaned is not None:
+            kept[canonical] = cleaned
+    return kept
+
+
 def build_error_response(
     code: str,
     message: str,
@@ -366,6 +419,8 @@ def build_error_response(
     resp_headers = dict(headers or {})
     if request_id:
         resp_headers["X-Request-ID"] = request_id
+    if status_code == 401 and not any(name.lower() == "www-authenticate" for name in resp_headers):
+        resp_headers["WWW-Authenticate"] = "Bearer"        # a 401 must say how to authenticate (RFC 9110, section 15.5.2)
 
     payload = {
         "error": {
@@ -402,9 +457,11 @@ async def document_extractor_error_handler(request: Request, exc: DocumentExtrac
     """Handles all DocumentExtractorError subclasses and formats them per API-010."""
     status_code = get_status_code_for_exception(exc)
     req_id = extract_request_id(request, exc)
-    extra_headers: Dict[str, str] = {}
-    if hasattr(exc, "retry_after_seconds") and exc.retry_after_seconds is not None:
-        extra_headers["Retry-After"] = str(max(0, int(exc.retry_after_seconds)))
+    extra_headers = preserved_headers(getattr(exc, "headers", None))
+    if getattr(exc, "retry_after_seconds", None) is not None:
+        retry_after = sanitize_retry_after(exc.retry_after_seconds)
+        if retry_after is not None:
+            extra_headers["Retry-After"] = retry_after
     return build_error_response(
         code=exc.code,
         message=exc.message,
@@ -436,10 +493,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
     }
     code = code_lookup.get(status_code, f"HTTP_{status_code}")
     message = str(exc.detail) if exc.detail else "HTTP request failed."
-    extra_headers: Dict[str, str] = {}
-    for header_name, header_value in (exc.headers or {}).items():
-        if str(header_name).lower() == "retry-after":       # header names are case-insensitive (API-012)
-            extra_headers["Retry-After"] = str(header_value)
+    extra_headers = preserved_headers(exc.headers)           # Retry-After (validated), WWW-Authenticate, Allow
     return build_error_response(
         code=code,
         message=message,
