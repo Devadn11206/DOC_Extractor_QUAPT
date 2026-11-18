@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Any, Dict, Optional, Protocol, Set, runtime_checkable
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from doc_extractor.tenancy import require_path_safe_tenant_id
 
 # Try importing M4 roles for full type interoperability
 try:
@@ -44,11 +46,18 @@ class TenantContext(BaseModel):
     Immutable representation of an authenticated tenant boundary.
     Guaranteed to originate exclusively from a verified principal.
     """
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    # hide_input_in_errors: a rejected tenant ID is attacker-controlled and must not be echoed (SEC-012)
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     tenant_id: str = Field(..., min_length=1, description="Authoritative tenant identifier")
     name: Optional[str] = Field(None, description="Optional tenant display name")
     is_active: bool = Field(default=True, description="Whether tenant is currently in good standing")
+
+    @field_validator("tenant_id")
+    @classmethod
+    def _tenant_id_must_be_path_safe(cls, value: str) -> str:
+        """Tenant IDs name storage directories: reject values that could address another tenant (SEC-006)."""
+        return require_path_safe_tenant_id(value)
 
 
 class ApiPrincipal(BaseModel):
@@ -57,7 +66,7 @@ class ApiPrincipal(BaseModel):
 
     Holds identity, tenant binding, canonical roles, and granular API scopes.
     """
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     principal_id: str = Field(..., min_length=1, description="Unique subject identifier (key ID, user ID)")
     tenant_id: str = Field(..., min_length=1, description="Mandatory tenant identifier binding")
@@ -68,6 +77,12 @@ class ApiPrincipal(BaseModel):
     is_active: bool = Field(default=True, description="Active status; inactive principals fail closed")
     mfa_verified: bool = Field(default=False, description="Whether credential verified MFA (SEC-001)")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Redacted principal metadata")
+
+    @field_validator("tenant_id")
+    @classmethod
+    def _tenant_id_must_be_path_safe(cls, value: str) -> str:
+        """The principal is the only source of tenant identity, so it is checked where it is created."""
+        return require_path_safe_tenant_id(value)
 
     @property
     def tenant_context(self) -> TenantContext:

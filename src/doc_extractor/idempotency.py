@@ -17,6 +17,7 @@ from typing import Dict, Optional, Tuple, Union
 
 from doc_extractor.exceptions import ConflictError, StorageError
 from doc_extractor.models import IdempotencyRecord
+from doc_extractor.tenancy import tenant_id_path_problem
 
 
 class IdempotencyStore(ABC):
@@ -66,7 +67,15 @@ class LocalIdempotencyStore(IdempotencyStore):
 
     def _get_record_path(self, tenant_id: str, idempotency_key: str) -> Path:
         import hashlib
-        safe_tenant = Path(tenant_id).name
+        # Reject, never "sanitize": Path(tenant_id).name used to collapse "tenant_a/../tenant_b" into
+        # "tenant_b" and so address another tenant's records (SEC-006).
+        problem = tenant_id_path_problem(tenant_id)
+        if problem is not None:
+            raise StorageError(
+                message="Unsafe tenant identifier for the idempotency store.",
+                details={"reason": problem},
+            )
+        safe_tenant = tenant_id
         key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
         tenant_dir = (self.base_dir / safe_tenant / "idempotency").resolve()
         tenant_dir.mkdir(parents=True, exist_ok=True)

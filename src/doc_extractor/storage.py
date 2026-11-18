@@ -17,6 +17,7 @@ import uuid
 
 from doc_extractor.config import Settings
 from doc_extractor.exceptions import StorageError
+from doc_extractor.tenancy import tenant_id_path_problem
 
 
 @dataclass(frozen=True)
@@ -132,10 +133,22 @@ class LocalDiskStorage(StorageBackend):
     """
 
     def __init__(self, base_dir: Union[str, Path], tenant_id: str = "default_tenant") -> None:
+        self._require_safe_tenant(tenant_id)
         self.base_dir = Path(base_dir).resolve()
         self.tenant_id = tenant_id
 
+    @staticmethod
+    def _require_safe_tenant(tenant_id: str) -> None:
+        """The tenant ID is a directory name: refuse one that could address another tenant (SEC-006)."""
+        problem = tenant_id_path_problem(tenant_id)
+        if problem is not None:
+            raise StorageError(
+                message="Unsafe tenant identifier for storage.",
+                details={"reason": problem},
+            )
+
     def _get_document_dir(self, document_id: str) -> Path:
+        self._require_safe_tenant(self.tenant_id)      # also guards a tenant_id reassigned after construction
         # Check for path traversal characters before stripping
         if "/" in document_id or "\\" in document_id or ".." in document_id:
             raise StorageError(

@@ -189,8 +189,21 @@ class ApiKeyAuthenticationProvider(AuthenticationProvider):
                     code="TOKEN_EXPIRED",
                 )
 
-        # 6. Build authoritative ApiPrincipal
-        principal = create_api_key_principal(record, current_time=now_utc)
+        # 6. Build authoritative ApiPrincipal. A stored record whose tenant ID is not path-safe is refused
+        #    here (fail closed, 401) instead of surfacing a validation error as HTTP 500.
+        try:
+            principal = create_api_key_principal(record, current_time=now_utc)
+        except ValueError:
+            await self._safe_log_audit_failure(
+                actor_id=record.key_id,
+                tenant_id="unknown",
+                resource_id=record.key_id,
+                error_code="INVALID_CREDENTIALS",
+            )
+            raise InvalidTokenError(
+                message="API key is invalid or unrecognized.",
+                code="INVALID_CREDENTIALS",
+            )
 
         # 7. Record last-used timestamp
         try:
