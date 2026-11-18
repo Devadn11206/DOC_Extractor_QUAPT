@@ -185,15 +185,15 @@ def test_case_variants_are_separate_even_when_each_is_resolved_first(tmp_path):
 
 
 def test_the_same_identity_always_resolves_to_the_same_directory(tmp_path):
-    first = LocalDiskStorage(tmp_path, tenant_id="Org:7")._tenant_dir()
-    again = LocalDiskStorage(tmp_path, tenant_id="Org:7")._tenant_dir()
+    first = LocalDiskStorage(tmp_path, tenant_id="Org:7")._tenant_dir(create=True)
+    again = LocalDiskStorage(tmp_path, tenant_id="Org:7")._tenant_dir(create=True)
     assert first == again and first.name == tenant_storage_key("Org:7")
 
 
 def test_both_stores_agree_on_the_tenant_directory(tmp_path):
     storage = LocalDiskStorage(tmp_path, tenant_id="Tenant_X")
     store = LocalIdempotencyStore(tmp_path)
-    assert store._resolver.resolve("Tenant_X", create=True) == storage._tenant_dir()
+    assert store._resolver.resolve("Tenant_X", create=True) == storage._tenant_dir(create=True)
 
 
 # -- existing data is preserved -------------------------------------------------------------------
@@ -287,7 +287,7 @@ def test_a_tenant_cannot_adopt_another_tenants_hashed_directory_by_naming_it(tmp
     assert owner_of(attacker) is None
     put(attacker)
     assert LocalDiskStorage(tmp_path, tenant_id="Victim").get_document_record("doc_1")["owner"] == "Victim"
-    assert attacker._tenant_dir().name != victim_dir.name
+    assert attacker._tenant_dir(create=True).name != victim_dir.name
 
 
 def test_a_marker_in_a_legacy_directory_naming_someone_else_is_refused(tmp_path):
@@ -336,7 +336,7 @@ def test_a_symlinked_document_directory_into_another_tenant_is_refused(tmp_path)
     victim = LocalDiskStorage(tmp_path, tenant_id="tenant_v")
     put(victim, "doc_9")
     mine = LocalDiskStorage(tmp_path, tenant_id="tenant_s")
-    mine._tenant_dir()
+    mine._tenant_dir(create=True)
     os.symlink(tmp_path / "tenant_v" / "doc_9", tmp_path / "tenant_s" / "doc_9")
     with pytest.raises(TenantStorageIsolationError) as exc:
         mine.get_document_record("doc_9")
@@ -347,7 +347,7 @@ def test_a_symlinked_subdirectory_cannot_redirect_writes_into_another_tenant(tmp
     outside = tmp_path / "tenant_v" / "doc_1" / "pages"
     outside.mkdir(parents=True)
     mine = LocalDiskStorage(tmp_path, tenant_id="tenant_s")
-    (mine._get_document_dir("doc_1")).mkdir(parents=True, exist_ok=True)
+    (mine._get_document_dir("doc_1", create=True)).mkdir(parents=True, exist_ok=True)
     os.symlink(outside, tmp_path / "tenant_s" / "doc_1" / "pages")
     with pytest.raises(TenantStorageIsolationError):
         mine.store_page_image("doc_1", 1, b"png-bytes")
@@ -359,7 +359,7 @@ def test_a_symlinked_record_file_is_refused_instead_of_followed(tmp_path):
     secret.mkdir(parents=True)
     (secret / "document_record.json").write_text(json.dumps({"document_id": "doc_1", "owner": "victim"}))
     mine = LocalDiskStorage(tmp_path, tenant_id="tenant_s")
-    os.makedirs(mine._get_document_dir("doc_1"), exist_ok=True)
+    os.makedirs(mine._get_document_dir("doc_1", create=True), exist_ok=True)
     os.symlink(secret / "document_record.json", tmp_path / "tenant_s" / "doc_1" / "document_record.json")
     with pytest.raises(TenantStorageIsolationError):
         mine.get_document_record("doc_1")
@@ -369,7 +369,7 @@ def test_symlinked_documents_and_records_are_skipped_by_the_hash_search(tmp_path
     victim = LocalDiskStorage(tmp_path, tenant_id="tenant_v")
     victim.save_document_record(type("R", (), {"document_id": "doc_1", "to_dict": lambda self: {"document_id": "doc_1", "file_hash_sha256": "H"}})())
     mine = LocalDiskStorage(tmp_path, tenant_id="tenant_s")
-    mine._tenant_dir()
+    mine._tenant_dir(create=True)
     os.symlink(tmp_path / "tenant_v" / "doc_1", tmp_path / "tenant_s" / "doc_1")
     assert mine.find_document_by_hash("H") is None
 
@@ -377,7 +377,7 @@ def test_symlinked_documents_and_records_are_skipped_by_the_hash_search(tmp_path
 def test_a_symlinked_idempotency_directory_is_refused(tmp_path):
     (tmp_path / "tenant_v" / "idempotency").mkdir(parents=True)
     store = LocalIdempotencyStore(tmp_path)
-    store.get_record("tenant_s", "k")                                    # creates tenant_s and its idempotency directory
+    store._get_record_path("tenant_s", "k", create=True)                 # provisions tenant_s and its idempotency directory
     (tmp_path / "tenant_s" / "idempotency").rmdir()
     os.symlink(tmp_path / "tenant_v" / "idempotency", tmp_path / "tenant_s" / "idempotency")
     with pytest.raises(TenantStorageIsolationError):

@@ -37,7 +37,11 @@ import uuid
 from pathlib import Path, PureWindowsPath
 from typing import Dict, Optional, Set
 
-from doc_extractor.exceptions import InvalidTenantIdentifierError, TenantStorageIsolationError
+from doc_extractor.exceptions import (
+    InvalidTenantIdentifierError,
+    TenantStorageIsolationError,
+    TenantStorageUnavailableError,
+)
 
 # A safety bound, not a format: the common limit of one path component, in UTF-8 bytes.
 MAX_TENANT_ID_BYTES = 255
@@ -101,6 +105,10 @@ def _isolation(reason: str) -> TenantStorageIsolationError:
     return TenantStorageIsolationError(reason)
 
 
+def _unavailable(reason: str) -> TenantStorageUnavailableError:
+    return TenantStorageUnavailableError(reason)
+
+
 class TenantDirectoryResolver:
     """Maps a tenant identity to its verified directory under ``base_dir`` (see the module docstring)."""
 
@@ -110,8 +118,9 @@ class TenantDirectoryResolver:
 
     # -- public ---------------------------------------------------------------------------------------
     def resolve(self, tenant_id: str, *, create: bool = False) -> Path:
-        """The tenant directory. With ``create`` a missing directory is created, marker first; without it a
-        missing directory is just returned as the path where it will be."""
+        """The tenant directory. READS never create anything: without ``create`` a missing directory is just returned
+        as the path where it will be. Only an explicit write/provisioning call passes ``create=True``, and then the
+        directory is created marker first. A filesystem failure is a typed ``TenantStorageUnavailableError``."""
         require_path_safe_tenant_id(tenant_id)
         name = self._names.get(tenant_id)
         if name is None:
@@ -131,6 +140,8 @@ class TenantDirectoryResolver:
                 return {entry.name for entry in it}
         except FileNotFoundError:
             return set()
+        except OSError as exc:                                   # for example PermissionError on an unreadable root
+            raise _unavailable("storage_root_unreadable") from exc
 
     def _decide(self, tenant_id: str) -> str:
         key = tenant_storage_key(tenant_id)
@@ -192,20 +203,26 @@ class TenantDirectoryResolver:
 
     def _create(self, path: Path, tenant_id: str, name: str) -> None:
         """Create the directory WITH its marker in one atomic rename, so no markerless directory ever exists."""
-        self.base_dir.mkdir(parents=True, exist_ok=True)
         staging = self.base_dir / f".tmp-tenant-{uuid.uuid4().hex}"
-        os.mkdir(staging)
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            os.mkdir(staging)
+        except OSError as exc:                                   # read-only or missing root, no permission, disk full
+            raise _unavailable("tenant_directory_not_creatable") from exc
         try:
             with open(staging / IDENTITY_MARKER, "w", encoding="utf-8") as handle:
                 json.dump({"schema": 1, "tenant_id": tenant_id, "key": name}, handle)
             os.rename(staging, path)
-        except OSError:
+        except OSError as exc:
             # Lost a race with a concurrent creator (or the name now exists): verify what is there instead.
-            for child in staging.iterdir():
-                child.unlink()
-            os.rmdir(staging)
+            try:
+                for child in staging.iterdir():
+                    child.unlink()
+                os.rmdir(staging)
+            except OSError:
+                pass                                             # a leftover staging directory is harmless
             if not os.path.lexists(path):
-                raise
+                raise _unavailable("tenant_directory_not_creatable") from exc
             self._verify_existing(path, tenant_id, name)
 
 

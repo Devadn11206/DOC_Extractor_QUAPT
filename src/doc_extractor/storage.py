@@ -16,7 +16,12 @@ from typing import Any, BinaryIO, List, Optional, Union
 import uuid
 
 from doc_extractor.config import Settings
-from doc_extractor.exceptions import CrossTenantStorageAccessError, StorageError, TenantStorageIsolationError
+from doc_extractor.exceptions import (
+    CrossTenantStorageAccessError,
+    StorageError,
+    TenantStorageIsolationError,
+    TenantStorageUnavailableError,
+)
 from doc_extractor.tenancy import TenantDirectoryResolver, ensure_inside_tenant, require_path_safe_tenant_id
 
 
@@ -145,11 +150,23 @@ class LocalDiskStorage(StorageBackend):
         self.tenant_id = tenant_id
         self._resolver = TenantDirectoryResolver(self.base_dir)
 
-    def _tenant_dir(self, *, create: bool = True) -> Path:
-        """The verified directory of ``self.tenant_id`` (re-validated each time, so a reassigned attribute is caught)."""
+    def _tenant_dir(self, *, create: bool = False) -> Path:
+        """
+        The verified directory of ``self.tenant_id`` (re-validated each time, so a reassigned attribute is caught).
+        Reads never create it; only the write operations below pass ``create=True``.
+        """
         return self._resolver.resolve(self.tenant_id, create=create)
 
-    def _get_document_dir(self, document_id: str) -> Path:
+    @staticmethod
+    def _make_dir(path: Path) -> None:
+        """``mkdir -p`` that reports a filesystem failure as a typed error (no path in the error)."""
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise TenantStorageUnavailableError("directory_not_creatable") from exc
+
+    def _get_document_dir(self, document_id: str, *, create: bool = False) -> Path:
+        """The verified document directory. ``create`` provisions the TENANT directory (writes only); reads leave the disk alone."""
         # Check for path traversal characters before stripping
         if "/" in document_id or "\\" in document_id or ".." in document_id:
             raise StorageError(
@@ -162,7 +179,7 @@ class LocalDiskStorage(StorageBackend):
                 message="Invalid document ID format.",
                 details={"document_id": document_id},
             )
-        tenant_dir = self._tenant_dir(create=True)
+        tenant_dir = self._tenant_dir(create=create)
         # No symlink anywhere on the way, and the resolved path must stay inside THIS tenant's directory.
         return ensure_inside_tenant(tenant_dir, tenant_dir / safe_doc_id)
 
@@ -173,7 +190,7 @@ class LocalDiskStorage(StorageBackend):
     def _subdir(self, doc_dir: Path, name: str, *, create: bool = False) -> Path:
         path = self._inside(doc_dir / name)
         if create:
-            path.mkdir(parents=True, exist_ok=True)
+            self._make_dir(path)
         return path
 
     def store_original_document(
@@ -182,7 +199,7 @@ class LocalDiskStorage(StorageBackend):
         document_data: Union[bytes, BinaryIO],
     ) -> StoredArtifact:
         """Persist the original PDF atomically inside tenant-scoped storage."""
-        doc_dir = self._get_document_dir(document_id)
+        doc_dir = self._get_document_dir(document_id, create=True)
         source_dir = self._subdir(doc_dir, "source", create=True)
 
         target_file = source_dir / "original.pdf"
@@ -229,7 +246,7 @@ class LocalDiskStorage(StorageBackend):
                 details={"page_number": page_number},
             )
 
-        doc_dir = self._get_document_dir(document_id)
+        doc_dir = self._get_document_dir(document_id, create=True)
         pages_dir = self._subdir(doc_dir, "pages", create=True)
 
         target_file = pages_dir / f"page_{page_number:04d}.{format_extension}"
@@ -278,7 +295,7 @@ class LocalDiskStorage(StorageBackend):
                 details={"page_number": page_number},
             )
 
-        doc_dir = self._get_document_dir(document_id)
+        doc_dir = self._get_document_dir(document_id, create=True)
         prep_dir = self._subdir(doc_dir, "preprocessed", create=True)
 
         target_img = prep_dir / f"page_{page_number:04d}_preprocessed.{format_extension}"
@@ -407,8 +424,8 @@ class LocalDiskStorage(StorageBackend):
             raise                                       # a symlink inside tenant storage: an integrity fault, kept loud
 
     def save_document_record(self, record: Any) -> None:
-        doc_dir = self._get_document_dir(record.document_id)
-        doc_dir.mkdir(parents=True, exist_ok=True)
+        doc_dir = self._get_document_dir(record.document_id, create=True)
+        self._make_dir(doc_dir)
         target_file = doc_dir / "document_record.json"
         temp_file = doc_dir / f".tmp_rec_{uuid.uuid4().hex}"
 
@@ -460,8 +477,8 @@ class LocalDiskStorage(StorageBackend):
         return None
 
     def save_handoff_payload(self, payload: Any) -> None:
-        doc_dir = self._get_document_dir(payload.document_id)
-        doc_dir.mkdir(parents=True, exist_ok=True)
+        doc_dir = self._get_document_dir(payload.document_id, create=True)
+        self._make_dir(doc_dir)
         target_file = doc_dir / "module_a_handoff.json"
         temp_file = doc_dir / f".tmp_handoff_{uuid.uuid4().hex}"
 

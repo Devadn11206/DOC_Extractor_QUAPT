@@ -15,7 +15,7 @@ from pathlib import Path
 import threading
 from typing import Dict, Optional, Tuple, Union
 
-from doc_extractor.exceptions import ConflictError, StorageError
+from doc_extractor.exceptions import ConflictError, StorageError, TenantStorageUnavailableError
 from doc_extractor.models import IdempotencyRecord
 from doc_extractor.tenancy import TenantDirectoryResolver, ensure_inside_tenant
 
@@ -67,14 +67,19 @@ class LocalIdempotencyStore(IdempotencyStore):
                 self._key_locks[composite] = threading.Lock()
             return self._key_locks[composite]
 
-    def _get_record_path(self, tenant_id: str, idempotency_key: str) -> Path:
+    def _get_record_path(self, tenant_id: str, idempotency_key: str, *, create: bool = False) -> Path:
         import hashlib
         # Same verified, collision-proof tenant directory as LocalDiskStorage (doc_extractor.tenancy): an unsafe
         # identity is refused with a typed error (never "sanitized": Path(tenant_id).name used to collapse
         # "tenant_a/../tenant_b" into "tenant_b"), colliding identities cannot share records, symlinks are refused.
-        tenant_dir = self._resolver.resolve(tenant_id, create=True)
+        # Reads (get/delete) never create anything: only save_record provisions the tenant and its idempotency directory.
+        tenant_dir = self._resolver.resolve(tenant_id, create=create)
         idempotency_dir = ensure_inside_tenant(tenant_dir, tenant_dir / "idempotency")
-        idempotency_dir.mkdir(parents=True, exist_ok=True)
+        if create:
+            try:
+                idempotency_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise TenantStorageUnavailableError("directory_not_creatable") from exc
         key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
         return ensure_inside_tenant(tenant_dir, idempotency_dir / f"{key_hash}.json")
 
@@ -99,7 +104,7 @@ class LocalIdempotencyStore(IdempotencyStore):
             ) from exc
 
     def save_record(self, record: IdempotencyRecord) -> None:
-        file_path = self._get_record_path(record.tenant_id, record.idempotency_key)
+        file_path = self._get_record_path(record.tenant_id, record.idempotency_key, create=True)
         temp_file = file_path.parent / f".tmp_{file_path.name}"
 
         try:

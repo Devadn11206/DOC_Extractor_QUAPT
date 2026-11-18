@@ -214,6 +214,22 @@ class TenantStorageIsolationError(StorageError):
         )
 
 
+class TenantStorageUnavailableError(StorageError):
+    """
+    A tenant's storage location could not be read or provisioned (permissions, read-only or missing root, disk full).
+    Typed so callers never see a bare ``OSError``; ``details`` carry a short machine-readable reason only, never a
+    filesystem path (which would disclose the server layout).
+    """
+
+    def __init__(self, reason: str, request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="Tenant storage is unavailable.",
+            code="TENANT_STORAGE_UNAVAILABLE",
+            request_id=request_id,
+            details={"reason": reason},
+        )
+
+
 class LLMExecutionError(DocumentExtractorError):
     """
     Raised when LLM grammar-constrained extraction fails and fallback is disabled (SCH-007).
