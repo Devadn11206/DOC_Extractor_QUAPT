@@ -53,17 +53,13 @@ from doc_extractor.api.token_core import (
     validate_key_expiration,
 )
 
-# Optional M4 imports for permission separation verification
-try:
-    from schema_lifecycle.roles import (
-        AuthenticatedPrincipal as M4Principal,
-        Role as M4Role,
-        SchemaPermission as M4Permission,
-    )
-except ImportError:
-    M4Principal = None
-    M4Role = None
-    M4Permission = None
+# M4 is part of this distribution: import it directly so a broken import fails the suite instead of skipping checks.
+from schema_lifecycle.roles import (
+    AuthenticatedPrincipal as M4Principal,
+    DefaultSchemaAuthorizer,
+    Role as M4Role,
+    SchemaPermission as M4Permission,
+)
 
 
 # ============================================================================
@@ -443,18 +439,16 @@ def test_api_key_principal_cannot_satisfy_m4_mfa_requirement():
     assert m4_principal.mfa_verified is False
 
     # In M4, schema approvers and admins require MFA. An API key cannot approve schemas:
-    if M4Permission is not None and M4Role is not None:
-        from schema_lifecycle.roles import DefaultSchemaAuthorizer
-        authorizer = DefaultSchemaAuthorizer(
-            trusted_principals={m4_principal.principal_id: m4_principal}
-        )
-        decision = authorizer.authorize(
-            principal=m4_principal,
-            permission=M4Permission.SCHEMA_APPROVE,
-            tenant_id="tenant_alpha",
-        )
-        assert decision.is_authorized is False
-        assert "MFA required" in decision.reason or "Missing required permission" in decision.reason
+    authorizer = DefaultSchemaAuthorizer(
+        trusted_principals={m4_principal.principal_id: m4_principal}
+    )
+    decision = authorizer.authorize(
+        principal=m4_principal,
+        permission=M4Permission.SCHEMA_APPROVE,
+        tenant_id="tenant_alpha",
+    )
+    assert decision.is_authorized is False
+    assert "MFA required" in decision.reason or "Missing required permission" in decision.reason
 
 
 # ============================================================================

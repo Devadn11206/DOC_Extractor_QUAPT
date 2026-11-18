@@ -18,19 +18,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from doc_extractor.tenancy import require_path_safe_tenant_id
 
-# Try importing M4 roles for full type interoperability
-try:
-    from schema_lifecycle.roles import (
-        AuthenticatedPrincipal as M4Principal,
-        Role as M4Role,
-        ROLE_PERMISSIONS as M4_ROLE_PERMISSIONS,
-        SchemaPermission as M4Permission,
-    )
-except ImportError:  # pragma: no cover
-    M4Principal = None
-    M4Role = None
-    M4_ROLE_PERMISSIONS = None
-    M4Permission = None
+# M4 ships in this same distribution, so a failed import is a packaging or import-order BUG and must fail loudly. It used
+# to be swallowed (``except ImportError: M4Role = None``), which silently dropped every role-derived permission.
+from schema_lifecycle.roles import (
+    AuthenticatedPrincipal as M4Principal,
+    Role as M4Role,
+    ROLE_PERMISSIONS as M4_ROLE_PERMISSIONS,
+    SchemaPermission as M4Permission,
+)
 
 
 class PrincipalType(str, Enum):
@@ -143,17 +138,16 @@ class ApiPrincipal(_TenantBoundModel):
         if permission in self.permissions:
             return True
         # Evaluate against canonical M4 role-to-permission mapping
-        if M4_ROLE_PERMISSIONS is not None and M4Role is not None:
-            for role_str in self.roles:
-                try:
-                    m4_role = M4Role(role_str) if not isinstance(role_str, M4Role) else role_str
-                    allowed_perms = M4_ROLE_PERMISSIONS.get(m4_role, set())
-                    for p in allowed_perms:
-                        val = p.value if hasattr(p, "value") else str(p)
-                        if val == permission or str(p) == permission:
-                            return True
-                except (ValueError, KeyError):
-                    continue
+        for role_str in self.roles:
+            try:
+                m4_role = M4Role(role_str) if not isinstance(role_str, M4Role) else role_str
+                allowed_perms = M4_ROLE_PERMISSIONS.get(m4_role, set())
+                for p in allowed_perms:
+                    val = p.value if hasattr(p, "value") else str(p)
+                    if val == permission or str(p) == permission:
+                        return True
+            except (ValueError, KeyError):
+                continue
         return False
 
     def to_m4_principal(self) -> Any:
@@ -162,24 +156,19 @@ class ApiPrincipal(_TenantBoundModel):
         Preserves compatibility with existing M4 authorization rules.
         Never merges API scopes into M4 explicit permissions.
         """
-        if M4Principal is None:
-            raise RuntimeError("M4 schema_lifecycle.roles module is not available in environment.")
-
         m4_roles: Set[Any] = set()
-        if M4Role is not None:
-            for r in self.roles:
-                try:
-                    m4_roles.add(M4Role(r))
-                except ValueError:
-                    pass
+        for r in self.roles:
+            try:
+                m4_roles.add(M4Role(r))
+            except ValueError:
+                pass
 
         m4_perms: Set[Any] = set()
-        if M4Permission is not None:
-            for p in self.permissions:
-                try:
-                    m4_perms.add(M4Permission(p))
-                except ValueError:
-                    pass
+        for p in self.permissions:
+            try:
+                m4_perms.add(M4Permission(p))
+            except ValueError:
+                pass
 
         return M4Principal(
             principal_id=self.principal_id,
