@@ -441,4 +441,3 @@ def create_api_key_record(
         created_by=created_by,
         last_used_at=None,
     )
-

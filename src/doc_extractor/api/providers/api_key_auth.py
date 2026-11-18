@@ -216,4 +216,3 @@ class ApiKeyAuthenticationProvider(AuthenticationProvider):
             logger.warning("Failed to record API key last_used_at for key '%s': %s", record.key_id, exc)
 
         return principal
-
