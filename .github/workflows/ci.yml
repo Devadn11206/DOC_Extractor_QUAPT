@@ -66,7 +66,7 @@ jobs:
 
       - name: Re-check the junit report (no skips, enough tests)
         if: always()
-        run: python scripts/ci/assert_junit.py junit-api.xml --max-skipped 0 --min-tests 380
+        run: python scripts/ci/assert_junit.py junit-api.xml --max-skipped 0 --min-tests 540
 
       - name: Upload the junit report
         if: always()
@@ -108,7 +108,7 @@ jobs:
       - name: Only optional OCR and live-model tests may have skipped
         if: always()
         run: >
-          python scripts/ci/assert_junit.py junit-full.xml --min-tests 1200
+          python scripts/ci/assert_junit.py junit-full.xml --min-tests 1400
           --allow-skip test_ocr_backend_selection
           --allow-skip test_tesseract_integration
           --allow-skip test_live_qwen_smoke_against_local_ollama
