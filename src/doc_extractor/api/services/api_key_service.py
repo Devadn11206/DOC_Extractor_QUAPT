@@ -148,7 +148,7 @@ class ApiKeyService:
 
         Security Guarantees:
         - Plaintext secret token is returned in ApiKeyCreationResult exactly once and is never
-          retained: no cache, no replay (security decision D8 is open).
+          retained: no cache, no replay (decision M5-D08 is open).
         - Only cryptographic SHA-256 hash is persisted.
         - Creator cannot escalate privileges beyond their own grants.
         - Maximum lifetime cannot exceed 90 days.
@@ -212,7 +212,7 @@ class ApiKeyService:
             raise
 
         # 7. Return creation result disclosing the secret ONCE. It is never cached, stored or replayed
-        #    (security decision D8 is open: no idempotent replay of this call is offered).
+        #    (decision M5-D08 is open: no idempotent replay of this call is offered).
         return ApiKeyCreationResult(
             key_id=persisted.key_id,
             tenant_id=persisted.tenant_id,

@@ -119,7 +119,7 @@ def create_app(settings: Optional[ApiSettings] = None) -> FastAPI:
         app.include_router(health_router, prefix=resolved_settings.api_prefix, tags=["Health & Status"])
 
     # The API-key management router (API-019) is intentionally not mounted: it is held back until
-    # security decision D8 is approved. Document, review-task and webhook routers are later stages.
+    # decision M5-D08 is approved. Document, review-task and webhook routers are later stages.
 
     # Custom OpenAPI generator ensuring metadata and clean schemas
     def custom_openapi():

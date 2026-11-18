@@ -1,5 +1,5 @@
 """
-Security decision D8 is open (idempotent replay of a "shown once" API-key secret), so nothing may
+Decision M5-D08 is open (idempotent replay of a "shown once" API-key secret), so nothing may
 retain or replay the plaintext secret: no cache, no replay, no idempotency parameter on the service.
 """
 

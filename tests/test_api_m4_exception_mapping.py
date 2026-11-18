@@ -2,7 +2,7 @@
 Every M4 (schema lifecycle) exception must answer with its correct HTTP status and its EXISTING domain
 error code. Before this fix only three classes were mapped and the rest (self-approval, forbidden,
 unauthenticated, invalid transition, ...) answered HTTP 500. Public error codes are not renamed here:
-that is PRD decision D1.
+that is decision M5-D01.
 """
 
 import pytest
