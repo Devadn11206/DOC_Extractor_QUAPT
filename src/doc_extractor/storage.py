@@ -404,7 +404,13 @@ class LocalDiskStorage(StorageBackend):
         - The first segment must be exactly self.tenant_id (never another tenant, never an alias of it).
         - The result stays inside this tenant's directory, with no symlink on the way.
         """
-        if ".." in storage_uri or "\\" in storage_uri or storage_uri.startswith("/"):
+        # ".." is refused as a path COMPONENT, not as a substring: a tenant or document named "a..b" is an ordinary name.
+        if (
+            "\\" in storage_uri
+            or storage_uri.startswith("/")
+            or ".." in storage_uri.split("/")
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in storage_uri)
+        ):
             raise StorageError(
                 message="Unsafe storage URI detected.",
                 details={"storage_uri": storage_uri},
