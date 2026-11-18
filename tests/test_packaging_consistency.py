@@ -181,3 +181,12 @@ def test_every_first_party_package_in_src_is_declared_as_first_party_and_vice_ve
     """A new top-level package under src/ must be listed in FIRST_PARTY, or its imports would count as third-party."""
     packages = {p.name for p in (ROOT / "src").iterdir() if p.is_dir() and (p / "__init__.py").exists()}
     assert packages == set(FIRST_PARTY)
+
+
+def test_package_discovery_ships_every_first_party_package():
+    """setuptools finds packages under src/ (``where = ["src"]``) with no include/exclude filter, so the new leaf package
+    ``engine_errors`` is installed with the others. (Checked from the metadata: it must not need setuptools to run.)"""
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"]["packages"]["find"]
+    assert config == {"where": ["src"]}
+    discovered = {p.name for p in (ROOT / "src").iterdir() if p.is_dir() and (p / "__init__.py").exists()}
+    assert discovered == set(FIRST_PARTY) and "engine_errors" in discovered
