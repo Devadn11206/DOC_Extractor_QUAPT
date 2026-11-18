@@ -1340,7 +1340,8 @@ def test_cors_exposes_request_id_header():
 def test_runtime_dependencies_exclude_httpx():
     """Verify httpx is not declared as a production runtime dependency."""
     import tomllib
-    with open("pyproject.toml", "rb") as f:
+    from pathlib import Path
+    with open(Path(__file__).resolve().parents[1] / "pyproject.toml", "rb") as f:     # not relative to the working directory
         data = tomllib.load(f)
     deps = data["project"]["dependencies"]
     assert not any(d.startswith("httpx") for d in deps), "httpx must be in dev dependencies only"
