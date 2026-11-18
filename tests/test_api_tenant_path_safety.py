@@ -8,11 +8,14 @@ The guard rejects only values that can leave their directory. It does NOT define
 ordinary identifiers must keep working (several are asserted below).
 """
 
+import pytest
+
+pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
+
 import asyncio
 from datetime import datetime, timezone
 
 from pydantic import ValidationError
-import pytest
 
 from doc_extractor.api.exceptions import InvalidTokenError
 from doc_extractor.api.ports.authentication import ApiPrincipal, TenantContext

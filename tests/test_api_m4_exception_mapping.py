@@ -5,10 +5,13 @@ unauthenticated, invalid transition, ...) answered HTTP 500. Public error codes 
 that is PRD decision D1.
 """
 
+import pytest
+
+pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
+
 import inspect
 
 from fastapi.testclient import TestClient
-import pytest
 
 from doc_extractor.api import exceptions as api_exceptions
 from doc_extractor.api.app import create_app

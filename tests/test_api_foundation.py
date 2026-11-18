@@ -15,9 +15,12 @@ Covers:
 11. Structured audit logger with SEC-012 PII redaction.
 """
 
+import pytest
+
+pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
+
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
-import pytest
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field

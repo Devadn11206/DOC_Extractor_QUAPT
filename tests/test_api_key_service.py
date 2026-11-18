@@ -15,12 +15,15 @@ Verifies:
 - Immediate revocation effectiveness on subsequent authentication attempts.
 """
 
+import pytest
+
+pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
+
 import asyncio
 from datetime import datetime, timedelta, timezone
 import functools
 from typing import Any, Dict, List, Optional
 
-import pytest
 
 from doc_extractor.api.contracts.records import ApiKeyRecord
 from doc_extractor.api.exceptions import (

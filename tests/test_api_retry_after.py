@@ -3,9 +3,12 @@ API-012: ``429`` responses carry ``Retry-After``. The header must survive on eve
 a plain ``HTTPException`` raised by a route or a dependency (it used to be computed and then dropped).
 """
 
+import pytest
+
+pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
+
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-import pytest
 
 from doc_extractor.api.app import create_app
 from doc_extractor.api.config import ApiSettings

@@ -5,9 +5,12 @@ NotImplementedError surfacing as a generic 500. Team Member 3's adapters are not
 these ports are deliberately unconfigured.
 """
 
+import pytest
+
+pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
+
 from fastapi import Depends
 from fastapi.testclient import TestClient
-import pytest
 
 from doc_extractor.api import dependencies as deps
 from doc_extractor.api.app import create_app

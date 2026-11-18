@@ -3,9 +3,12 @@ Security decision D8 is open (idempotent replay of a "shown once" API-key secret
 retain or replay the plaintext secret: no cache, no replay, no idempotency parameter on the service.
 """
 
+import pytest
+
+pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
+
 import inspect
 
-import pytest
 
 from doc_extractor.api.ports.authentication import ApiPrincipal, PrincipalType
 from doc_extractor.api.services import api_key_service as service_module

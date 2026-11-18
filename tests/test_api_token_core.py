@@ -15,13 +15,16 @@ Verifies:
 - Repository protocol contract with typed last_used_at tracking.
 """
 
+import pytest
+
+pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[api]')")
+
 import collections
 import hashlib
 import math
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-import pytest
 
 from doc_extractor.api.contracts.records import ApiKeyRecord, utc_now
 from doc_extractor.api.exceptions import (
