@@ -79,7 +79,10 @@ def test_core_dependencies_match_between_pyproject_and_requirements_txt():
 
 def test_extras_are_mirrored_by_their_requirements_files():
     extras = PYPROJECT["optional-dependencies"]
-    for extra, filename in (("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"), ("ocr", "requirements-ocr.txt")):
+    for extra, filename in (
+        ("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"),
+        ("ocr", "requirements-ocr.txt"), ("api", "requirements-api.txt"),
+    ):
         declared = {_name(d): d.replace(" ", "") for d in extras[extra]}
         listed = {k: v for k, v in _requirements(filename).items() if k not in _requirements("requirements.txt")}
         assert listed == declared, f"{filename} differs from the '{extra}' extra"
@@ -137,3 +140,35 @@ def test_qwen3_vl_transformers_floor_is_not_below_4_57():
 def test_core_matches_the_reproducible_gpu_baseline():
     core = {_name(d): d.replace(" ", "") for d in PYPROJECT["dependencies"]}
     assert core["qwen-vl-utils"] == "qwen-vl-utils==0.0.14"          # exact baseline pin
+
+
+# -- REST API foundation: a dedicated optional group, nothing added to core ------------------------
+
+API_STACK = {"fastapi", "starlette", "uvicorn", "python-multipart"}
+
+
+def test_api_stack_is_a_dedicated_optional_extra_and_never_core():
+    api_extra = {_name(d) for d in PYPROJECT["optional-dependencies"]["api"]}
+    assert api_extra == API_STACK
+    core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
+    assert not core & (API_STACK | {"httpx"})
+
+
+def test_httpx_is_a_development_dependency_only():
+    assert "httpx" in {_name(d) for d in PYPROJECT["optional-dependencies"]["dev"]}
+    assert "httpx" in _requirements("requirements-dev.txt")
+    assert "httpx" not in {_name(d) for d in PYPROJECT["optional-dependencies"]["api"]}
+    assert "httpx" not in _requirements("requirements-api.txt")
+
+
+def test_requirements_api_installs_core_first_and_lists_only_the_api_extra():
+    text = (ROOT / "requirements-api.txt").read_text(encoding="utf-8")
+    assert "-r requirements.txt" in text
+    assert set(_requirements("requirements-api.txt")) - set(_requirements("requirements.txt")) == API_STACK
+
+
+def test_the_api_extra_leaves_the_existing_groups_unchanged():
+    extras = PYPROJECT["optional-dependencies"]
+    assert {_name(d) for d in extras["ui"]} == {"gradio"}
+    assert {_name(d) for d in extras["ocr"]} == {"pytesseract"}
+    assert {_name(d) for d in extras["dev"]} == {"pytest", "pytest-cov", "httpx"}

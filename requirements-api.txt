@@ -1,0 +1,8 @@
+# Optional: REST API foundation (doc_extractor.api). Mirrors the 'api' extra in pyproject.toml.
+# Not required by the engine, the demo UI or the default test run of Modules A/B/C.
+-r requirements.txt
+
+fastapi>=0.100.0,<1.0.0
+starlette>=0.27.0
+uvicorn>=0.22.0,<1.0.0
+python-multipart>=0.0.9
