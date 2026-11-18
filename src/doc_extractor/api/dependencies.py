@@ -8,7 +8,7 @@ Adheres to:
 - Provider-independent injection of repositories, queue brokers, and audit loggers.
 """
 
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 from fastapi import Depends, Header, Request
 
 from doc_extractor.api.config import ApiSettings, get_api_settings
