@@ -16,6 +16,7 @@ from doc_extractor.api.exceptions import (
     AuthenticationRequiredError,
     ForbiddenError,
     InternalServerError,
+    PortNotConfiguredError,
 )
 from doc_extractor.api.ports.audit import AuditLogger, SafeStructuredAuditLogger
 from doc_extractor.api.ports.authentication import (
@@ -145,14 +146,14 @@ def require_permissions(*required_permissions: str) -> Callable:
 
 
 # ============================================================================
-# Hexagonal Port Dependencies (Dependency Injection Stubs)
+# Hexagonal Port Dependencies (an unconfigured port answers 503 SERVICE_UNAVAILABLE, never a bare 500)
 # ============================================================================
 
 def get_document_metadata_repository(request: Request) -> DocumentMetadataRepository:
     """Dependency injection provider for DocumentMetadataRepository."""
     repo = getattr(request.app.state, "document_metadata_repo", None)
     if repo is None:
-        raise NotImplementedError("DocumentMetadataRepository adapter not configured.")
+        raise PortNotConfiguredError("DocumentMetadataRepository")
     return repo
 
 
@@ -160,7 +161,7 @@ def get_review_task_repository(request: Request) -> ReviewTaskRepository:
     """Dependency injection provider for ReviewTaskRepository."""
     repo = getattr(request.app.state, "review_task_repo", None)
     if repo is None:
-        raise NotImplementedError("ReviewTaskRepository adapter not configured.")
+        raise PortNotConfiguredError("ReviewTaskRepository")
     return repo
 
 
@@ -168,7 +169,7 @@ def get_api_key_repository(request: Request) -> ApiKeyRepository:
     """Dependency injection provider for ApiKeyRepository."""
     repo = getattr(request.app.state, "api_key_repo", None)
     if repo is None:
-        raise NotImplementedError("ApiKeyRepository adapter not configured.")
+        raise PortNotConfiguredError("ApiKeyRepository")
     return repo
 
 
@@ -176,7 +177,7 @@ def get_webhook_subscription_repository(request: Request) -> WebhookSubscription
     """Dependency injection provider for WebhookSubscriptionRepository."""
     repo = getattr(request.app.state, "webhook_subscription_repo", None)
     if repo is None:
-        raise NotImplementedError("WebhookSubscriptionRepository adapter not configured.")
+        raise PortNotConfiguredError("WebhookSubscriptionRepository")
     return repo
 
 
@@ -184,7 +185,7 @@ def get_webhook_delivery_repository(request: Request) -> WebhookDeliveryReposito
     """Dependency injection provider for WebhookDeliveryRepository."""
     repo = getattr(request.app.state, "webhook_delivery_repo", None)
     if repo is None:
-        raise NotImplementedError("WebhookDeliveryRepository adapter not configured.")
+        raise PortNotConfiguredError("WebhookDeliveryRepository")
     return repo
 
 
@@ -192,7 +193,7 @@ def get_audit_repository(request: Request) -> AuditRepository:
     """Dependency injection provider for AuditRepository."""
     repo = getattr(request.app.state, "audit_repo", None)
     if repo is None:
-        raise NotImplementedError("AuditRepository adapter not configured.")
+        raise PortNotConfiguredError("AuditRepository")
     return repo
 
 
@@ -200,7 +201,7 @@ def get_queue_producer(request: Request) -> QueueProducer:
     """Dependency injection provider for durable QueueProducer."""
     producer = getattr(request.app.state, "queue_producer", None)
     if producer is None:
-        raise NotImplementedError("QueueProducer adapter not configured.")
+        raise PortNotConfiguredError("QueueProducer")
     return producer
 
 
@@ -208,7 +209,7 @@ def get_queue_consumer(request: Request) -> QueueConsumer:
     """Dependency injection provider for durable QueueConsumer."""
     consumer = getattr(request.app.state, "queue_consumer", None)
     if consumer is None:
-        raise NotImplementedError("QueueConsumer adapter not configured.")
+        raise PortNotConfiguredError("QueueConsumer")
     return consumer
 
 

@@ -268,6 +268,30 @@ class InternalServerError(ApiHttpError):
         super().__init__(message=message, code=code, status_code=500, request_id=request_id, details=details)
 
 
+class PortNotConfiguredError(ApiHttpError):
+    """
+    An infrastructure port (repository, queue, ...) has no adapter configured: the service cannot
+    serve the request yet (HTTP 503), which is not an internal fault (500). Uses the existing
+    ``SERVICE_UNAVAILABLE`` code; ``details`` names the port, never document content (API-011).
+    """
+
+    status_code = 503
+
+    def __init__(
+        self,
+        port: str,
+        request_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            message=f"The {port} adapter is not configured; the service is unavailable.",
+            code="SERVICE_UNAVAILABLE",
+            status_code=503,
+            request_id=request_id,
+            details={"port": port},
+        )
+        self.port = port
+
+
 # Status code mapping for existing DocumentExtractorError hierarchy and PRD §19
 _STATUS_CODE_MAP: Dict[Any, int] = {
     AuthenticationRequiredError: 401,

@@ -556,8 +556,9 @@ def test_record_models_reject_extra_fields():
 
 
 @pytest.mark.unit
-def test_dependency_stubs_raise_not_implemented():
-    """Verify hexagonal port dependency stubs raise NotImplementedError when unconfigured."""
+def test_unconfigured_port_dependencies_raise_the_typed_503_error():
+    """An unconfigured hexagonal port raises PortNotConfiguredError (HTTP 503), not NotImplementedError."""
+    from doc_extractor.api.exceptions import PortNotConfiguredError
     from doc_extractor.api.dependencies import (
         get_api_key_repository,
         get_audit_repository,
@@ -582,21 +583,21 @@ def test_dependency_stubs_raise_not_implemented():
         })()})()
 
     req = DummyRequest()
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(PortNotConfiguredError):
         get_document_metadata_repository(req)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(PortNotConfiguredError):
         get_review_task_repository(req)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(PortNotConfiguredError):
         get_api_key_repository(req)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(PortNotConfiguredError):
         get_webhook_subscription_repository(req)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(PortNotConfiguredError):
         get_webhook_delivery_repository(req)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(PortNotConfiguredError):
         get_audit_repository(req)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(PortNotConfiguredError):
         get_queue_producer(req)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(PortNotConfiguredError):
         get_queue_consumer(req)
 
 
