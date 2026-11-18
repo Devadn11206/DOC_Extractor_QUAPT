@@ -218,6 +218,24 @@ Module C acts as Stage 3 of the engine, consuming `ModuleBOutputPayload` and tra
 
 ---
 
+## REST API foundation (Module M5, optional)
+
+`src/doc_extractor/api/` is the HTTP layer's foundation. It is optional (`pip install -e ".[api]"`) and does not change Modules A/B/C or the canonical envelope.
+
+**Included:** the `create_app()` factory (run with `uvicorn --factory doc_extractor.api.app:create_app`); `GET /health` and `GET /api/v1/health`; request-ID middleware; the API-010 error envelope and handlers; authentication and tenant interfaces (`ApiPrincipal`, `TenantContext`; the tenant always comes from the authenticated principal); the scoped API-key token core, provider and `ApiKeyService`; and repository, durable-queue and audit **protocols** (ports) with no adapters.
+
+**Behaviour to know:**
+- An infrastructure port with no adapter configured answers `503 SERVICE_UNAVAILABLE` (typed, names the port), not a generic 500. Persistence, queue, audit and object-storage adapters are Team Member 3's and are not implemented here.
+- Every schema-lifecycle (M4) error answers with its own HTTP status and its existing domain code. Public error codes are unchanged; renaming them is a pending PRD decision.
+- `Retry-After` is preserved on error responses raised as HTTP exceptions (API-012).
+- A tenant identifier is rejected when it could address another tenant's directory (path separators, `.`/`..`, control characters); no tenant-ID format is imposed.
+
+**Not implemented yet:** document, review-task, webhook, schema, export and audit endpoints. The API-key management router (API-019) is held back until the security decision on replaying a one-time secret is made, so there is no `/api/v1/api-keys` route; the service never caches or replays a plaintext secret.
+
+**Verified:** the foundation test modules pass on Python 3.11 and 3.14, and the server starts and answers `/api/v1/health` on 3.11. Python 3.10, 3.12 and 3.13 and the dependency floors (`fastapi>=0.100`, `starlette>=0.27`, `python-multipart>=0.0.9`) have **not** been tested. Nothing here has run against a real queue, store, scanner or user-session login.
+
+---
+
 ## Project Setup & Local Development
 
 ### 1. Prerequisites
@@ -250,9 +268,10 @@ Install exactly the components you need (the extras are mirrored by the `require
 | Engine + multimodal stack (core) | install PyTorch + torchvision first (below), then `pip install -e .` | Modules A/B/C, schema lifecycle, `instructor`/`litellm`, and the PRD v1.5 section 12.1 multimodal stack: transformers (>=4.57.1), accelerate (>=0.26.0), bitsandbytes (>=0.43.1, skipped on macOS), qwen-vl-utils (==0.0.14) |
 | Development / run the tests | `pip install -e ".[dev]"` | core + pytest, pytest-cov |
 | Demo UI (`doc_extractor.app`) | `pip install -e ".[ui]"` | core + gradio |
+| REST API foundation (`doc_extractor.api`) | `pip install -e ".[api]"` | core + fastapi, starlette, uvicorn, python-multipart. The API tests also need `httpx`, which is in `dev`; without the `api` extra they skip. |
 | Optional OCR backends | `pip install -e ".[ocr]"` + the Tesseract binary | core + pytesseract |
 
-Extras combine, e.g. `pip install -e ".[dev,ui]"`. Without an editable install, use `pip install -r requirements.txt` (core), `requirements-dev.txt`, `requirements-ui.txt` or `requirements-ocr.txt`.
+Extras combine, e.g. `pip install -e ".[dev,ui]"`. Without an editable install, use `pip install -r requirements.txt` (core), `requirements-dev.txt`, `requirements-ui.txt`, `requirements-ocr.txt` or `requirements-api.txt`.
 
 **Dependency classification (PRD v1.5 section 12.1).** The multimodal packages are **core** dependencies, as the PRD lists them. PyTorch and torchvision are the deliberate exception: they are platform specific (CUDA/CPU/MPS), so they are not declared and are installed first with the build for your machine (see <https://pytorch.org/get-started/locally/>), for example `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126` (CUDA 12.x). `accelerate` requires torch, so install torch before `pip install -e .`. `qwen-vl-utils` imports `torchvision`, so the two must match. On Kaggle and Colab keep the preinstalled torch/torchvision: do not upgrade or reinstall them. Gradio and Tesseract are optional extras. The full GPU runtime guide is in "Qwen3-VL GPU runtime" below.
 
@@ -357,7 +376,9 @@ extractor = SchemaGuidedExtractor(          # defaults shown
 ### Automated Test Suite
 The repository includes unit, regression, integration and end-to-end test coverage across Modules A, B and C, the schema lifecycle, OCR backends, multipage multimodal extraction (with a faked model call) and the DOC-01/02/03 launch types.
 
-**Result (Phase 1 on PRD v1.5):** 915 tests collected. With the optional `ocr` extra and the Tesseract binary installed: 914 pass, 1 skipped (the opt-in live Ollama test). In a clean environment without torch, `pytesseract` or Tesseract (fresh Python 3.11 and 3.14): 869 pass, 3 skipped (the live Ollama test and the two optional-OCR test files, which skip as a whole). With `pytesseract` but the binary hidden: 910 pass, 5 skipped. The suite runs without a GPU, torch, model weights or Tesseract. The Qwen-VL runtime (`vlm_runtime.py`) and the OCR + text adapter are covered with fakes; real Qwen-VL / GLM-OCR / GPU behaviour is not covered by any automated test.
+**Result (Phase 1 + M5 API foundation, Python 3.11 and 3.14 with the `api` extra, no OCR extra):** 1170 tests collected; 1168 pass, 4 skipped (the opt-in live Ollama test, the fresh-interpreter import check when the system Python has no dependencies, and the two optional-OCR test files, which skip as a whole). Without the `api` extra the eight API test modules skip with an explicit reason and nothing else changes (920 pass, 12 skipped).
+
+**Earlier result (Phase 1 on PRD v1.5, before the API foundation):** 915 tests collected. With the optional `ocr` extra and the Tesseract binary installed: 914 pass, 1 skipped (the opt-in live Ollama test). In a clean environment without torch, `pytesseract` or Tesseract (fresh Python 3.11 and 3.14): 869 pass, 3 skipped (the live Ollama test and the two optional-OCR test files, which skip as a whole). With `pytesseract` but the binary hidden: 910 pass, 5 skipped. The suite runs without a GPU, torch, model weights or Tesseract. The Qwen-VL runtime (`vlm_runtime.py`) and the OCR + text adapter are covered with fakes; real Qwen-VL / GLM-OCR / GPU behaviour is not covered by any automated test.
 
 ```bash
 pip install -e ".[dev]"      # test dependencies
