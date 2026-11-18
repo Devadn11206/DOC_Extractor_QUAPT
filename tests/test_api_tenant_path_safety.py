@@ -116,8 +116,9 @@ def test_an_isolation_failure_over_http_is_a_typed_500_that_names_no_tenant(tmp_
 
     response = TestClient(app, raise_server_exceptions=False).get("/probe/symlink")
     error = response.json()["error"]
-    assert response.status_code == 500 and error["code"] == "TENANT_STORAGE_ISOLATION_FAILED"
-    assert error["details"] == {"reason": "tenant_directory_is_a_symlink"} and "tenant_v" not in response.text
+    # R5: the client gets the generic internal error; the reason is logged server-side only (tests/test_api_storage_fault_responses.py)
+    assert response.status_code == 500 and error["code"] == "INTERNAL_ERROR" and error["details"] == {}
+    assert "tenant_v" not in response.text and "symlink" not in response.text
 
 
 # -- the validator cannot be bypassed by copying or constructing a principal ------------------------

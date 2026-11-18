@@ -7,8 +7,10 @@ Adheres to:
 - Preserves full compatibility with DocumentExtractorError hierarchy.
 """
 
+import logging
 import math
 import re
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Optional, Tuple
 from fastapi import FastAPI, Request
@@ -29,11 +31,15 @@ from doc_extractor.exceptions import (
     SecurityCheckFailedError,
     StorageError,
     TenantStorageIsolationError,
+    TenantStorageUnavailableError,
     UnsupportedFileError,
 )
 
 # Import approved M4 schema lifecycle exceptions for canonical HTTP mapping
 from schema_lifecycle import exceptions as _m4  # same distribution: a failed import must fail loudly
+
+
+logger = logging.getLogger("doc_extractor.api.errors")
 
 
 class ApiHttpError(DocumentExtractorError):
@@ -335,7 +341,8 @@ _STATUS_CODE_MAP: Dict[Any, int] = {
     ApiValidationError: 422,
     ConfigurationError: 500,
     InvalidTenantIdentifierError: 422,    # typed validation error (subclass of StorageError: listed first by MRO)
-    TenantStorageIsolationError: 500,     # integrity fault with its own typed code, never a bare OS error
+    TenantStorageIsolationError: 500,     # integrity fault: generic body for the client (see _SERVER_SIDE_ONLY)
+    TenantStorageUnavailableError: 500,   # storage cannot be read or provisioned: generic body for the client
     StorageError: 500,
     LLMExecutionError: 502,
     DocumentProcessingError: 500,
@@ -390,6 +397,14 @@ def concealed_not_found(exc: BaseException) -> Optional[Tuple[str, str]]:
     return None
 
 
+# Storage faults that are the OPERATOR's business, not the caller's: an isolation check failed (alias of another identity,
+# symlink, marker mismatch) or the storage root cannot be read or written. Their reason strings describe the server's
+# storage layout, and "directory_alias_collision" even hints that another identity's directory exists, so the client gets
+# the same generic 500 as any internal fault (API-011). The reason is logged server-side only.
+_SERVER_SIDE_ONLY = (TenantStorageIsolationError, TenantStorageUnavailableError)
+GENERIC_INTERNAL_MESSAGE = "An unexpected internal server error occurred."
+
+
 def get_status_code_for_exception(exc: Exception) -> int:
     """
     Derive the HTTP status for an exception: an explicit ``status_code`` first, then the nearest class in
@@ -419,28 +434,42 @@ def _clean_header_value(value: Any) -> Optional[str]:
     return text
 
 
-def sanitize_retry_after(value: Any) -> Optional[str]:
+# The longest wait the API ever asks of a client: 24 hours. A larger (or absurd, e.g. 10**30) value is clamped to it.
+MAX_RETRY_AFTER_SECONDS = 86_400
+
+
+def _bounded_seconds(seconds: int) -> str:
+    return str(min(max(0, seconds), MAX_RETRY_AFTER_SECONDS))
+
+
+def sanitize_retry_after(value: Any, *, now: Optional[datetime] = None) -> Optional[str]:
     """
-    A valid ``Retry-After`` (API-012): a non-negative number of seconds, or an HTTP-date. A negative value is clamped
-    to 0, as the domain rate-limit path always did; anything that is neither (text, NaN, header injection) is dropped
-    rather than sent, because a malformed header is worse than none.
+    A valid ``Retry-After`` (API-012): a number of seconds or an HTTP-date, bounded to ``MAX_RETRY_AFTER_SECONDS``
+    (86,400). A negative value is clamped to 0, a larger one to the maximum, as is an HTTP-date further away than the
+    maximum (sent as seconds). Anything that is neither (text, NaN, infinity, header injection) is dropped rather than
+    sent, because a malformed header is worse than none. ``now`` exists for tests.
     """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return str(max(0, value))
+        return _bounded_seconds(value)
     if isinstance(value, float):
-        return str(max(0, int(value))) if math.isfinite(value) else None
+        return _bounded_seconds(int(value)) if math.isfinite(value) else None
     text = _clean_header_value(value)
     if text is None:
         return None
     if re.fullmatch(r"-?\d+", text):
-        return str(max(0, int(text)))
+        return _bounded_seconds(int(text))
     try:
-        parsedate_to_datetime(text)                           # an HTTP-date
-        return text
+        when = parsedate_to_datetime(text)                    # an HTTP-date
     except (TypeError, ValueError):
         return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if (when - current).total_seconds() > MAX_RETRY_AFTER_SECONDS:
+        return str(MAX_RETRY_AFTER_SECONDS)
+    return text
 
 
 def preserved_headers(raw: Any) -> Dict[str, str]:
@@ -511,6 +540,15 @@ async def document_extractor_error_handler(request: Request, exc: DocumentExtrac
         retry_after = sanitize_retry_after(exc.retry_after_seconds)
         if retry_after is not None:
             extra_headers["Retry-After"] = retry_after
+    if isinstance(exc, _SERVER_SIDE_ONLY):
+        # Diagnostics stay on the server: the machine-readable reason and the request id, never the tenant or any path.
+        logger.error(
+            "Storage fault answered with a generic 500: %s reason=%s request_id=%s",
+            getattr(exc, "code", type(exc).__name__), (getattr(exc, "details", None) or {}).get("reason"), req_id,
+        )
+        return build_error_response(
+            code="INTERNAL_ERROR", message=GENERIC_INTERNAL_MESSAGE, status_code=500, request_id=req_id, details={}
+        )
     concealed = concealed_not_found(exc)
     if concealed is not None:                        # cross-tenant: same body as a missing resource, no details, no identifiers
         return build_error_response(

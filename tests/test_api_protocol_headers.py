@@ -95,7 +95,7 @@ def test_the_domain_rate_limit_path_applies_the_same_validation(client, sent, ex
 
 @pytest.mark.parametrize("value,expected", [
     (7, "7"), (-1, "0"), (0, "0"), (True, None), (False, None), (None, None), (float("nan"), None), (float("inf"), None),
-    (3.9, "3"), (-0.5, "0"), ("12", "12"), ("-12", "0"), ("x", None), (HTTP_DATE, HTTP_DATE), ("a\nb", None), ("1" * 600, None), ("1" * 500, "1" * 500),     # over the 512-character cap: dropped, and int() never sees a huge string
+    (3.9, "3"), (-0.5, "0"), ("12", "12"), ("-12", "0"), ("x", None), (HTTP_DATE, HTTP_DATE), ("a\nb", None), ("1" * 600, None), ("1" * 500, "86400"),     # over the 512-character cap: dropped (int() never sees it); under it: clamped to the maximum
 ])
 def test_sanitize_retry_after_unit(value, expected):
     assert sanitize_retry_after(value) == expected
@@ -190,3 +190,43 @@ def test_headers_survive_over_a_real_http_socket():
     assert unauthorised.status_code == 401 and unauthorised.headers["www-authenticate"] == "Bearer"
     assert wrong_method.status_code == 405 and "POST" in wrong_method.headers["allow"]
     assert all(r.headers["x-request-id"] for r in (rate, negative, junk, unauthorised, wrong_method))
+
+
+# -- the documented maximum: 86,400 seconds (24 hours) -------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+from email.utils import format_datetime  # noqa: E402
+
+from doc_extractor.api.exceptions import MAX_RETRY_AFTER_SECONDS  # noqa: E402
+
+NOW = datetime(2026, 11, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_the_documented_maximum_is_one_day():
+    assert MAX_RETRY_AFTER_SECONDS == 86_400
+
+
+@pytest.mark.parametrize("value,expected", [
+    (86_399, "86399"), (86_400, "86400"), (86_401, "86400"), (10**30, "86400"), (float(10**30), "86400"), (1e300, "86400"),
+    ("86400", "86400"), ("86401", "86400"), ("9" * 40, "86400"), ("-86401", "0"), (-(10**30), "0"),
+])
+def test_retry_after_seconds_are_bounded(value, expected):
+    assert sanitize_retry_after(value) == expected
+
+
+def test_an_http_date_is_bounded_too():
+    within = format_datetime(NOW + timedelta(hours=23), usegmt=True)
+    exactly = format_datetime(NOW + timedelta(seconds=MAX_RETRY_AFTER_SECONDS), usegmt=True)
+    beyond = format_datetime(NOW + timedelta(seconds=MAX_RETRY_AFTER_SECONDS + 1), usegmt=True)
+    far = format_datetime(NOW + timedelta(days=3650), usegmt=True)
+    past = format_datetime(NOW - timedelta(days=1), usegmt=True)
+    assert sanitize_retry_after(within, now=NOW) == within            # a valid date inside the window is passed through
+    assert sanitize_retry_after(exactly, now=NOW) == exactly
+    assert sanitize_retry_after(beyond, now=NOW) == "86400"           # sent as seconds, clamped
+    assert sanitize_retry_after(far, now=NOW) == "86400"
+    assert sanitize_retry_after(past, now=NOW) == past                # "retry now": still a valid date
+
+
+def test_an_oversized_value_is_clamped_on_every_response_path(client):
+    assert client.get("/p/retry", params={"v": "999999999"}).headers["Retry-After"] == "86400"
+    assert client.get("/p/domain-retry", params={"v": 10**12}).headers["Retry-After"] == "86400"
