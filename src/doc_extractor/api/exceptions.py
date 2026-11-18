@@ -397,14 +397,16 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
     code = code_lookup.get(status_code, f"HTTP_{status_code}")
     message = str(exc.detail) if exc.detail else "HTTP request failed."
     extra_headers: Dict[str, str] = {}
-    if exc.headers and "Retry-After" in exc.headers:
-        extra_headers["Retry-After"] = str(exc.headers["Retry-After"])
+    for header_name, header_value in (exc.headers or {}).items():
+        if str(header_name).lower() == "retry-after":       # header names are case-insensitive (API-012)
+            extra_headers["Retry-After"] = str(header_value)
     return build_error_response(
         code=code,
         message=message,
         status_code=status_code,
         request_id=req_id,
         details={},
+        headers=extra_headers,
     )
 
 
