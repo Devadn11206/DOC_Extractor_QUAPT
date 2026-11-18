@@ -222,9 +222,10 @@ Module C acts as Stage 3 of the engine, consuming `ModuleBOutputPayload` and tra
 
 `src/doc_extractor/api/` is the HTTP layer's foundation. It is optional (`pip install -e ".[api]"`) and does not change Modules A/B/C or the canonical envelope.
 
-**Included:** the `create_app()` factory (run with `uvicorn --factory doc_extractor.api.app:create_app`); `GET /health` and `GET /api/v1/health`; request-ID middleware; the API-010 error envelope and handlers; authentication and tenant interfaces (`ApiPrincipal`, `TenantContext`; the tenant always comes from the authenticated principal); the scoped API-key token core, provider and `ApiKeyService`; and repository, durable-queue and audit **protocols** (ports) with no adapters.
+**Included:** the `create_app()` factory (run with `DOC_API_ENV=production uvicorn --factory doc_extractor.api.app:create_app`; without `DOC_API_ENV` it starts in **development** with the interactive docs on); `GET /health` and `GET /api/v1/health`; request-ID middleware; the API-010 error envelope and handlers; authentication and tenant interfaces (`ApiPrincipal`, `TenantContext`; the tenant always comes from the authenticated principal); the scoped API-key token core, provider and `ApiKeyService`; and repository, durable-queue and audit **protocols** (ports) with no adapters.
 
 **Behaviour to know:**
+- **Configuration comes from the environment** (`DOC_API_ENV`, `DOC_API_DEBUG`, `DOC_API_DOCS_ENABLED`, `DOC_API_CORS_ORIGINS`, and a few more, listed in `.env.example`). Unknown `DOC_API_*` names, empty values and invalid values stop start-up instead of falling back to development. The interactive docs (`/docs`, `/redoc`, `/openapi.json`) are on in development only and can never be enabled in production.
 - An infrastructure port with no adapter configured answers `503 SERVICE_UNAVAILABLE` (typed, names the port), not a generic 500. Persistence, queue, audit and object-storage adapters are Team Member 3's and are not implemented here.
 - Every schema-lifecycle (M4) error answers with its own HTTP status and its existing domain code. Public error codes are unchanged; renaming them is a pending PRD decision.
 - `Retry-After` is preserved on error responses raised as HTTP exceptions (API-012).
