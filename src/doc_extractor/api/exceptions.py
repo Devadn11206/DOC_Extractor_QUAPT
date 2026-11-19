@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from doc_extractor.exceptions import (
+    ComponentConfigurationError,
     ConfigurationError,
     ConflictError as IngestionConflictError,
     DocumentExtractorError,
@@ -30,6 +31,7 @@ from doc_extractor.exceptions import (
     ScannerUnavailableError,
     SecurityCheckFailedError,
     StorageError,
+    TenantMismatchError,
     TenantStorageIsolationError,
     TenantStorageUnavailableError,
     UnsupportedFileError,
@@ -338,6 +340,7 @@ _STATUS_CODE_MAP: Dict[Any, int] = {
     ForbiddenError: 403,
     TenantAccessDeniedError: 404,         # SEC-006: concealed as not found, see concealed_not_found()
     CrossTenantStorageAccessError: 404,   # idem
+    TenantMismatchError: 404,             # SEC-006: concealed as not found per F6
     NotFoundError: 404,
     TenantResourceNotFoundError: 404,
     ApiConflictError: 409,
@@ -350,6 +353,7 @@ _STATUS_CODE_MAP: Dict[Any, int] = {
     RateLimitExceededError: 429,        # PRD §19: 429 RATE_LIMITED
     ApiValidationError: 422,
     ConfigurationError: 500,
+    ComponentConfigurationError: 500,
     InvalidTenantIdentifierError: 422,    # typed validation error (subclass of StorageError: listed first by MRO)
     TenantStorageIsolationError: 500,     # integrity fault: generic body for the client (see _SERVER_SIDE_ONLY)
     TenantStorageUnavailableError: 500,   # storage cannot be read or provisioned: generic body for the client
@@ -389,6 +393,7 @@ for _name, _status in _M4_STATUS_BY_CLASS_NAME.items():
 _CONCEALED_AS_NOT_FOUND: Dict[type, Tuple[str, str]] = {
     TenantAccessDeniedError: ("DOCUMENT_NOT_FOUND", "Document not found."),
     CrossTenantStorageAccessError: ("DOCUMENT_NOT_FOUND", "Document not found."),
+    TenantMismatchError: ("DOCUMENT_NOT_FOUND", "Document not found."),
 }
 
 # M4 reports a cross-tenant attempt only as a plain ForbiddenActionError whose message starts like this (it also puts
@@ -411,7 +416,13 @@ def concealed_not_found(exc: BaseException) -> Optional[Tuple[str, str]]:
 # symlink, marker mismatch), the storage root cannot be read or written, or a general storage failure occurred.
 # Their reason strings or messages describe the server's storage layout or internal paths, so the client gets
 # the same generic 500 as any internal fault (API-011). The reason is logged server-side only.
-_SERVER_SIDE_ONLY = (TenantStorageIsolationError, TenantStorageUnavailableError, StorageError)
+_SERVER_SIDE_ONLY = (
+    TenantStorageIsolationError,
+    TenantStorageUnavailableError,
+    StorageError,
+    ComponentConfigurationError,
+    ConfigurationError,
+)
 GENERIC_INTERNAL_MESSAGE = "An unexpected internal server error occurred."
 
 

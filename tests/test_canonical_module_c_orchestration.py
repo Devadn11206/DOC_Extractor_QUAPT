@@ -44,7 +44,7 @@ from tests.test_dynamic_module_c_adapter import (  # noqa: F401
     sample_payload,
 )
 
-TENANT = "tenant-canon"
+TENANT = app.TENANT_ID
 VLM_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 
 CASA_VLM_OUTPUT: Dict[str, Any] = {

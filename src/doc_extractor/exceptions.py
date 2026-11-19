@@ -30,6 +30,30 @@ class ConfigurationError(DocumentExtractorError):
         )
 
 
+class ComponentConfigurationError(ConfigurationError, ValueError):
+    """
+    Raised when server-side components, storage backends, or pipeline dependencies
+    are misconfigured, missing required tenant context, or exhibit internal wiring faults.
+    Mapped to generic HTTP 500 INTERNAL_ERROR (never concealed as 404).
+    Internal diagnostic details are logged server-side and never exposed to clients.
+    """
+
+    def __init__(
+        self,
+        message: str = "Component configuration error.",
+        code: str = "CONFIGURATION_FAILED",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        DocumentExtractorError.__init__(
+            self,
+            message=message,
+            code=code,
+            request_id=request_id,
+            details=details,
+        )
+
+
 class UnsupportedFileError(DocumentExtractorError):
     """
     Raised when an uploaded file is not supported or fails magic-byte verification.
@@ -196,6 +220,29 @@ class InvalidTenantIdentifierError(StorageError, ValueError):
             code="INVALID_TENANT_IDENTIFIER",
             request_id=request_id,
             details={"reason": reason},
+        )
+
+
+class TenantMismatchError(DocumentExtractorError, ValueError):
+    """
+    Raised when an incoming request tenant conflicts with a tenant-bound service or workspace context.
+    Inherits from ValueError for model/validator compatibility and DocumentExtractorError.
+    Mapped to HTTP 404 concealed as DOCUMENT_NOT_FOUND per SEC-006 so tenant existence cannot be probed.
+    The offending tenant identifier(s) must NEVER be disclosed in the message.
+    Server-side component configuration errors use ComponentConfigurationError (HTTP 500), not this class.
+    """
+
+    def __init__(
+        self,
+        message: str = "Tenant boundary mismatch: request tenant does not match service context.",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(
+            message=message,
+            code="TENANT_MISMATCH",
+            request_id=request_id,
+            details=details,
         )
 
 
