@@ -180,6 +180,8 @@ class ModuleCPipeline:
         document_type: str = "generic",
         force_review: bool = False,
         expected_fields: Optional[Sequence[str]] = None,
+        expected_page_numbers: Optional[Sequence[int]] = None,
+        total_document_pages: Optional[int] = None,
     ) -> CanonicalExtractionEnvelope:
         """
         Canonical path for documents without a bound schema (unstructured / handwritten categories).
@@ -250,13 +252,20 @@ class ModuleCPipeline:
             ))
 
         flags.extend(conflict_flags(grounding))
+        expected_scope = (
+            expected_page_numbers
+            if expected_page_numbers is not None
+            else [p.page_number for p in payload.pages]
+        )
         coverage_flag = self.partial_coverage_flag(
             provenance,
-            [p.page_number for p in payload.pages],
+            expected_scope,
             [r.page_number for r in selected],
         )
         if coverage_flag:
             flags.append(coverage_flag)
+
+        doc_page_count = total_document_pages if total_document_pages is not None else len(payload.pages)
 
         return assemble_canonical_envelope(
             document_id=payload.document_id,
@@ -264,7 +273,7 @@ class ModuleCPipeline:
             schema_id=document_type,
             schema_version="1.0.0",
             classification_confidence=payload.classification.classification_confidence,
-            page_count=len(payload.pages),
+            page_count=doc_page_count,
             fields=fields,
             flags=flags,
             run_id=payload.run_id,
@@ -286,6 +295,8 @@ class ModuleCPipeline:
         schema_bound: bool = False,
         force_review: bool = False,
         expected_fields: Optional[Sequence[str]] = None,
+        expected_page_numbers: Optional[Sequence[int]] = None,
+        total_document_pages: Optional[int] = None,
     ) -> CanonicalExtractionEnvelope:
         """
         Adapter-aware canonical entry (PRD v1.5): assembles the envelope from pages that were ALREADY
@@ -305,7 +316,12 @@ class ModuleCPipeline:
         )
         canonical = ModuleCPipeline(extractor=replay, settings=self.settings)
         if schema_bound:
-            return canonical.process(payload, page_images=page_images)
+            return canonical.process(
+                payload,
+                page_images=page_images,
+                expected_page_numbers=expected_page_numbers,
+                total_document_pages=total_document_pages,
+            )
         return canonical.process_generic(
             payload,
             page_images,
@@ -313,6 +329,8 @@ class ModuleCPipeline:
             document_type=document_type,
             force_review=force_review,
             expected_fields=expected_fields,
+            expected_page_numbers=expected_page_numbers,
+            total_document_pages=total_document_pages,
         )
 
     @staticmethod
@@ -386,7 +404,11 @@ class ModuleCPipeline:
         self,
         payload: ModuleBOutputPayload,
         page_images: Optional[Sequence[PageImageRef]] = None,
+        expected_page_numbers: Optional[Sequence[int]] = None,
+        total_document_pages: Optional[int] = None,
     ) -> CanonicalExtractionEnvelope:
+        doc_page_count = total_document_pages if total_document_pages is not None else len(payload.pages)
+
         # Route UNKNOWN or low-confidence classification directly to needs_review (FR-CLS-002)
         if payload.status == "needs_review" or payload.classification.document_type.value == "UNKNOWN":
             return CanonicalExtractionEnvelope(
@@ -397,7 +419,7 @@ class ModuleCPipeline:
                     schema_version=payload.classification.schema_version or "1.0.0",
                     classification_confidence=payload.classification.classification_confidence,
                     status="needs_review",
-                    page_count=len(payload.pages),
+                    page_count=doc_page_count,
                 ),
                 fields={},
                 flags=[FlagItem(code="CLASSIFICATION_UNCERTAIN", message="Document routed to review prior to extraction", fields=[])],
@@ -420,7 +442,7 @@ class ModuleCPipeline:
                     schema_version=payload.classification.schema_version or "1.0.0",
                     classification_confidence=payload.classification.classification_confidence,
                     status="needs_review",
-                    page_count=len(payload.pages),
+                    page_count=doc_page_count,
                 ),
                 fields={},
                 flags=[FlagItem(code="NO_SCHEMA_BOUND", message=f"No schema registered for document type {doc_type}", fields=[])],
@@ -467,9 +489,14 @@ class ModuleCPipeline:
                 self._process_doc_03(extracted_data, payload, fields_envelope, flags)
 
         flags.extend(conflict_flags(getattr(extraction_result, "grounding", None) or {}))
+        expected_scope = (
+            expected_page_numbers
+            if expected_page_numbers is not None
+            else [p.page_number for p in payload.pages]
+        )
         coverage_flag = self.partial_coverage_flag(
             execution_provenance,
-            [p.page_number for p in payload.pages],
+            expected_scope,
             [r.page_number for r in selected_images] if selected_images else None,
         )
         if coverage_flag:
@@ -481,7 +508,7 @@ class ModuleCPipeline:
             schema_id=payload.classification.schema_id or doc_type,
             schema_version=payload.classification.schema_version or "1.0.0",
             classification_confidence=payload.classification.classification_confidence,
-            page_count=len(payload.pages),
+            page_count=doc_page_count,
             fields=fields_envelope,
             flags=flags,
             run_id=payload.run_id,

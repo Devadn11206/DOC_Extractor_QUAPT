@@ -18,7 +18,7 @@ import hashlib
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import uuid
 
 from doc_extractor.classification.base import (
@@ -119,23 +119,30 @@ class ModuleBPipeline:
     def load_page_images(
         self,
         handoff_data: Union[ModuleAHandoffPayload, Dict[str, Any]],
+        page_numbers: Optional[Sequence[int]] = None,
     ) -> List[PageImageRef]:
         """
         Resolves the real Module A page images of a handoff into explicit ``PageImageRef``s
         for Module C (multimodal extraction). Goes through the same tenant-validating secure
         loader as ``process_handoff``; ``PageLayoutOutput`` itself carries no image reference.
+        When page_numbers is provided, filters resolved pages to those numbers while preserving
+        original page numbers and geometry.
         """
         load_result = self.loader.load_handoff(
             handoff_data=handoff_data,
             expected_tenant_id=self.tenant_id if self.tenant_id != "default_tenant" else None,
         )
+        pages = load_result.pages
+        if page_numbers is not None:
+            page_set = set(page_numbers)
+            pages = [p for p in pages if p.page_number in page_set]
         return [
             PageImageRef(
                 page_number=page.page_number,
                 image_path=page.file_path,
                 page_ref=page.page_ref,
             )
-            for page in load_result.pages
+            for page in pages
         ]
 
     # ------------------------------------------------------------------------
@@ -150,6 +157,7 @@ class ModuleBPipeline:
         candidate_checkboxes_by_page: Optional[Dict[int, List[CandidateCheckboxRegion]]] = None,
         candidate_grids_by_page: Optional[Dict[int, List[CandidateCharacterGrid]]] = None,
         idempotency_key: Optional[str] = None,
+        page_numbers: Optional[Sequence[int]] = None,
     ) -> ModuleBOutputPayload:
         """
         Executes end-to-end Module B pipeline from Module A handoff to ModuleBOutputPayload.
@@ -205,8 +213,13 @@ class ModuleBPipeline:
             canonical_tenant_id = load_result.tenant_id
 
             # 3b. Per-Page Visual Layout Parsing & Reconstruction
+            pages_to_process = load_result.pages
+            if page_numbers is not None:
+                page_set = set(page_numbers)
+                pages_to_process = [p for p in pages_to_process if p.page_number in page_set]
+
             parsed_pages: List[PageLayoutOutput] = []
-            for loaded_page in load_result.pages:
+            for loaded_page in pages_to_process:
                 page_layout = self.parser.parse_page(loaded_page)
                 page_layout.page_image_path = str(loaded_page.file_path)
 

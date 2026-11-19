@@ -14,6 +14,7 @@ Covers:
 - Convenience invocation with kwargs.
 """
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -51,7 +52,9 @@ from doc_extractor.contracts_c import (
 from doc_extractor.exceptions import (
     DocumentExtractorError,
     InvalidTenantIdentifierError,
+    StorageError,
     TenantMismatchError,
+    UnsupportedFileError,
 )
 from doc_extractor.handoff import ModuleAHandoffPayload, PageHandoffRecord
 from doc_extractor.pipeline import ModuleAPipeline
@@ -179,6 +182,11 @@ def _setup_mock_service(tmp_path: Path, tenant_id: str = "tenant_test", actor_id
         ],
         created_at=datetime.now(timezone.utc).isoformat(),
         completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    handoff_dict_template = mock_module_a.process_document.return_value.to_dict()
+    mock_storage.get_handoff_payload.side_effect = lambda doc_id: (
+        deepcopy(handoff_dict_template) if doc_id == "doc_123" else None
     )
 
     # Module B mock
@@ -2298,3 +2306,796 @@ def test_defensive_diagnostic_sink_failure_does_not_break_processing(tmp_path):
         "code": "INGESTION_ERROR",
         "message": "Document ingestion and preprocessing failed.",
     }
+
+
+# ============================================================================
+# Milestone 2C: Single-Page Stored Document Processing Service Tests
+# ============================================================================
+
+def test_process_stored_page_success(tmp_path):
+    """Verify successful single-page processing of a stored document page."""
+    service, mod_a, mod_b, routed, mod_c, img1 = _setup_mock_service(tmp_path)
+
+    events: List[ProcessingProgressEvent] = []
+    res = service.process_stored_page(
+        document_id="doc_123",
+        page_number=1,
+        progress_callback=events.append,
+    )
+
+    assert res.is_success is True
+    assert res.status == "needs_review"
+    assert res.document_id == "doc_123"
+    assert res.tenant_id == "tenant_test"
+    assert res.envelope is not None
+    assert len(res.page_results) == 1
+    assert res.page_results[0].page_number == 1
+    assert len(res.pages_info) == 1
+    assert res.pages_info[0]["page"] == 1
+    assert len(res.page_items) == 1
+    assert res.page_items[0][0] == 1
+    assert len(res.routes) == 1
+    assert res.routes[0]["page"] == 1
+    assert res.error is None
+
+    # Step keys in progress events: load -> cls -> ext1 -> merge
+    step_keys = [e.step_key for e in events]
+    assert "load" in step_keys
+    assert "cls" in step_keys
+    assert "ext1" in step_keys
+    assert "merge" in step_keys
+
+    # Module A ingestion was NOT rerun
+    mod_a.process_document.assert_not_called()
+
+
+def test_process_stored_page_missing_handoff(tmp_path):
+    """Verify missing Module A handoff returns failed result with HANDOFF_NOT_FOUND."""
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path)
+
+    res = service.process_stored_page(document_id="nonexistent_doc", page_number=1)
+
+    assert res.is_failed is True
+    assert res.status == "failed"
+    assert res.error["code"] == "HANDOFF_NOT_FOUND"
+    assert res.error["message"] == "Module A handoff payload not found for document."
+
+
+def test_process_stored_page_malformed_handoff(tmp_path):
+    """Verify malformed Module A handoff returns failed result with MALFORMED_HANDOFF."""
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path)
+    service.storage.get_handoff_payload.side_effect = lambda doc_id: {"corrupt": "data"}
+
+    res = service.process_stored_page(document_id="doc_123", page_number=1)
+
+    assert res.is_failed is True
+    assert res.status == "failed"
+    assert res.error["code"] == "MALFORMED_HANDOFF"
+    assert res.error["message"] == "Module A handoff payload is malformed or invalid."
+
+
+def test_process_stored_page_invalid_page_number_and_missing_page(tmp_path):
+    """Verify invalid page numbers raise ValueError and missing pages return failed result."""
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path)
+
+    # Invalid page numbers must raise ValueError
+    with pytest.raises(ValueError, match="Invalid page number"):
+        service.process_stored_page("doc_123", page_number=0)
+
+    with pytest.raises(ValueError, match="Invalid page number"):
+        service.process_stored_page("doc_123", page_number=-2)
+
+    with pytest.raises(ValueError, match="Invalid page number"):
+        service.process_stored_page("doc_123", page_number="first")
+
+    # Missing page (valid number, but page does not exist in the 2-page document)
+    res = service.process_stored_page("doc_123", page_number=99)
+    assert res.is_failed is True
+    assert res.status == "failed"
+    assert res.error["code"] == "PAGE_NOT_FOUND"
+    assert "Page 99 not found" in res.error["message"]
+
+
+def test_process_stored_page_cross_tenant_access_rejected(tmp_path):
+    """Verify cross-tenant document access is rejected fail-closed without disclosing tenant identity."""
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path, tenant_id="tenant_a")
+
+    # Case 1: Caller supplies conflicting tenant
+    with pytest.raises(TenantMismatchError) as exc_info:
+        service.process_stored_page("doc_123", page_number=1, tenant_id="tenant_b")
+    assert "tenant_a" not in str(exc_info.value)
+    assert "tenant_b" not in str(exc_info.value)
+    assert "Tenant mismatch" in str(exc_info.value)
+
+    # Case 2: Stored handoff belongs to a different tenant
+    corrupt_tenant_handoff = deepcopy(service.storage.get_handoff_payload("doc_123"))
+    corrupt_tenant_handoff["tenant_id"] = "tenant_attacker"
+    service.storage.get_handoff_payload.side_effect = lambda doc_id: corrupt_tenant_handoff
+
+    with pytest.raises(TenantMismatchError) as exc_info:
+        service.process_stored_page("doc_123", page_number=1)
+    assert "tenant_attacker" not in str(exc_info.value)
+    assert "tenant_a" not in str(exc_info.value)
+    assert "Tenant mismatch" in str(exc_info.value)
+
+
+def test_process_stored_page_preserves_page_geometry_and_evidence(tmp_path):
+    """Verify stored page processing preserves original page geometry and evidence references."""
+    service, _, _, routed, mod_c, img1 = _setup_mock_service(tmp_path)
+
+    # Simulate 90 degree rotation detection during classification
+    routed.classify.return_value = {
+        "category": "structured",
+        "document_type": None,
+        "subtype": None,
+        "language": "en",
+        "confidence": None,
+        "method": "vlm",
+        "rotation": 90,
+        "router_model": "test_router",
+        "filled_by": None,
+    }
+
+    orig_bytes = img1.read_bytes()
+    orig_hash = hashlib.sha256(orig_bytes).hexdigest()
+
+    res = service.process_stored_page("doc_123", page_number=1)
+    assert res.is_success is True
+
+    # 1. Original file bytes on disk are completely unmodified
+    assert img1.read_bytes() == orig_bytes
+    assert hashlib.sha256(img1.read_bytes()).hexdigest() == orig_hash
+
+    # 2. Result page_items preserves unrotated paths
+    assert len(res.page_items) == 1
+    page_no, page_path, orig_path = res.page_items[0]
+    assert page_no == 1
+    assert "upright" not in page_path.name
+    if orig_path:
+        assert "upright" not in orig_path.name
+
+    # 3. Module C was called with page 1 PageImageRef
+    assert mod_c.process_routed_pages.called
+    call_args = mod_c.process_routed_pages.call_args
+    passed_page_images = call_args[0][2]
+    assert len(passed_page_images) == 1
+    assert passed_page_images[0].page_number == 1
+    assert passed_page_images[0].page_ref.original_width_px == 100
+    assert passed_page_images[0].page_ref.original_height_px == 100
+
+
+def test_process_stored_page_module_b_extraction_failure(tmp_path):
+    """Verify Module B processing failures return sanitized failed result."""
+    # Case A: Exception in Module B
+    service, _, mod_b, _, _, _ = _setup_mock_service(tmp_path)
+    mod_b.process_handoff.side_effect = RuntimeError("/sensitive/path/ocr_engine_crash.bin")
+
+    res = service.process_stored_page("doc_123", page_number=1)
+    assert res.is_failed is True
+    assert res.status == "failed"
+    assert res.error["code"] == "MODULE_B_ERROR"
+    assert res.error["message"] == "Module B processing failed."
+    assert "/sensitive/path" not in str(res.error)
+
+    # Case B: Module B returns failed payload
+    service2, _, mod_b2, _, _, _ = _setup_mock_service(tmp_path)
+    mod_b2.process_handoff.return_value = ModuleBOutputPayload(
+        contract_version="1.0.0",
+        run_id="run_b_fail",
+        document_id="doc_123",
+        tenant_id="tenant_test",
+        status="failed",
+        classification=ClassificationOutput(
+            domain=MVPClassificationDomain.BFSI,
+            document_type=MVPDocumentType.UNKNOWN,
+            classification_confidence=0.0,
+            confidence_provenance=ConfidenceProvenance.UNCALIBRATED,
+            review_required=True,
+        ),
+        pages=[],
+        combined_markdown="",
+        parser_model_name="test",
+        classifier_model_name="test",
+        processing_time_ms=10.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
+        error={"code": "INTERNAL", "message": "Raw internal failure /var/log/app.log"},
+    )
+
+    res2 = service2.process_stored_page("doc_123", page_number=1)
+    assert res2.is_failed is True
+    assert res2.status == "failed"
+    assert res2.error["code"] == "MODULE_B_ERROR"
+    assert res2.error["message"] == "Document page classification and layout analysis failed."
+    assert "/var/log" not in str(res2.error)
+
+
+def test_process_stored_page_module_c_failure(tmp_path):
+    """Verify Module C canonical assembly failure returns sanitized failed result."""
+    service, _, _, _, mod_c, _ = _setup_mock_service(tmp_path)
+    mod_c.process_routed_pages.side_effect = ValueError("Corrupt envelope structure at /tmp/workspace/env.json")
+
+    res = service.process_stored_page("doc_123", page_number=1)
+    assert res.is_failed is True
+    assert res.status == "failed"
+    assert res.error["code"] == "CANONICAL_ASSEMBLY_FAILED"
+    assert res.error["message"] == "Canonical output assembly failed."
+    assert "/tmp/workspace" not in str(res.error)
+
+
+def test_process_stored_page_workspace_cleanup_success_and_failure(tmp_path):
+    """Verify temporary workspace cleanup is guaranteed after success and failure."""
+    from unittest.mock import patch
+    from doc_extractor.processing_service import RequestTemporaryWorkspace
+
+    service, _, _, _, mod_c, _ = _setup_mock_service(tmp_path)
+
+    # 1. Successful run cleanup
+    created_workspaces: List[Path] = []
+    orig_enter = RequestTemporaryWorkspace.__enter__
+
+    def tracking_enter(self):
+        res = orig_enter(self)
+        created_workspaces.append(self.path)
+        return res
+
+    with patch.object(RequestTemporaryWorkspace, "__enter__", tracking_enter):
+        res = service.process_stored_page("doc_123", page_number=1)
+        assert res.is_success is True
+
+    assert len(created_workspaces) == 1
+    assert not created_workspaces[0].exists()
+
+    # 2. Failure run cleanup (Module C failure)
+    created_workspaces.clear()
+    mod_c.process_routed_pages.side_effect = RuntimeError("Module C fatal error")
+
+    with patch.object(RequestTemporaryWorkspace, "__enter__", tracking_enter):
+        res = service.process_stored_page("doc_123", page_number=1)
+        assert res.is_failed is True
+
+    assert len(created_workspaces) == 1
+    assert not created_workspaces[0].exists()
+
+
+def test_process_stored_page_stream_early_generator_close_cleans_up(tmp_path):
+    """Verify closing the stream generator early triggers finally cleanup."""
+    from unittest.mock import patch
+    from doc_extractor.processing_service import RequestTemporaryWorkspace
+
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path)
+
+    active_paths: List[Path] = []
+    orig_enter = RequestTemporaryWorkspace.__enter__
+
+    def tracking_enter(self):
+        res = orig_enter(self)
+        active_paths.append(self.path)
+        return res
+
+    with patch.object(RequestTemporaryWorkspace, "__enter__", tracking_enter):
+        stream = service.process_stored_page_stream("doc_123", page_number=1)
+        first_event = next(stream)
+        assert first_event.step_key == "load"
+
+        # Workspace directory was created and is active
+        assert len(active_paths) == 1
+        ws_path = active_paths[0]
+        assert ws_path.exists()
+
+        # Closing generator early must execute workspace.cleanup() in finally
+        stream.close()
+        assert not ws_path.exists()
+
+
+def test_document_service_process_stored_page_boundary(tmp_path):
+    """Verify DocumentService delegates process_stored_page and enforces tenant alignment."""
+    from doc_extractor.api.services.document_service import DocumentService
+
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path, tenant_id="tenant_boundary")
+    doc_service = DocumentService(processing_service=service, tenant_id="tenant_boundary")
+
+    # 1. Matching tenant succeeds
+    res = doc_service.process_stored_page(document_id="doc_123", page_number=1)
+    assert res.is_success is True
+    assert res.tenant_id == "tenant_boundary"
+
+    # 2. Conflicting tenant parameter fails closed
+    with pytest.raises(TenantMismatchError):
+        doc_service.process_stored_page(
+            document_id="doc_123",
+            page_number=1,
+            tenant_id="tenant_other",
+        )
+
+    # 3. Conflicting tenant in kwargs fails closed
+    with pytest.raises(TenantMismatchError):
+        doc_service.process_stored_page(
+            document_id="doc_123",
+            page_number=1,
+            kwargs_tenant="tenant_other",  # won't trigger kw_tenant
+            tenant_id="tenant_other",
+        )
+    with pytest.raises(TenantMismatchError):
+        doc_service.process_stored_page(
+            "doc_123",
+            1,
+            tenant_id="tenant_other",
+        )
+
+    # 4. Non-string document_id rejected
+    with pytest.raises(ValueError, match="Document ID is required"):
+        doc_service.process_stored_page(document_id=123, page_number=1)
+
+    with pytest.raises(ValueError, match="Document ID is required"):
+        doc_service.process_stored_page_stream(document_id=123, page_number=1)
+
+    # 5. Stream conflicting tenant fails closed
+    with pytest.raises(TenantMismatchError):
+        doc_service.process_stored_page_stream(
+            document_id="doc_123",
+            page_number=1,
+            tenant_id="tenant_other",
+        )
+
+
+def test_process_stored_page_non_string_document_id_rejected(tmp_path):
+    """Verify non-string or empty document_id is rejected fail-closed with ValueError."""
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path)
+
+    for invalid_doc_id in (None, 12345, 0, True, False, "", "   ", DocumentProcessingRequest):
+        with pytest.raises(ValueError, match="Document ID is required"):
+            service.process_stored_page(document_id=invalid_doc_id, page_number=1)
+
+    req = DocumentProcessingRequest(
+        file_path_or_stream=b"dummy",
+        claimed_filename="doc.pdf",
+        tenant_id="tenant_test",
+    )
+    with pytest.raises(ValueError, match="Document ID is required"):
+        service.process_stored_page(document_id=req, page_number=1)
+
+
+def test_process_stored_page_stream_synchronous_validation(tmp_path):
+    """Verify process_stored_page_stream validates arguments synchronously before generator starts."""
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path, tenant_id="tenant_test")
+
+    # 1. Invalid document_id fails synchronously without calling next()
+    with pytest.raises(ValueError, match="Document ID is required"):
+        service.process_stored_page_stream(document_id=123, page_number=1)
+
+    with pytest.raises(ValueError, match="Document ID is required"):
+        service.process_stored_page_stream(document_id="", page_number=1)
+
+    # 2. Path traversal fails synchronously without calling next()
+    with pytest.raises(StorageError, match="Path traversal attempt"):
+        service.process_stored_page_stream(document_id="../etc/passwd", page_number=1)
+
+    # 3. Invalid page_number fails synchronously without calling next()
+    with pytest.raises(ValueError, match="Invalid page number"):
+        service.process_stored_page_stream(document_id="doc_123", page_number=0)
+
+    with pytest.raises(ValueError, match="Invalid page number"):
+        service.process_stored_page_stream(document_id="doc_123", page_number=-1)
+
+    with pytest.raises(ValueError, match="Invalid page number"):
+        service.process_stored_page_stream(document_id="doc_123", page_number=True)
+
+    # 4. Tenant mismatch fails synchronously without calling next()
+    with pytest.raises(TenantMismatchError):
+        service.process_stored_page_stream(
+            document_id="doc_123", page_number=1, tenant_id="other_tenant"
+        )
+
+
+def test_process_stored_page_handoff_document_id_mismatch(tmp_path):
+    """Verify retrieved handoff with mismatched document_id fails closed with MALFORMED_HANDOFF."""
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path, tenant_id="tenant_test")
+
+    handoff = deepcopy(service.storage.get_handoff_payload("doc_123"))
+    handoff["document_id"] = "foreign_doc_999"
+    service.storage.get_handoff_payload.side_effect = lambda doc_id: handoff
+
+    res = service.process_stored_page(document_id="doc_123", page_number=1)
+
+    assert res.is_failed is True
+    assert res.status == "failed"
+    assert res.error["code"] == "MALFORMED_HANDOFF"
+    assert res.error["message"] == "Module A handoff payload is malformed or invalid."
+    assert "foreign_doc_999" not in str(res.error)
+
+
+def test_process_stored_page_request_id_correlation(tmp_path):
+    """Verify request_id is propagated to progress event data and error details."""
+    service, _, _, _, _, _ = _setup_mock_service(tmp_path, tenant_id="tenant_test")
+
+    req_id = "req_trace_abc123"
+    events: List[ProcessingProgressEvent] = []
+    res = service.process_stored_page(
+        document_id="doc_123",
+        page_number=1,
+        progress_callback=events.append,
+        request_id=req_id,
+    )
+
+    assert res.is_success is True
+    assert len(events) > 0
+    for ev in events:
+        if ev.data is not None:
+            assert ev.data.get("request_id") == req_id
+
+    # Test error correlation
+    error_events: List[ProcessingProgressEvent] = []
+    err_res = service.process_stored_page(
+        document_id="doc_123",
+        page_number=99,  # non-existent page
+        progress_callback=error_events.append,
+        request_id=req_id,
+    )
+    assert err_res.is_failed is True
+    assert err_res.error.get("request_id") == req_id
+    assert any(ev.data and ev.data.get("request_id") == req_id for ev in error_events)
+
+
+def test_real_stack_single_page_processing(tmp_path):
+    """
+    Real-stack integration test using real LocalDiskStorage, real ModuleAPipeline,
+    real ModuleBPipeline, real ModuleCPipeline, and a 3-page synthetic PDF fixture.
+    Verifies:
+      - Page 2 isolation before Module B parsing
+      - Byte-for-byte unmodified source PDF in storage
+      - Combined markdown contains ONLY page 2
+      - Module B payload contains ONLY page 2
+      - No false PARTIAL_PAGE_COVERAGE flag
+      - Envelope page_count correctly reports total document pages (3)
+      - Whole document processing still processes all 3 pages
+      - Correct evidence page number (page 2)
+      - Exact expected evidence bounding-box coordinates with 90-degree rotation
+      - Specialist extractor receives the upright temporary image with transposed dimensions
+      - Original and preprocessed stored page-image files and handoff remain byte-for-byte unchanged
+      - Hash verification of handoff JSON and all stored page artifacts before and after processing
+      - Distinct OCR/parsed content for pages 1, 2, and 3
+      - No text from pages 1 or 3 appears in the selected-page result
+    """
+    import io
+    import json
+    import hashlib
+    from unittest.mock import MagicMock
+    from PIL import Image
+    from doc_extractor.contracts_c import ExecutionProvenance, ExecutionMode
+    from doc_extractor.malware import MockMalwareScanner
+    from doc_extractor.pipeline_b import ModuleBPipeline
+    from doc_extractor.pipeline_c import ModuleCPipeline
+    from doc_extractor.routing import RoutedExtractor
+
+    storage = LocalDiskStorage(base_dir=tmp_path / "real_storage", tenant_id="tenant_real_e2e")
+    pipe_a = ModuleAPipeline(scanner=MockMalwareScanner(), storage=storage, tenant_id="tenant_real_e2e")
+    pipe_b = ModuleBPipeline(storage=storage, tenant_id="tenant_real_e2e")
+    pipe_c = ModuleCPipeline()
+    routed = RoutedExtractor(allow_fallback=False)
+
+    # 1. Page 2 requires 90-degree clockwise rotation
+    routed.classify = MagicMock(return_value={
+        "category": "structured",
+        "document_type": None,
+        "subtype": None,
+        "language": "en",
+        "confidence": None,
+        "method": "vlm",
+        "rotation": 90,
+        "router_model": "test_router",
+        "filled_by": None,
+    })
+
+    extracted_images: List[Tuple[str, Tuple[int, int]]] = []
+    captured_upright_pixels: List[Tuple[int, ...]] = []
+    def spy_extract(img_path, category, language, schema_cls, subtype, engine=None):
+        with Image.open(img_path) as im:
+            extracted_images.append((img_path, im.size))
+            # Capture center pixel of the image delivered to the specialist extractor
+            captured_upright_pixels.append(im.getpixel((im.width // 2, im.height // 2)))
+        # Returns normalized bbox [ymin, xmin, ymax, xmax] or [x1, y1, x2, y2] on UPRIGHT image (0-1000)
+        return (
+            {"applicant_name": {"value": "Alice Wonderland", "bbox": [100.0, 200.0, 300.0, 400.0]}},
+            ExecutionProvenance(
+                mode=ExecutionMode.GENUINE_LLM,
+                model_name="vlm_model",
+                provider="local_test",
+                details={"pages_processed": [2], "pages_failed": []},
+            ),
+            {"model_used": "vlm_model", "fallback_occurred": False},
+        )
+    routed.extract = spy_extract
+
+    service = DocumentProcessingService(
+        storage=storage,
+        module_a=pipe_a,
+        module_b=pipe_b,
+        module_c=pipe_c,
+        routed_extractor=routed,
+        tenant_id="tenant_real_e2e",
+    )
+
+    # 2. Create a 3-page synthetic PDF fixture with distinct aspect ratio (200x300)
+    imgs = [Image.new("RGB", (200, 300), (i * 60, 100, 100)) for i in range(3)]
+    buf = io.BytesIO()
+    imgs[0].save(buf, format="PDF", save_all=True, append_images=imgs[1:])
+    original_pdf_bytes = buf.getvalue()
+    buf.seek(0)
+
+    # Ingest document into storage through Module A
+    handoff = pipe_a.process_document(buf, "invoice_3pages.pdf")
+    doc_id = handoff.document_id
+    assert handoff.page_count == 3
+    assert len(handoff.pages) == 3
+
+    # 3. Hash the stored Module A handoff JSON and all relevant stored page artifacts BEFORE processing
+    def compute_storage_hashes() -> Dict[str, str]:
+        h: Dict[str, str] = {}
+        # Stored handoff JSON
+        raw_handoff = storage.get_handoff_payload(doc_id)
+        h["handoff_json"] = hashlib.sha256(json.dumps(raw_handoff, sort_keys=True).encode()).hexdigest()
+        # Original stored source PDF
+        pdf_path = storage.resolve_uri_to_path(f"{storage.tenant_id}/{doc_id}/source/original.pdf")
+        h["original_pdf"] = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+        # All page image and metadata artifacts
+        for p in handoff.pages:
+            orig_p = storage.resolve_uri_to_path(p.original_storage_uri)
+            prep_p = storage.resolve_uri_to_path(p.preprocessed_storage_uri)
+            meta_p = storage.resolve_uri_to_path(p.metadata_storage_uri)
+            h[f"page_{p.page_number}_orig"] = hashlib.sha256(orig_p.read_bytes()).hexdigest()
+            h[f"page_{p.page_number}_prep"] = hashlib.sha256(prep_p.read_bytes()).hexdigest()
+            h[f"page_{p.page_number}_meta"] = hashlib.sha256(meta_p.read_bytes()).hexdigest()
+        return h
+
+    hashes_before = compute_storage_hashes()
+    assert len(hashes_before) == 11, "Expected 11 distinct stored artifacts to be tracked"
+
+    # 4. Spy on Module B parser.parse_page to provide distinct OCR/parsed content for each page
+    original_parse_page = pipe_b.parser.parse_page
+    parsed_pages: List[int] = []
+
+    def spy_parse_page(loaded_page):
+        p_no = loaded_page.page_number
+        parsed_pages.append(p_no)
+        layout = original_parse_page(loaded_page)
+        # Unique distinct content for each page
+        layout.markdown_content = f"--- Page {p_no}: EXCLUSIVE_PAGE_{p_no}_SECRET ---"
+        return layout
+
+    pipe_b.parser.parse_page = spy_parse_page
+
+    # 5. Process ONLY page 2
+    res = service.process_stored_page(document_id=doc_id, page_number=2)
+
+    # Verify execution outcome
+    assert res.is_success is True
+    assert res.status in ("auto_approved", "needs_review", "reviewed", "processing")
+
+    # Verify Module B parsed ONLY page 2
+    assert parsed_pages == [2], f"Expected parser to be called ONLY for page 2, got: {parsed_pages}"
+
+    # Verify Module B output payload contains ONLY page 2
+    assert len(res.payload_b.pages) == 1
+    assert res.payload_b.pages[0].page_number == 2
+
+    # Verify distinct OCR/parsed content: only page 2 present, pages 1 and 3 strictly absent
+    assert "EXCLUSIVE_PAGE_2_SECRET" in res.payload_b.combined_markdown
+    assert "EXCLUSIVE_PAGE_1_SECRET" not in res.payload_b.combined_markdown
+    assert "EXCLUSIVE_PAGE_3_SECRET" not in res.payload_b.combined_markdown
+    assert "EXCLUSIVE_PAGE_1_SECRET" not in str(res.envelope.model_dump())
+    assert "EXCLUSIVE_PAGE_3_SECRET" not in str(res.envelope.model_dump())
+
+    # Verify that specialist extractor received the upright temporary image with transposed dimensions
+    assert len(extracted_images) == 1
+    upright_img_path, upright_size = extracted_images[0]
+    assert "upright_90_" in Path(upright_img_path).name
+    prep_p2_path = storage.resolve_uri_to_path(handoff.pages[1].preprocessed_storage_uri)
+    with Image.open(prep_p2_path) as prep_im:
+        prep_size = prep_im.size
+    assert upright_size == (prep_size[1], prep_size[0]), "Specialist model must receive transposed upright image dimensions"
+
+    # Verify that the specialist extractor received the actual page-2 image, not page 1 mislabelled.
+    # Note: Each synthetic fixture page has a distinct solid fill colour:
+    #   Page 1 R-channel ~10, Page 2 R-channel ~63, Page 3 R-channel ~121  (after CLAHE preprocessing).
+    # This pixel-color check verifies page identity (confirming page 2 was routed, not page 1 or 3),
+    # while rotation correctness is verified by the transposed dimensions assertion above,
+    # the un-rotated evidence bounding box mapping below, and dedicated rotation unit tests.
+    assert len(captured_upright_pixels) == 1
+    upright_center_r = captured_upright_pixels[0][0]
+    with Image.open(prep_p2_path) as p2_im:
+        expected_rotated = p2_im.rotate(-90, expand=True)
+        expected_center_r = expected_rotated.getpixel((expected_rotated.width // 2, expected_rotated.height // 2))[0]
+    assert abs(upright_center_r - expected_center_r) <= 2, (
+        f"Specialist extractor received wrong page image: upright R={upright_center_r}, "
+        f"expected page-2 rotated R={expected_center_r}"
+    )
+    # Confirm it is NOT page 1 or page 3 by checking the R-channel distance
+    prep_p1_path = storage.resolve_uri_to_path(handoff.pages[0].preprocessed_storage_uri)
+    with Image.open(prep_p1_path) as p1_im:
+        p1_center_r = p1_im.getpixel((p1_im.width // 2, p1_im.height // 2))[0]
+    assert abs(upright_center_r - p1_center_r) > 20, (
+        f"Specialist extractor received page-1 image instead of page-2: R={upright_center_r}, page-1 R={p1_center_r}"
+    )
+
+    # Verify that the rotated temporary artifact no longer exists after processing
+    upright_tmp_file = Path(upright_img_path)
+    assert not upright_tmp_file.exists(), (
+        f"Rotated temporary artifact should have been cleaned up: {upright_tmp_file}"
+    )
+    # Also verify the entire temporary workspace directory was removed
+    workspace_dir = upright_tmp_file.parent
+    assert not workspace_dir.exists(), (
+        f"Temporary workspace directory should have been cleaned up: {workspace_dir}"
+    )
+
+    # Verify rotation metadata recorded on execution
+    assert res.page_results[0].rotation == 90
+    assert res.routes[0]["page"] == 2
+
+    # Verify correct evidence page number and exact bounding box coordinates
+    assert "applicant_name" in res.envelope.fields
+    ev = res.envelope.fields["applicant_name"].evidence
+    assert ev is not None
+    assert ev.page == 2, f"Expected evidence page to be 2, got {ev.page}"
+    assert ev.text == "Alice Wonderland"
+
+    # Exact expected evidence coordinates:
+    # Model extracted [100.0, 200.0, 300.0, 400.0] on the 90-degree upright image
+    # unrotate_bbox_norm(..., 90) -> (200.0, 700.0, 400.0, 900.0) in preprocessed normalized frame
+    w_prep, h_prep = prep_size
+    expected_bbox = (
+        200.0 * w_prep / 1000.0,
+        700.0 * h_prep / 1000.0,
+        400.0 * w_prep / 1000.0,
+        900.0 * h_prep / 1000.0,
+    )
+    assert ev.bbox == pytest.approx(expected_bbox), f"Expected evidence bbox {expected_bbox}, got {ev.bbox}"
+
+    # Verify all 11 stored artifacts remain byte-for-byte unchanged after processing
+    hashes_after = compute_storage_hashes()
+    assert hashes_after == hashes_before, "Stored artifacts or handoff were modified during single-page processing!"
+
+    # Verify canonical extraction envelope:
+    # - reports the full original document page count (3)
+    # - does NOT produce a false PARTIAL_PAGE_COVERAGE flag
+    assert res.envelope.document_metadata.page_count == 3
+    coverage_flags = [f for f in res.envelope.flags if f.code == "PARTIAL_PAGE_COVERAGE"]
+    assert len(coverage_flags) == 0, f"False PARTIAL_PAGE_COVERAGE flag detected: {coverage_flags}"
+
+    # 6. Verify whole-document processing still extracts all pages (regression check)
+    buf2 = io.BytesIO(original_pdf_bytes)
+    req_full = DocumentProcessingRequest(
+        file_path_or_stream=buf2,
+        claimed_filename="invoice_whole.pdf",
+        tenant_id="tenant_real_e2e",
+    )
+    # Configure routed extractor for full document (pages 1, 2, 3)
+    routed.extract = MagicMock(return_value=(
+        {"applicant_name": {"value": "Alice Wonderland", "bbox": [10, 10, 50, 20]}},
+        ExecutionProvenance(
+            mode=ExecutionMode.GENUINE_LLM,
+            model_name="vlm_model",
+            provider="local_test",
+            details={"pages_processed": [1, 2, 3], "pages_failed": []},
+        ),
+        {"model_used": "vlm_model", "fallback_occurred": False},
+    ))
+    parsed_pages.clear()
+    res_full = service.process_document(req_full)
+    assert res_full.is_success is True
+    assert len(res_full.payload_b.pages) == 3
+    assert parsed_pages == [1, 2, 3]
+
+
+def test_module_b_page_selection_contract(tmp_path):
+    """
+    Directly test ModuleBPipeline.load_page_images(page_numbers=...) and process_handoff.
+    Verifies:
+      - page_numbers=None loads all pages
+      - [2] selects only page 2
+      - Original page numbering remains unchanged (page 2 stays 2)
+      - Duplicate page selections are deduplicated ([2, 2] -> [2])
+      - Invalid page numbers ([99]) return empty list
+      - Corrupt unselected pages still fail full-handoff integrity validation
+      - process_handoff() passes only the selected page to its parser
+    """
+    import io
+    from PIL import Image
+    from doc_extractor.malware import MockMalwareScanner
+    from doc_extractor.pipeline_b import ModuleBPipeline
+    from doc_extractor.exceptions import UnsupportedFileError
+
+    storage = LocalDiskStorage(base_dir=tmp_path / "mb_storage", tenant_id="tenant_mb")
+    pipe_a = ModuleAPipeline(scanner=MockMalwareScanner(), storage=storage, tenant_id="tenant_mb")
+    pipe_b = ModuleBPipeline(storage=storage, tenant_id="tenant_mb")
+
+    # Ingest 3-page document
+    imgs = [Image.new("RGB", (200, 200), (i * 50, 100, 100)) for i in range(3)]
+    buf = io.BytesIO()
+    imgs[0].save(buf, format="PDF", save_all=True, append_images=imgs[1:])
+    buf.seek(0)
+    handoff = pipe_a.process_document(buf, "mb_test.pdf")
+
+    # 1. page_numbers=None loads all pages
+    refs_all = pipe_b.load_page_images(handoff, page_numbers=None)
+    assert len(refs_all) == 3
+    assert [r.page_number for r in refs_all] == [1, 2, 3]
+
+    # 2. [2] selects only page 2 with original page numbering preserved
+    refs_p2 = pipe_b.load_page_images(handoff, page_numbers=[2])
+    assert len(refs_p2) == 1
+    assert refs_p2[0].page_number == 2
+    assert refs_p2[0].page_ref.page_number == 2
+
+    # 3. Duplicate page selection is deduplicated
+    refs_dup = pipe_b.load_page_images(handoff, page_numbers=[2, 2])
+    assert len(refs_dup) == 1
+    assert refs_dup[0].page_number == 2
+
+    # 4. Invalid page selection returns empty list
+    refs_invalid = pipe_b.load_page_images(handoff, page_numbers=[99])
+    assert refs_invalid == []
+
+    # 5. process_handoff passes only selected page to parser
+    orig_parse = pipe_b.parser.parse_page
+    parsed_pages: List[int] = []
+
+    def spy_parse(loaded_page):
+        parsed_pages.append(loaded_page.page_number)
+        return orig_parse(loaded_page)
+
+    pipe_b.parser.parse_page = spy_parse
+    payload_b = pipe_b.process_handoff(handoff, page_numbers=[2])
+
+    assert parsed_pages == [2], f"Expected parser to be called ONLY for page 2, got {parsed_pages}"
+    assert len(payload_b.pages) == 1
+    assert payload_b.pages[0].page_number == 2
+
+    # 6. Corrupt unselected page still fails full-handoff integrity validation
+    # Delete page 3 preprocessed image file from storage
+    p3_prep_file = storage.resolve_uri_to_path(handoff.pages[2].preprocessed_storage_uri)
+    p3_prep_file.unlink()
+
+    # Calling load_page_images for page 1 must fail closed even though page 3 was not requested
+    with pytest.raises(UnsupportedFileError):
+        pipe_b.load_page_images(handoff, page_numbers=[1])
+
+    # Calling process_handoff for page 1 must also fail closed returning a terminal failed payload
+    failed_payload = pipe_b.process_handoff(handoff, page_numbers=[1])
+    assert failed_payload.status == "failed"
+    assert "page 3" in str(failed_payload.error).lower()
+
+
+def test_service_passes_scope_and_total_pages_to_module_c(tmp_path):
+    """
+    Verify DocumentProcessingService passes:
+      - page_numbers=[2] to ModuleBPipeline.load_page_images
+      - page_numbers=[2] to ModuleBPipeline.process_handoff
+      - expected_page_numbers=[2] and total_document_pages=2 to ModuleCPipeline.process_routed_pages
+    """
+    service, _, mock_module_b, _, mock_module_c, _ = _setup_mock_service(tmp_path)
+
+    # Process page 2 of doc_123 (handoff in _setup_mock_service has 2 pages)
+    service.process_stored_page("doc_123", page_number=2)
+
+    # Module B assertions
+    assert mock_module_b.load_page_images.called
+    assert mock_module_b.load_page_images.call_args.kwargs.get("page_numbers") == [2], (
+        f"Expected Module B load_page_images page_numbers=[2], got {mock_module_b.load_page_images.call_args.kwargs.get('page_numbers')}"
+    )
+    assert mock_module_b.process_handoff.called
+    assert mock_module_b.process_handoff.call_args.kwargs.get("page_numbers") == [2], (
+        f"Expected Module B process_handoff page_numbers=[2], got {mock_module_b.process_handoff.call_args.kwargs.get('page_numbers')}"
+    )
+
+    # Module C assertions
+    assert mock_module_c.process_routed_pages.called
+    call_kwargs = mock_module_c.process_routed_pages.call_args.kwargs
+
+    assert call_kwargs.get("expected_page_numbers") == [2], (
+        f"Expected expected_page_numbers=[2], got {call_kwargs.get('expected_page_numbers')}"
+    )
+    assert call_kwargs.get("total_document_pages") == 2, (
+        f"Expected total_document_pages=2, got {call_kwargs.get('total_document_pages')}"
+    )

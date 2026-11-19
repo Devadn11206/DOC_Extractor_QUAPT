@@ -82,3 +82,69 @@ class DocumentService:
                 message="Tenant mismatch: request tenant does not match service tenant."
             )
         return self.processing_service.process_document_stream(request, **kwargs)
+
+    def process_stored_page(
+        self,
+        document_id: str,
+        page_number: int,
+        tenant_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> DocumentProcessingResult:
+        """
+        Execute single-page processing for a previously stored document page.
+        Enforces tenant context alignment.
+        """
+        if not isinstance(document_id, str) or isinstance(document_id, bool) or not document_id.strip():
+            raise ValueError("Document ID is required and must be a non-empty string.")
+
+        if "tenant_id" in kwargs:
+            kw_tenant = kwargs.pop("tenant_id")
+            if kw_tenant != self.tenant_id:
+                raise TenantMismatchError(
+                    message="Tenant mismatch: request tenant does not match service tenant."
+                )
+
+        if tenant_id is not None and tenant_id != self.tenant_id:
+            raise TenantMismatchError(
+                message="Tenant mismatch: request tenant does not match service tenant."
+            )
+
+        return self.processing_service.process_stored_page(
+            document_id=document_id,
+            page_number=page_number,
+            tenant_id=self.tenant_id,
+            **kwargs,
+        )
+
+    def process_stored_page_stream(
+        self,
+        document_id: str,
+        page_number: int,
+        tenant_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Iterator[ProcessingProgressEvent]:
+        """
+        Stream progress events during single-page processing for a previously stored document page.
+        Enforces tenant context alignment.
+        """
+        if not isinstance(document_id, str) or isinstance(document_id, bool) or not document_id.strip():
+            raise ValueError("Document ID is required and must be a non-empty string.")
+
+        if "tenant_id" in kwargs:
+            kw_tenant = kwargs.pop("tenant_id")
+            if kw_tenant != self.tenant_id:
+                raise TenantMismatchError(
+                    message="Tenant mismatch: request tenant does not match service tenant."
+                )
+
+        if tenant_id is not None and tenant_id != self.tenant_id:
+            raise TenantMismatchError(
+                message="Tenant mismatch: request tenant does not match service tenant."
+            )
+
+        return self.processing_service.process_stored_page_stream(
+            document_id=document_id,
+            page_number=page_number,
+            tenant_id=self.tenant_id,
+            **kwargs,
+        )

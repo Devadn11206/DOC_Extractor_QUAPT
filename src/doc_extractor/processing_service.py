@@ -42,6 +42,7 @@ from doc_extractor.exceptions import (
     DocumentExtractorError,
     DocumentProcessingError,
     InvalidTenantIdentifierError,
+    StorageError,
     TenantMismatchError,
     TenantStorageIsolationError,
     TenantStorageUnavailableError,
@@ -494,12 +495,16 @@ class DocumentProcessingService:
 
         self.max_pages_default = int(os.environ.get("DOC_MAX_PAGES", "0"))
 
-    def _resolve_tenant(self, request: DocumentProcessingRequest) -> str:
+    def _resolve_tenant(self, request: Union[DocumentProcessingRequest, str, None] = None) -> str:
         """
         Resolves and validates the effective tenant ID for this processing execution.
         Fails closed if the tenant is missing, blank, invalid, or mismatches the service's bound tenant.
         """
-        req_tenant = getattr(request, "tenant_id", None)
+        if isinstance(request, str):
+            req_tenant = request
+        else:
+            req_tenant = getattr(request, "tenant_id", None) if request is not None else None
+
         if req_tenant is None:
             if self.tenant_id is not None:
                 req_tenant = self.tenant_id
@@ -1256,5 +1261,811 @@ class DocumentProcessingService:
             raise DocumentProcessingError(
                 message="Document processing finished without producing a result.",
                 details={"document_id": getattr(req, "request_id", "unknown")},
+            )
+        return last_result
+
+    def process_stored_page_stream(
+        self,
+        document_id: str,
+        page_number: int,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        category_choice: Optional[str] = None,
+        doc_type_choice: Optional[str] = None,
+        subtype_choice: Optional[str] = None,
+        language_choice: Optional[str] = None,
+        engine_choice: Optional[str] = None,
+        diagnostic_sink: Optional[Callable[[str, str], None]] = None,
+        request_id: Optional[str] = None,
+    ) -> Iterator[ProcessingProgressEvent]:
+        """
+        Executes single-page processing using the stored Module A handoff and yields ProcessingProgressEvents.
+        The terminal event carries the complete DocumentProcessingResult in its `result` attribute.
+
+        Performs synchronous input and tenant validation before returning the stream generator.
+        """
+        if not isinstance(document_id, str) or isinstance(document_id, bool) or not document_id.strip():
+            raise ValueError("Document ID is required and must be a non-empty string.")
+
+        if "/" in document_id or "\\" in document_id or ".." in document_id:
+            raise StorageError(
+                message="Path traversal attempt detected in document storage path.",
+                details={"document_id": document_id},
+            )
+
+        if not isinstance(page_number, int) or isinstance(page_number, bool) or page_number < 1:
+            raise ValueError(
+                f"Invalid page number: {page_number}. Page numbers must be 1-based positive integers."
+            )
+
+        effective_tenant = self._resolve_tenant(tenant_id)
+
+        return self._process_stored_page_stream_generator(
+            document_id=document_id,
+            page_number=page_number,
+            effective_tenant=effective_tenant,
+            actor_id=actor_id,
+            category_choice=category_choice,
+            doc_type_choice=doc_type_choice,
+            subtype_choice=subtype_choice,
+            language_choice=language_choice,
+            engine_choice=engine_choice,
+            diagnostic_sink=diagnostic_sink,
+            request_id=request_id,
+        )
+
+    def _process_stored_page_stream_generator(
+        self,
+        document_id: str,
+        page_number: int,
+        effective_tenant: str,
+        actor_id: Optional[str] = None,
+        category_choice: Optional[str] = None,
+        doc_type_choice: Optional[str] = None,
+        subtype_choice: Optional[str] = None,
+        language_choice: Optional[str] = None,
+        engine_choice: Optional[str] = None,
+        diagnostic_sink: Optional[Callable[[str, str], None]] = None,
+        request_id: Optional[str] = None,
+    ) -> Iterator[ProcessingProgressEvent]:
+        t_start = time.perf_counter()
+        effective_actor = actor_id or self.actor_id or "system"
+
+        def _make_error(code: str, message: str) -> Dict[str, Any]:
+            err: Dict[str, Any] = {"code": code, "message": message}
+            if request_id is not None:
+                err["request_id"] = request_id
+            return err
+
+        def _make_event(
+            step_key: str,
+            label: str,
+            state: str,
+            detail: Optional[str] = None,
+            data: Optional[Dict[str, Any]] = None,
+            result: Optional[DocumentProcessingResult] = None,
+        ) -> ProcessingProgressEvent:
+            ev_data = dict(data) if data is not None else {}
+            if request_id is not None:
+                ev_data.setdefault("request_id", request_id)
+            return ProcessingProgressEvent(
+                step_key=step_key,
+                label=label,
+                state=state,
+                detail=detail,
+                data=ev_data if ev_data else None,
+                result=result,
+            )
+
+        _validate_component_tenant(self.storage, effective_tenant, "storage")
+        _validate_component_tenant(self.module_a, effective_tenant, "module_a")
+        _validate_component_tenant(self.module_b, effective_tenant, "module_b")
+
+        exec_storage = (
+            self.storage
+            if self.storage is not None
+            else LocalDiskStorage(self.settings.storage_base_dir, tenant_id=effective_tenant)
+        )
+        exec_module_a = (
+            self.module_a
+            if self.module_a is not None
+            else ModuleAPipeline(
+                settings=self.settings,
+                storage=exec_storage,
+                idempotency_store=self.idempotency_store,
+                tenant_id=effective_tenant,
+            )
+        )
+        exec_module_b = (
+            self.module_b
+            if self.module_b is not None
+            else ModuleBPipeline(
+                storage=exec_storage,
+                tenant_id=effective_tenant,
+                settings=self.settings,
+                idempotency_store=self.idempotency_store,
+            )
+        )
+        _validate_component_tenant(exec_storage, effective_tenant, "storage")
+        _validate_component_tenant(exec_module_a, effective_tenant, "module_a")
+        _validate_component_tenant(exec_module_b, effective_tenant, "module_b")
+
+        workspace = RequestTemporaryWorkspace(prefix="doc_workspace_")
+        workspace.__enter__()
+        try:
+            choices = {
+                "category": category_choice or AUTO,
+                "doc_type": doc_type_choice or AUTO,
+                "subtype": subtype_choice or AUTO,
+                "language": language_choice or AUTO,
+            }
+
+            engine = resolve_engine_choice(engine_choice)
+
+            yield _make_event(
+                step_key="load",
+                label=f"Load stored page {page_number} handoff",
+                state="running",
+                detail=f"Resolving handoff for document {document_id}",
+            )
+
+            try:
+                raw_handoff = exec_storage.get_handoff_payload(document_id)
+            except TYPED_DOMAIN_EXCEPTIONS:
+                raise
+            except Exception as exc:
+                logger.error("Failed to retrieve handoff payload: %s", exc, exc_info=True)
+                sanitized_msg = "Failed to retrieve stored document handoff."
+                res = DocumentProcessingResult(
+                    document_id=document_id,
+                    tenant_id=effective_tenant,
+                    status="failed",
+                    error=_make_error("STORAGE_ERROR", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "load", str(exc))
+                yield _make_event(
+                    step_key="load",
+                    label=f"Load stored page {page_number} handoff",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            if raw_handoff is None:
+                logger.warning("Module A handoff not found for document %s", document_id)
+                sanitized_msg = "Module A handoff payload not found for document."
+                res = DocumentProcessingResult(
+                    document_id=document_id,
+                    tenant_id=effective_tenant,
+                    status="failed",
+                    error=_make_error("HANDOFF_NOT_FOUND", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "load", f"Handoff missing for document {document_id}")
+                yield _make_event(
+                    step_key="load",
+                    label=f"Load stored page {page_number} handoff",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            if isinstance(raw_handoff, ModuleAHandoffPayload):
+                payload_a = raw_handoff
+            elif isinstance(raw_handoff, dict):
+                try:
+                    payload_a = ModuleAHandoffPayload.from_dict(raw_handoff)
+                except Exception as exc:
+                    logger.error("Malformed Module A handoff payload: %s", exc, exc_info=True)
+                    sanitized_msg = "Module A handoff payload is malformed or invalid."
+                    res = DocumentProcessingResult(
+                        document_id=document_id,
+                        tenant_id=effective_tenant,
+                        status="failed",
+                        error=_make_error("MALFORMED_HANDOFF", sanitized_msg),
+                        execution_time_seconds=time.perf_counter() - t_start,
+                    )
+                    _safe_diagnostic_sink(diagnostic_sink, "load", str(exc))
+                    yield _make_event(
+                        step_key="load",
+                        label=f"Load stored page {page_number} handoff",
+                        state="failed",
+                        detail=sanitized_msg,
+                        data={"error": sanitized_msg},
+                        result=res,
+                    )
+                    return
+            else:
+                logger.error("Unexpected handoff type: %r", type(raw_handoff))
+                sanitized_msg = "Module A handoff payload is malformed or invalid."
+                res = DocumentProcessingResult(
+                    document_id=document_id,
+                    tenant_id=effective_tenant,
+                    status="failed",
+                    error=_make_error("MALFORMED_HANDOFF", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "load", f"Invalid handoff type: {type(raw_handoff).__name__}")
+                yield _make_event(
+                    step_key="load",
+                    label=f"Load stored page {page_number} handoff",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            # Verify document ID binding
+            if payload_a.document_id != document_id:
+                logger.error(
+                    "Handoff document_id mismatch: expected %s, got %s",
+                    document_id,
+                    payload_a.document_id,
+                )
+                sanitized_msg = "Module A handoff payload is malformed or invalid."
+                res = DocumentProcessingResult(
+                    document_id=document_id,
+                    tenant_id=effective_tenant,
+                    status="failed",
+                    error=_make_error("MALFORMED_HANDOFF", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(
+                    diagnostic_sink, "load", "Handoff document ID mismatch for requested document"
+                )
+                yield _make_event(
+                    step_key="load",
+                    label=f"Load stored page {page_number} handoff",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            # Verify tenant ownership of the retrieved handoff
+            if payload_a.tenant_id != effective_tenant:
+                raise TenantMismatchError(
+                    "Tenant mismatch: stored document belongs to another tenant."
+                )
+
+            # Check for rejected or failed handoff status
+            if payload_a.status == "rejected":
+                raw_err = payload_a.error if isinstance(payload_a.error, dict) else {"code": "REJECTED", "message": "File rejected."}
+                err_dict = _make_error(str(raw_err.get("code", "REJECTED")), str(raw_err.get("message", "File rejected.")))
+                res = DocumentProcessingResult(
+                    document_id=payload_a.document_id,
+                    tenant_id=payload_a.tenant_id,
+                    status="rejected",
+                    payload_a=payload_a,
+                    error=err_dict,
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "load", f"Rejected: {err_dict}")
+                yield _make_event(
+                    step_key="load",
+                    label=f"Load stored page {page_number} handoff",
+                    state="failed",
+                    detail=str(err_dict.get("message", "File rejected")),
+                    data={"payload_a": payload_a.to_dict(), "error": err_dict},
+                    result=res,
+                )
+                return
+
+            if payload_a.status == "failed":
+                raw_err = payload_a.error
+                raw_msg = f"Module A failed: {raw_err}" if raw_err else "Module A ingestion failed."
+                logger.error("Module A handoff recorded failure: %s", raw_msg)
+                _safe_diagnostic_sink(diagnostic_sink, "load", raw_msg)
+
+                sanitized_msg = "Document ingestion and preprocessing failed."
+                sanitized_a_error = _make_error("INGESTION_ERROR", sanitized_msg)
+                sanitized_payload_a = replace(payload_a, error=sanitized_a_error)
+                res = DocumentProcessingResult(
+                    document_id=payload_a.document_id,
+                    tenant_id=payload_a.tenant_id,
+                    status="failed",
+                    payload_a=sanitized_payload_a,
+                    error=sanitized_a_error,
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                yield _make_event(
+                    step_key="load",
+                    label=f"Load stored page {page_number} handoff",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_a_error},
+                    result=res,
+                )
+                return
+
+            # Find requested page record
+            target_page_rec: Optional[PageHandoffRecord] = None
+            for p_rec in payload_a.pages:
+                if getattr(p_rec, "page_number", None) == page_number:
+                    target_page_rec = p_rec
+                    break
+
+            if target_page_rec is None:
+                sanitized_msg = f"Page {page_number} not found in document (document has {len(payload_a.pages)} page(s))."
+                res = DocumentProcessingResult(
+                    document_id=document_id,
+                    tenant_id=effective_tenant,
+                    status="failed",
+                    payload_a=payload_a,
+                    error=_make_error("PAGE_NOT_FOUND", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "load", sanitized_msg)
+                yield _make_event(
+                    step_key="load",
+                    label=f"Load stored page {page_number} handoff",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg, "page_number": page_number},
+                    result=res,
+                )
+                return
+
+            # Resolve page image paths from storage
+            try:
+                prep = exec_storage.resolve_uri_to_path(target_page_rec.preprocessed_storage_uri)
+                orig = exec_storage.resolve_uri_to_path(target_page_rec.original_storage_uri)
+                img_path = prep if prep.exists() else orig
+                if not img_path.exists():
+                    raise FileNotFoundError(f"Page image for page {page_number} not found in storage.")
+                page_items: List[Tuple[int, Path, Optional[Path]]] = [(page_number, img_path, orig)]
+            except TYPED_DOMAIN_EXCEPTIONS:
+                raise
+            except Exception as exc:
+                logger.error("Storage URI resolution error: %s", exc, exc_info=True)
+                sanitized_msg = "Failed to resolve storage URIs for document page."
+                res = DocumentProcessingResult(
+                    document_id=payload_a.document_id,
+                    tenant_id=payload_a.tenant_id,
+                    status="failed",
+                    payload_a=payload_a,
+                    error=_make_error("STORAGE_RESOLUTION_FAILED", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "load", str(exc))
+                yield _make_event(
+                    step_key="load",
+                    label=f"Load stored page {page_number} handoff",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            yield _make_event(
+                step_key="load",
+                label=f"Load stored page {page_number} handoff",
+                state="done",
+                detail=f"Resolved page {page_number} of {len(payload_a.pages)}",
+                data={"total_pages": len(payload_a.pages), "page_items": page_items},
+            )
+
+            # Step 2: Module B hand-off (isolate requested page)
+            try:
+                page_refs = {ref.page_number: ref for ref in exec_module_b.load_page_images(payload_a, page_numbers=[page_number])}
+                payload_b = exec_module_b.process_handoff(payload_a, page_numbers=[page_number])
+            except TYPED_DOMAIN_EXCEPTIONS:
+                raise
+            except Exception as exc:
+                logger.error("Module B processing error: %s", exc, exc_info=True)
+                sanitized_msg = "Module B processing failed."
+                res = DocumentProcessingResult(
+                    document_id=payload_a.document_id,
+                    tenant_id=payload_a.tenant_id,
+                    status="failed",
+                    payload_a=payload_a,
+                    error=_make_error("MODULE_B_ERROR", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "cls", str(exc))
+                yield _make_event(
+                    step_key="cls",
+                    label=f"Classify document for page {page_number}",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            if not isinstance(payload_b, ModuleBOutputPayload):
+                logger.error("Module B returned invalid payload: %r", type(payload_b))
+                sanitized_msg = "Module B processing failed: invalid payload produced."
+                res = DocumentProcessingResult(
+                    document_id=payload_a.document_id,
+                    tenant_id=payload_a.tenant_id,
+                    status="failed",
+                    payload_a=payload_a,
+                    error=_make_error("MODULE_B_ERROR", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "cls", f"Module B returned invalid payload: {type(payload_b).__name__}")
+                yield _make_event(
+                    step_key="cls",
+                    label=f"Classify document for page {page_number}",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            if payload_b.status == "failed":
+                raw_err = payload_b.error if isinstance(payload_b.error, dict) else {}
+                raw_msg = f"Module B failed: {raw_err.get('code', 'UNKNOWN')}: {raw_err.get('message', 'no detail')}"
+                logger.error("Module B processing failed: %s", raw_msg)
+                _safe_diagnostic_sink(diagnostic_sink, "cls", raw_msg)
+
+                sanitized_b_error = _make_error("MODULE_B_ERROR", "Document page classification and layout analysis failed.")
+                sanitized_payload_b = payload_b.model_copy(update={"error": sanitized_b_error})
+                res = DocumentProcessingResult(
+                    document_id=payload_b.document_id,
+                    tenant_id=payload_b.tenant_id,
+                    status="failed",
+                    payload_a=payload_a,
+                    payload_b=sanitized_payload_b,
+                    error=sanitized_b_error,
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                yield _make_event(
+                    step_key="cls",
+                    label=f"Classify document for page {page_number}",
+                    state="failed",
+                    detail=sanitized_b_error["message"],
+                    data={"error": sanitized_b_error},
+                    result=res,
+                )
+                return
+
+            module_b_type = payload_b.classification.document_type.value
+            rule_type = module_b_type if module_b_type != "UNKNOWN" else None
+            rule_confidence = payload_b.classification.classification_confidence if rule_type else None
+
+            # Step 3: Classify page
+            yield _make_event(
+                step_key="cls",
+                label=f"Classify document for page {page_number}",
+                state="running",
+                detail="detecting category, type and language",
+            )
+
+            try:
+                doc_info = self.resolve_page(
+                    page_items[0][1],
+                    payload_a.claimed_filename,
+                    rule_type,
+                    rule_confidence,
+                    choices,
+                    page_number,
+                )
+            except TYPED_DOMAIN_EXCEPTIONS:
+                raise
+            except Exception as exc:
+                logger.error("Classification/routing error: %s", exc, exc_info=True)
+                sanitized_msg = "Document classification and routing failed."
+                res = DocumentProcessingResult(
+                    document_id=payload_a.document_id,
+                    tenant_id=payload_a.tenant_id,
+                    status="failed",
+                    payload_a=payload_a,
+                    payload_b=payload_b,
+                    error=_make_error("ROUTING_FAILED", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "cls", str(exc))
+                yield _make_event(
+                    step_key="cls",
+                    label=f"Classify document for page {page_number}",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            cls_detail = (
+                f"{doc_info['category']} · {doc_info['document_type']} · {doc_info['language']} · {doc_info['category_source']}"
+                + (f" · filled by {doc_info['filled_by']}" if doc_info.get("filled_by") else "")
+                + (f" · {doc_info['router_model'].split('/')[-1]}" if doc_info.get("router_model") else "")
+            )
+
+            rotation = doc_info.get("rotation", 0)
+            read_items = page_items
+            if rotation:
+                try:
+                    read_items = [
+                        (page_number, workspace.rotate_page(page_items[0][1], rotation, page_no=page_number), page_items[0][2])
+                    ]
+                except TYPED_DOMAIN_EXCEPTIONS:
+                    raise
+                except Exception as exc:
+                    logger.error("Page rotation error: %s", exc, exc_info=True)
+                    sanitized_msg = "Document page rotation failed."
+                    res = DocumentProcessingResult(
+                        document_id=payload_a.document_id,
+                        tenant_id=payload_a.tenant_id,
+                        status="failed",
+                        payload_a=payload_a,
+                        payload_b=payload_b,
+                        error=_make_error("ROTATION_FAILED", sanitized_msg),
+                        execution_time_seconds=time.perf_counter() - t_start,
+                    )
+                    _safe_diagnostic_sink(diagnostic_sink, "cls", str(exc))
+                    yield _make_event(
+                        step_key="cls",
+                        label=f"Classify document for page {page_number}",
+                        state="failed",
+                        detail=sanitized_msg,
+                        data={"error": sanitized_msg},
+                        result=res,
+                    )
+                    return
+                cls_detail += f" · rotated {rotation}°"
+
+            yield _make_event(
+                step_key="cls",
+                label=f"Classify document for page {page_number}",
+                state="done",
+                detail=cls_detail,
+                data={"doc_info": doc_info, "rotation": rotation},
+            )
+
+            category = DocumentCategory(doc_info["category"])
+            schema_cls = SCHEMA_MAP.get(doc_info["schema_id"]) if doc_info["schema_id"] else None
+            doc_type = doc_info["schema_id"]
+
+            if doc_type and payload_b.classification.document_type.value != doc_type:
+                try:
+                    payload_b = exec_module_b.apply_reviewer_override(
+                        payload_b,
+                        ReviewerOverrideRequest(
+                            document_id=payload_b.document_id,
+                            tenant_id=payload_b.tenant_id,
+                            reviewer_id=effective_actor,
+                            new_document_type=MVPDocumentType(doc_type),
+                            override_reason="Document type explicitly selected in the extraction UI",
+                        ),
+                    )
+                except TYPED_DOMAIN_EXCEPTIONS:
+                    raise
+                except Exception as exc:
+                    logger.error("Reviewer override error: %s", exc, exc_info=True)
+                    sanitized_msg = "Module B reviewer override failed."
+                    res = DocumentProcessingResult(
+                        document_id=payload_a.document_id,
+                        tenant_id=payload_a.tenant_id,
+                        status="failed",
+                        payload_a=payload_a,
+                        payload_b=payload_b,
+                        error=_make_error("MODULE_B_ERROR", sanitized_msg),
+                        execution_time_seconds=time.perf_counter() - t_start,
+                    )
+                    _safe_diagnostic_sink(diagnostic_sink, "cls", str(exc))
+                    yield _make_event(
+                        step_key="cls",
+                        label=f"Classify document for page {page_number}",
+                        state="failed",
+                        detail=sanitized_msg,
+                        data={"error": sanitized_msg},
+                        result=res,
+                    )
+                    return
+
+            # Step 4: Per-page extraction with specialist model
+            pages_info: List[Dict[str, Any]] = []
+            page_results: List[RoutedPageResult] = []
+            routes: List[Dict[str, Any]] = []
+
+            for page_no, img_path, _orig in read_items:
+                info = dict(doc_info, page=page_no)
+                pages_info.append(info)
+
+                yield _make_event(
+                    step_key=f"ext{page_no}",
+                    label=f"Page {page_no}: extract fields",
+                    state="running",
+                    detail=f"routing to the {category.value} model",
+                    data={
+                        "page_no": page_no,
+                        "read_count": len(read_items),
+                        "category": category.value,
+                        "language": info["language"],
+                        "pages_info": list(pages_info),
+                    },
+                )
+
+                try:
+                    if not (img_path and img_path.exists()):
+                        raise FileNotFoundError(f"Page {page_no} image not found.")
+                    raw_dict, prov, route = self.routed_extractor.extract(
+                        str(img_path), category, info["language"], schema_cls, info["subtype"], engine=engine
+                    )
+                    route_dict = route if isinstance(route, dict) else {}
+                    model_used = route_dict.get("model_used") or "unknown_model"
+                    fallback_occurred = bool(route_dict.get("fallback_occurred", False))
+                except Exception as exc:
+                    logger.error("Page %d extraction error: %s", page_no, exc, exc_info=True)
+                    sanitized_page_err = f"{type(exc).__name__}: Extraction failed for page {page_no}."
+                    page_results.append(RoutedPageResult(
+                        page_number=page_no, rotation=rotation, error=sanitized_page_err
+                    ))
+                    info["model_used"] = "-"
+                    _safe_diagnostic_sink(diagnostic_sink, f"ext{page_no}", str(exc))
+                    yield _make_event(
+                        step_key=f"ext{page_no}",
+                        label=f"Page {page_no}: extract fields",
+                        state="failed",
+                        detail=f"Page {page_no} extraction failed",
+                        data={"error": sanitized_page_err, "page_no": page_no},
+                    )
+                    continue
+
+                info["model_used"] = model_used
+                info["fallback_occurred"] = fallback_occurred
+                routes.append({"page": page_no, **route_dict})
+                page_results.append(RoutedPageResult(
+                    page_number=page_no, raw=raw_dict, provenance=prov, route=route_dict, rotation=rotation
+                ))
+
+                yield _make_event(
+                    step_key=f"ext{page_no}",
+                    label=f"Page {page_no}: extract fields",
+                    state="done",
+                    detail=f"{model_used}{' (fallback)' if fallback_occurred else ''} · {len(raw_dict or {})} fields",
+                    data={"route": route_dict, "raw_fields": raw_dict},
+                )
+
+            # Step 5: Canonical processing and envelope assembly (Module C)
+            yield _make_event(
+                step_key="merge",
+                label="Validate and build JSON",
+                state="running",
+            )
+
+            try:
+                refs = [page_refs[n] for n, _, _ in page_items if n in page_refs]
+                env: CanonicalExtractionEnvelope = self.module_c.process_routed_pages(
+                    payload_b,
+                    page_results,
+                    refs,
+                    system_prompt=build_generic_prompt(category, doc_info["subtype"], doc_info["language"]),
+                    document_type=doc_type or "generic",
+                    schema_bound=schema_cls is not None,
+                    force_review=category == DocumentCategory.HANDWRITTEN,
+                    expected_page_numbers=[page_number],
+                    total_document_pages=len(payload_a.pages),
+                )
+
+                first = pages_info[0]
+                specialists = sorted({p.get("model_used") for p in pages_info if p.get("model_used") not in (None, "-")})
+                md = env.document_metadata
+                md.document_category = first["category"]
+                md.document_subtype = first["subtype"]
+                md.language = first["language"]
+                md.pages_processed = len(page_items)
+                md.pages = [
+                    {k: p.get(k) for k in ("page", "category", "document_type", "subtype", "language", "model_used")}
+                    for p in pages_info
+                ]
+                env.run.routing = routes
+                env.run.confidence_calibrated = False
+                env.run.model_versions.update({
+                    k: v for k, v in {
+                        "router": first.get("router_model") or first.get("method"),
+                        "specialist": ", ".join(specialists),
+                        "normalizer": "deterministic-v1",
+                    }.items() if v
+                })
+            except TYPED_DOMAIN_EXCEPTIONS:
+                raise
+            except Exception as exc:
+                logger.error("Module C canonical assembly error: %s", exc, exc_info=True)
+                sanitized_msg = "Canonical output assembly failed."
+                res = DocumentProcessingResult(
+                    document_id=payload_a.document_id,
+                    tenant_id=payload_a.tenant_id,
+                    status="failed",
+                    payload_a=payload_a,
+                    payload_b=payload_b,
+                    page_results=page_results,
+                    pages_info=pages_info,
+                    page_items=page_items,
+                    routes=routes,
+                    error=_make_error("CANONICAL_ASSEMBLY_FAILED", sanitized_msg),
+                    execution_time_seconds=time.perf_counter() - t_start,
+                )
+                _safe_diagnostic_sink(diagnostic_sink, "merge", str(exc))
+                yield _make_event(
+                    step_key="merge",
+                    label="Validate and build JSON",
+                    state="failed",
+                    detail=sanitized_msg,
+                    data={"error": sanitized_msg},
+                    result=res,
+                )
+                return
+
+            final_res = DocumentProcessingResult(
+                document_id=payload_a.document_id,
+                tenant_id=payload_a.tenant_id,
+                status=env.document_metadata.status,
+                envelope=env,
+                payload_a=payload_a,
+                payload_b=payload_b,
+                page_results=page_results,
+                pages_info=pages_info,
+                page_items=page_items,
+                routes=routes,
+                execution_time_seconds=time.perf_counter() - t_start,
+            )
+
+            yield _make_event(
+                step_key="merge",
+                label="Validate and build JSON",
+                state="done",
+                detail=f"{len(env.fields)} fields · {len(env.flags)} flag(s)",
+                data={"rotation": rotation, "total_pages": len(payload_a.pages), "page_number": page_number},
+                result=final_res,
+            )
+        finally:
+            workspace.cleanup()
+
+    def process_stored_page(
+        self,
+        document_id: str,
+        page_number: int,
+        tenant_id: Optional[str] = None,
+        actor_id: Optional[str] = None,
+        category_choice: Optional[str] = None,
+        doc_type_choice: Optional[str] = None,
+        subtype_choice: Optional[str] = None,
+        language_choice: Optional[str] = None,
+        engine_choice: Optional[str] = None,
+        progress_callback: Optional[Callable[[ProcessingProgressEvent], None]] = None,
+        diagnostic_sink: Optional[Callable[[str, str], None]] = None,
+        request_id: Optional[str] = None,
+    ) -> DocumentProcessingResult:
+        """
+        Synchronous entry point returning a complete DocumentProcessingResult for an individual stored page.
+        """
+        if not isinstance(document_id, str) or isinstance(document_id, bool) or not document_id.strip():
+            raise ValueError("Document ID is required and must be a non-empty string.")
+
+        last_result: Optional[DocumentProcessingResult] = None
+        for event in self.process_stored_page_stream(
+            document_id=document_id,
+            page_number=page_number,
+            tenant_id=tenant_id,
+            actor_id=actor_id,
+            category_choice=category_choice,
+            doc_type_choice=doc_type_choice,
+            subtype_choice=subtype_choice,
+            language_choice=language_choice,
+            engine_choice=engine_choice,
+            diagnostic_sink=diagnostic_sink,
+            request_id=request_id,
+        ):
+            if progress_callback is not None:
+                progress_callback(event)
+            if event.result is not None:
+                last_result = event.result
+
+        if last_result is None:
+            raise DocumentProcessingError(
+                message="Stored page processing finished without producing a result.",
+                details={"document_id": document_id, "page_number": page_number},
             )
         return last_result
