@@ -7,7 +7,19 @@ durable queue protocols.
 """
 
 from doc_extractor.api.app import create_app
-from doc_extractor.api.config import ApiSettings, load_api_settings
+from doc_extractor.api.composition import (
+    ApplicationContainer,
+    TenantComponentCache,
+    TenantComponents,
+    ThreadSafeRoutedExtractor,
+)
+from doc_extractor.api.config import (
+    ApiSettings,
+    bridge_to_api_settings,
+    bridge_to_engine_settings,
+    load_api_settings,
+)
+from doc_extractor.api.services.document_service import DocumentService
 from doc_extractor.api.token_core import (
     DEFAULT_KEY_LIFETIME_DAYS,
     DEFAULT_TOKEN_PREFIX,
@@ -26,7 +38,14 @@ from doc_extractor.api.token_core import (
 
 __all__ = [
     "create_app",
+    "ApplicationContainer",
+    "TenantComponents",
+    "TenantComponentCache",
+    "ThreadSafeRoutedExtractor",
+    "DocumentService",
     "ApiSettings",
+    "bridge_to_api_settings",
+    "bridge_to_engine_settings",
     "load_api_settings",
     "DEFAULT_KEY_LIFETIME_DAYS",
     "DEFAULT_TOKEN_PREFIX",

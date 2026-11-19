@@ -11,9 +11,11 @@ Adheres to:
 from typing import Any, Callable, Optional, Sequence
 from fastapi import Depends, Header, Request
 
+from doc_extractor.api.composition import ApplicationContainer, TenantComponents
 from doc_extractor.api.config import ApiSettings, get_api_settings
 from doc_extractor.api.exceptions import (
     AuthenticationRequiredError,
+    ContainerUnavailableError,
     ForbiddenError,
     PortNotConfiguredError,
 )
@@ -32,6 +34,8 @@ from doc_extractor.api.ports.repositories import (
     WebhookDeliveryRepository,
     WebhookSubscriptionRepository,
 )
+from doc_extractor.api.services.document_service import DocumentService
+from doc_extractor.processing_service import DocumentProcessingService
 
 
 def get_settings(request: Request) -> ApiSettings:
@@ -236,3 +240,53 @@ def get_api_key_service(
     from doc_extractor.api.services.api_key_service import ApiKeyService
 
     return ApiKeyService(repository=api_key_repo, audit_logger=audit_logger)
+
+
+# ============================================================================
+# Application Composition and Tenant Service Dependencies
+# ============================================================================
+
+def get_application_container(request: Request) -> ApplicationContainer:
+    """Dependency injection provider for ApplicationContainer."""
+    container = getattr(request.app.state, "container", None)
+    if container is None or getattr(container, "_is_shutdown", False):
+        raise ContainerUnavailableError("ApplicationContainer is unavailable or has been shut down.")
+    return container
+
+
+def get_tenant_components(
+    tenant_context: TenantContext = Depends(get_tenant_context),
+    container: ApplicationContainer = Depends(get_application_container),
+) -> TenantComponents:
+    """
+    Dependency injection provider for tenant-bound components.
+    Strictly isolated by the authenticated principal's tenant identity.
+    """
+    return container.get_tenant_components(tenant_context.tenant_id)
+
+
+def get_document_processing_service(
+    components: TenantComponents = Depends(get_tenant_components),
+) -> DocumentProcessingService:
+    """Dependency injection provider for tenant-bound DocumentProcessingService."""
+    return components.processing_service
+
+
+def get_document_service(
+    request: Request,
+    tenant_context: TenantContext = Depends(get_tenant_context),
+    container: ApplicationContainer = Depends(get_application_container),
+) -> DocumentService:
+    """
+    Dependency injection provider for tenant-bound DocumentService.
+    Coordinates between API/transports and domain processing service.
+    """
+    doc_repo = getattr(request.app.state, "document_metadata_repo", None) or container.document_metadata_repo
+    queue_prod = getattr(request.app.state, "queue_producer", None) or container.queue_producer
+    audit_log = getattr(request.app.state, "audit_logger", None) or container.audit_logger
+    return container.get_document_service(
+        tenant_id=tenant_context.tenant_id,
+        document_metadata_repo=doc_repo,
+        queue_producer=queue_prod,
+        audit_logger=audit_log,
+    )

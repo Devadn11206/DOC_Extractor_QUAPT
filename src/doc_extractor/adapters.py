@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 import json
 import logging
 import re
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 from doc_extractor.contracts_c import ExecutionMode, ExecutionProvenance
@@ -91,6 +92,8 @@ class OCRTextAdapter(ModelAdapter):
         self._ocr_proc = None
         self._txt = None
         self._tok = None
+        self._ocr_lock = threading.Lock()
+        self._txt_lock = threading.Lock()
 
     @property
     def model_label(self) -> str:
@@ -98,41 +101,51 @@ class OCRTextAdapter(ModelAdapter):
 
     # -- loading ---------------------------------------------------------
     def _load_ocr(self):
-        if self._ocr is None:
-            import torch
-            from transformers import AutoModelForImageTextToText, AutoProcessor
+        if self._ocr is not None and self._ocr_proc is not None:
+            return self._ocr, self._ocr_proc
+        with self._ocr_lock:
+            if self._ocr is None or self._ocr_proc is None:
+                import torch
+                from transformers import AutoModelForImageTextToText, AutoProcessor
 
-            self._ocr_proc = AutoProcessor.from_pretrained(
-                self.ocr_model, trust_remote_code=resolve_trust_remote_code(self.ocr_model)
-            )
-            self._ocr = AutoModelForImageTextToText.from_pretrained(
-                self.ocr_model, torch_dtype=gpu_dtype(), device_map=_side_device(),
-                trust_remote_code=resolve_trust_remote_code(self.ocr_model),
-                attn_implementation="sdpa",
-            )
-            self._ocr.eval()
+                proc = AutoProcessor.from_pretrained(
+                    self.ocr_model, trust_remote_code=resolve_trust_remote_code(self.ocr_model)
+                )
+                model = AutoModelForImageTextToText.from_pretrained(
+                    self.ocr_model, torch_dtype=gpu_dtype(), device_map=_side_device(),
+                    trust_remote_code=resolve_trust_remote_code(self.ocr_model),
+                    attn_implementation="sdpa",
+                )
+                model.eval()
+                self._ocr_proc = proc
+                self._ocr = model
         return self._ocr, self._ocr_proc
 
     def _load_text(self):
-        if self._txt is None:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        if self._txt is not None and self._tok is not None:
+            return self._txt, self._tok
+        with self._txt_lock:
+            if self._txt is None or self._tok is None:
+                import torch
+                from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-            self._tok = AutoTokenizer.from_pretrained(
-                self.text_model, trust_remote_code=resolve_trust_remote_code(self.text_model)
-            )
-            kwargs: Dict[str, Any] = {
-                "device_map": _side_device(),
-                "trust_remote_code": resolve_trust_remote_code(self.text_model),  # False: native class
-            }
-            if self.load_in_4bit:
-                kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True, bnb_4bit_compute_dtype=gpu_dtype()
+                tok = AutoTokenizer.from_pretrained(
+                    self.text_model, trust_remote_code=resolve_trust_remote_code(self.text_model)
                 )
-            else:
-                kwargs["torch_dtype"] = gpu_dtype()
-            self._txt = AutoModelForCausalLM.from_pretrained(self.text_model, **kwargs)
-            self._txt.eval()
+                kwargs: Dict[str, Any] = {
+                    "device_map": _side_device(),
+                    "trust_remote_code": resolve_trust_remote_code(self.text_model),  # False: native class
+                }
+                if self.load_in_4bit:
+                    kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True, bnb_4bit_compute_dtype=gpu_dtype()
+                    )
+                else:
+                    kwargs["torch_dtype"] = gpu_dtype()
+                model = AutoModelForCausalLM.from_pretrained(self.text_model, **kwargs)
+                model.eval()
+                self._tok = tok
+                self._txt = model
         return self._txt, self._tok
 
     # -- steps -----------------------------------------------------------

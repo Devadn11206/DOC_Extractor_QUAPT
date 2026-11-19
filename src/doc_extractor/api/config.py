@@ -141,6 +141,85 @@ class ApiSettings(Settings):
             self.openapi_url = None
         return self
 
+    def to_engine_settings(self) -> Settings:
+        """Create a validated engine Settings instance from this ApiSettings instance."""
+        return bridge_to_engine_settings(self)
+
+    @classmethod
+    def from_engine_settings(
+        cls,
+        engine_settings: Settings,
+        **api_overrides: Any,
+    ) -> "ApiSettings":
+        """Create an ApiSettings instance bridged from an engine Settings instance."""
+        return bridge_to_api_settings(engine_settings, **api_overrides)
+
+
+def bridge_to_engine_settings(api_settings: ApiSettings) -> Settings:
+    """
+    Explicit, validated bridge creating an engine Settings instance from ApiSettings.
+    Avoids duplicate or conflicting configuration values while validating runtime safety.
+    Fails closed if the configuration violates security boundaries (ARC-001/SEC-011).
+    """
+    if not isinstance(api_settings, ApiSettings):
+        raise ConfigurationError(
+            message="Cannot bridge to engine settings: input must be an ApiSettings instance.",
+            details={"received_type": type(api_settings).__name__},
+        )
+
+    # ARC-001 / SEC-011 guardrail: strictly private VPC zero-egress boundary
+    if api_settings.allow_external_egress:
+        raise ConfigurationError(
+            message="Cannot bridge to engine settings: external egress is enabled (ARC-001/SEC-011).",
+            details={"allow_external_egress": True},
+        )
+
+    # Production safety guardrail: debug disallowed in production / staging
+    if api_settings.app_env in ("production", "staging") and api_settings.debug:
+        raise ConfigurationError(
+            message=f"Cannot bridge to engine settings: debug mode disallowed in {api_settings.app_env}.",
+            details={"app_env": api_settings.app_env, "debug": True},
+        )
+
+    engine_fields = set(Settings.model_fields.keys())
+    data: Dict[str, Any] = {}
+    for field_name in engine_fields:
+        if hasattr(api_settings, field_name):
+            data[field_name] = getattr(api_settings, field_name)
+
+    try:
+        return Settings(**data)
+    except Exception as exc:
+        raise ConfigurationError(
+            message=f"Failed to bridge ApiSettings to engine Settings: {str(exc)}",
+            details={"error": str(exc)},
+        ) from exc
+
+
+def bridge_to_api_settings(
+    engine_settings: Settings,
+    **api_overrides: Any,
+) -> ApiSettings:
+    """
+    Explicit, validated bridge creating an ApiSettings instance from an engine Settings instance.
+    Preserves engine configuration while allowing API-specific overrides.
+    """
+    if not isinstance(engine_settings, Settings):
+        raise ConfigurationError(
+            message="Cannot bridge to API settings: input must be an engine Settings instance.",
+            details={"received_type": type(engine_settings).__name__},
+        )
+
+    data = engine_settings.model_dump()
+    data.update(api_overrides)
+    try:
+        return ApiSettings(**data)
+    except Exception as exc:
+        raise ConfigurationError(
+            message=f"Failed to bridge engine Settings to ApiSettings: {str(exc)}",
+            details={"error": str(exc)},
+        ) from exc
+
 
 def load_api_settings(env_overrides: Optional[Dict[str, Any]] = None) -> ApiSettings:
     """

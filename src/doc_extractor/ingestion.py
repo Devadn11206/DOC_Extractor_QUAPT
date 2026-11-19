@@ -18,6 +18,7 @@ Guarantees:
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -114,6 +115,7 @@ class IngestionService:
         idempotency_store: Optional[IdempotencyStore] = None,
         downstream_callback: Optional[Callable[[IngestionResult, BinaryIO], None]] = None,
         tenant_id: str = "default_tenant",
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self.settings = settings or Settings()
         self.tenant_id = tenant_id
@@ -122,11 +124,17 @@ class IngestionService:
         self.storage = storage or LocalDiskStorage(self.settings.storage_base_dir, tenant_id=self.tenant_id)
         self.idempotency_store = idempotency_store or LocalIdempotencyStore(self.settings.storage_base_dir)
         self.downstream_callback = downstream_callback
-        self.logger = setup_logging(
-            level=self.settings.log_level,
-            service_name=self.settings.service_name,
-            environment=self.settings.app_env,
-        )
+        if logger is not None:
+            self.logger = logger
+        elif logging.getLogger("doc_extractor").hasHandlers():
+            self.logger = logging.getLogger("doc_extractor")
+        else:
+            self.logger = setup_logging(
+                level=self.settings.log_level,
+                service_name=self.settings.service_name,
+                environment=self.settings.app_env,
+                clear_existing=False,
+            )
 
     def ingest_document(
         self,

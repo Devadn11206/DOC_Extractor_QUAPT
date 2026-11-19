@@ -70,22 +70,42 @@ def setup_logging(
     level: str = "INFO",
     service_name: str = "module-a-ingestion",
     environment: str = "development",
+    clear_existing: bool = True,
 ) -> logging.Logger:
     """
     Initializes structured logging without exposing document contents or PII.
+    Idempotent when clear_existing is False: updates level and formatter on existing
+    managed handler without creating duplicate handlers or removing external handlers.
     """
     logger = logging.getLogger("doc_extractor")
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    # Remove existing handlers to avoid duplicates
-    if logger.hasHandlers():
+    # Remove existing handlers to avoid duplicates only when explicitly requested
+    if clear_existing and logger.hasHandlers():
         logger.handlers.clear()
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
-        SafeJsonFormatter(service_name=service_name, environment=environment)
-    )
-    logger.addHandler(handler)
+    # Locate existing application-managed handler (if already registered)
+    managed_handler: Optional[logging.Handler] = None
+    for h in logger.handlers:
+        if getattr(h, "_is_doc_extractor_handler", False) or isinstance(
+            getattr(h, "formatter", None), SafeJsonFormatter
+        ):
+            managed_handler = h
+            break
+
+    if managed_handler is not None:
+        # Re-apply formatter configuration idempotently without adding another handler
+        managed_handler.setFormatter(
+            SafeJsonFormatter(service_name=service_name, environment=environment)
+        )
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+        handler._is_doc_extractor_handler = True
+        handler.setFormatter(
+            SafeJsonFormatter(service_name=service_name, environment=environment)
+        )
+        logger.addHandler(handler)
+
     logger.propagate = False
 
     return logger

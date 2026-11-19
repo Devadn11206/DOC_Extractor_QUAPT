@@ -76,3 +76,31 @@ def test_setup_logging_level():
     assert logger.level == logging.DEBUG
     assert len(logger.handlers) == 1
 
+
+@pytest.mark.unit
+def test_setup_logging_idempotent_no_duplicate_handlers():
+    """Verify setup_logging with clear_existing=False does not duplicate handlers and preserves external handlers."""
+    logger = setup_logging(level="INFO", service_name="svc-1", environment="test", clear_existing=True)
+    external_handler = logging.NullHandler()
+    logger.addHandler(external_handler)
+
+    try:
+        assert external_handler in logger.handlers
+        initial_count = len(logger.handlers)
+
+        # Call setup_logging repeatedly with clear_existing=False
+        setup_logging(level="DEBUG", service_name="svc-2", environment="prod", clear_existing=False)
+        setup_logging(level="WARNING", service_name="svc-3", environment="staging", clear_existing=False)
+
+        # Count of handlers should remain identical
+        assert len(logger.handlers) == initial_count
+        assert external_handler in logger.handlers
+
+        # Exactly one handler with SafeJsonFormatter
+        json_handlers = [h for h in logger.handlers if isinstance(getattr(h, "formatter", None), SafeJsonFormatter)]
+        assert len(json_handlers) == 1
+        assert json_handlers[0].formatter.service_name == "svc-3"
+        assert json_handlers[0].formatter.environment == "staging"
+        assert logger.level == logging.WARNING
+    finally:
+        logger.removeHandler(external_handler)

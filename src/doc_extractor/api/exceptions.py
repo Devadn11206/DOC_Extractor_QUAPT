@@ -309,6 +309,29 @@ class PortNotConfiguredError(ApiHttpError):
         self.port = port
 
 
+class ContainerUnavailableError(PortNotConfiguredError):
+    """
+    ApplicationContainer is unconfigured or has been shut down (HTTP 503).
+    """
+
+    status_code = 503
+
+    def __init__(
+        self,
+        message: str = "The ApplicationContainer is unavailable or has been shut down.",
+        request_id: Optional[str] = None,
+    ) -> None:
+        ApiHttpError.__init__(
+            self,
+            message=message,
+            code="SERVICE_UNAVAILABLE",
+            status_code=503,
+            request_id=request_id,
+            details={"port": "ApplicationContainer"},
+        )
+        self.port = "ApplicationContainer"
+
+
 class AuditUnavailableError(ApiHttpError):
     """
     A MANDATORY audit record could not be written (SEC-008). The operation is never reported as a clean success: the

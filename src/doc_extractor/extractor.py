@@ -577,6 +577,7 @@ class SchemaGuidedExtractor:
         self._processor = None
         self._image_config = None
         self._load_error: Optional[Exception] = None
+        self._load_lock = threading.Lock()
         # Versions, loader class, dtype, quantization and image settings of the loaded model
         # (None until a real model is loaded); recorded in the run provenance.
         self.runtime_info: Optional[Dict[str, Any]] = None
@@ -1245,31 +1246,38 @@ class SchemaGuidedExtractor:
         actionable ``VLMRuntimeError`` for every incompatibility (no silent fallback to a generic
         text-only loader, another dtype or non-quantized loading). A model/processor injected into
         ``self._model`` / ``self._processor`` (unit tests) is used as is.
+        Uses double-checked locking to protect against duplicate concurrent initialization (NFR-006).
         """
-        if self._model is None or self._processor is None:
-            if self._load_error is not None:
-                raise self._load_error
-            try:
-                loaded = vlm_runtime.load_qwen_vl(vlm_runtime.VLMLoadConfig(
-                    model_id=self.model_name,
-                    load_in_4bit=getattr(self, "load_in_4bit", True),
-                    precision=self.precision,
-                    allow_cpu=self.allow_cpu,
-                    device_map=self.device,
-                    trust_remote_code=self.trust_remote_code,
-                    min_pixels=self.min_pixels,
-                    max_pixels=self.max_pixels,
-                    min_vram_gib=self.min_vram_gib,
-                ))
-            except vlm_runtime.VLMRuntimeError as exc:
-                # Deterministic compatibility problems are remembered so a document does not retry an
-                # expensive load once per page; an out-of-memory failure may be retried after freeing memory.
-                if exc.code != "VLM_INSUFFICIENT_VRAM":
-                    self._load_error = exc
-                raise
-            self._model, self._processor = loaded.model, loaded.processor
-            self._image_config = loaded.image_config
-            self.runtime_info = loaded.runtime_info
+        if self._model is not None and self._processor is not None:
+            return self._model, self._processor
+        with self._load_lock:
+            if self._model is None or self._processor is None:
+                if self._load_error is not None:
+                    raise self._load_error
+                try:
+                    loaded = vlm_runtime.load_qwen_vl(vlm_runtime.VLMLoadConfig(
+                        model_id=self.model_name,
+                        load_in_4bit=getattr(self, "load_in_4bit", True),
+                        precision=self.precision,
+                        allow_cpu=self.allow_cpu,
+                        device_map=self.device,
+                        trust_remote_code=self.trust_remote_code,
+                        min_pixels=self.min_pixels,
+                        max_pixels=self.max_pixels,
+                        min_vram_gib=self.min_vram_gib,
+                    ))
+                except vlm_runtime.VLMRuntimeError as exc:
+                    # Deterministic compatibility problems are remembered so a document does not retry an
+                    # expensive load once per page; an out-of-memory failure may be retried after freeing memory.
+                    if exc.code != "VLM_INSUFFICIENT_VRAM":
+                        self._load_error = exc
+                    raise
+                # Publish supporting processor, image configuration, and runtime info first
+                self._processor = loaded.processor
+                self._image_config = loaded.image_config
+                self.runtime_info = loaded.runtime_info
+                # Publish model sentinel reference last
+                self._model = loaded.model
         return self._model, self._processor
 
     def _build_system_prompt(self, schema_cls: Type[BaseModel]) -> str:
