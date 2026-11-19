@@ -28,6 +28,7 @@ from doc_extractor.api.ports.repositories import (
     WebhookDeliveryRepository,
     WebhookSubscriptionRepository,
 )
+from doc_extractor.api.services.document_read_service import DocumentReadService
 from doc_extractor.api.services.document_service import DocumentService
 from doc_extractor.config import Settings
 from doc_extractor.exceptions import InvalidTenantIdentifierError
@@ -341,6 +342,25 @@ class ApplicationContainer:
             queue_producer=queue_producer or self.queue_producer,
             audit_logger=audit_logger or self.audit_logger,
         )
+
+    def get_document_read_service(self, tenant_id: str) -> DocumentReadService:
+        """
+        Lazily creates a lightweight tenant-bound DocumentReadService.
+        Does NOT instantiate Module A, Module B, or specialist extraction pipelines.
+        """
+        if self._is_shutdown:
+            raise ContainerUnavailableError("ApplicationContainer has been shut down.")
+
+        if not isinstance(tenant_id, str):
+            raise InvalidTenantIdentifierError("Tenant ID must be a string.")
+        if not tenant_id:
+            raise InvalidTenantIdentifierError("Tenant ID cannot be empty.")
+        if not tenant_id.strip():
+            raise InvalidTenantIdentifierError("Tenant ID cannot be whitespace.")
+        require_path_safe_tenant_id(tenant_id)
+
+        storage = LocalDiskStorage(self.engine_settings.storage_base_dir, tenant_id=tenant_id)
+        return DocumentReadService(storage=storage, tenant_id=tenant_id)
 
     def shutdown(self) -> None:
         """

@@ -306,7 +306,8 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
   - Should a query parameter (e.g. `?variant=original|preprocessed`) allow selecting the artifact?
 - **PRD reference.** API-003, US-DOCX-007, PRD section 5.2.
 - **Owner.** PRD owner, API lead (Team Member 2). **Blocks.** S5. **Status.** Open. **Resolution.** none.
-- **In the code.** `src/doc_extractor/storage.py`, `src/doc_extractor/processing_service.py`.
+  - *Provisional implementation assumption (M2D Slice 1):* Default to returning original rendered 200 DPI PNG bytes as `image/png` with `Content-Disposition: inline; filename="page-{page_number}.png"`, `Cache-Control: private, no-store`, and `X-Content-Type-Options: nosniff`.
+- **In the code.** `src/doc_extractor/storage.py`, `src/doc_extractor/processing_service.py`, `src/doc_extractor/api/services/document_read_service.py`, `src/doc_extractor/api/routers/documents.py`.
 
 #### M2D-D04 Authorization scopes for page-image retrieval
 
@@ -317,7 +318,8 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
   - How does SEC-006 tenant isolation interact with page-image authorization (cross-tenant access must answer 404, but does an unauthorized tenant user answer 403 or 404)?
 - **PRD reference.** API-003, SEC-003, SEC-006, PRD section 15.5.
 - **Owner.** PRD owner (security), Team Member 3. **Blocks.** S5. **Status.** Open. **Resolution.** none.
-- **In the code.** `src/doc_extractor/api/ports/authentication.py`.
+  - *Provisional implementation assumption (M2D Slice 1):* Enforce provisional scope `SCOPE_DOCUMENTS_READ = "documents:read"`. Cross-tenant attempts answer concealed 404 (`DOCUMENT_NOT_FOUND`), whereas principals authenticated within the tenant who lack the scope receive 403 (`FORBIDDEN_SCOPE`).
+- **In the code.** `src/doc_extractor/api/ports/authentication.py`, `src/doc_extractor/api/contracts/documents.py`, `src/doc_extractor/api/routers/documents.py`.
 
 #### M2D-D05 Missing or not-yet-rendered page error code
 
@@ -329,4 +331,14 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
   - Error code naming alignment with PRD section 19 and M5-D01.
 - **PRD reference.** API-003, API-010, SEC-006, PRD section 19, M5-D01.
 - **Owner.** PRD owner. **Blocks.** S5. **Status.** Open. **Resolution.** none.
-- **In the code.** `src/doc_extractor/api/exceptions.py`.
+  - *Provisional implementation assumption (M2D Slice 1):* Missing, out-of-range (`n > page_count`), or not-yet-rendered pages return concealed 404 (`DOCUMENT_NOT_FOUND`, "Document not found.") with empty details to prevent enumeration. Path parameter validation (`n < 1` or non-integer) returns 422 (`VALIDATION_ERROR`).
+- **In the code.** `src/doc_extractor/api/exceptions.py`, `src/doc_extractor/api/services/document_read_service.py`.
+
+### M2D Remediation Follow-ups
+
+- **F5: Bounded or streaming page-image reads. Status: open follow-up (not implemented).** Bound or stream page-image reads to avoid loading arbitrarily large files into memory. `DocumentReadService.get_page_image` still reads the whole file into memory before validating it.
+- **F6: Sanitized logging with fixed reason codes. Status: resolved for `DocumentReadService` only; the wider audit remains open.**
+  - *Done (M2D Slice 1 remediation).* Every `logger.*` call in `src/doc_extractor/api/services/document_read_service.py` was inspected. Each now uses a constant message with a fixed reason code, an exception class name or an integer `errno`; no raw exception text, handoff URI, tenant identifier, document identifier or handoff key name is interpolated. `StorageError` details raised by this module carry a fixed `reason` code instead of the raw URI or foreign tenant value. Regression tests in `tests/test_api_documents_page_image.py` cover log forging through a newline in a URI or a handoff key, foreign tenant and document identifiers, and decode-error text, and a static AST test fails if a logger call takes an untrusted name.
+  - *Inspected on the same request path, no change needed.* `api/exceptions.py`: `document_extractor_error_handler` logs only the error code, the fixed `reason` and the request id, and `unhandled_exception_handler` logs nothing.
+  - *Not audited for untrusted content, still open.* Logging in these other modules is outside this follow-up: `src/doc_extractor/api/providers/api_key_auth.py` (authentication provider, on the request path), `src/doc_extractor/api/app.py`, `src/doc_extractor/api/ports/audit.py`, and `src/doc_extractor/api/composition.py` (tenant identifiers and exception text in cleanup messages), plus any server-level logging of unhandled exceptions. The review found no logger calls in `src/doc_extractor/storage.py`, `src/doc_extractor/tenancy.py` or `src/doc_extractor/handoff.py`. F6 must not be treated as closed for the API as a whole until the modules listed above are reviewed.
+- **F7: Strengthen handoff structural integrity validation. Status: open follow-up (not implemented).** Validate duplicate page numbers, page sequence continuity and `page_count` consistency in the handoff. `get_page_image` still takes the first page record whose number matches and does not compare `page_count` with `pages`.

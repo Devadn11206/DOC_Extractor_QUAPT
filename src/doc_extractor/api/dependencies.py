@@ -34,6 +34,7 @@ from doc_extractor.api.ports.repositories import (
     WebhookDeliveryRepository,
     WebhookSubscriptionRepository,
 )
+from doc_extractor.api.services.document_read_service import DocumentReadService
 from doc_extractor.api.services.document_service import DocumentService
 from doc_extractor.processing_service import DocumentProcessingService
 
@@ -290,3 +291,16 @@ def get_document_service(
         queue_producer=queue_prod,
         audit_logger=audit_log,
     )
+
+
+def get_document_read_service(
+    tenant_context: TenantContext = Depends(get_tenant_context),
+    container: ApplicationContainer = Depends(get_application_container),
+) -> DocumentReadService:
+    """
+    Dependency injection provider for tenant-bound DocumentReadService.
+    Strictly isolated by the authenticated principal's tenant identity.
+    Lightweight: does not instantiate heavy extraction or OCR pipelines.
+    Tenant context originates exclusively from authenticated principal (SEC-005).
+    """
+    return container.get_document_read_service(tenant_context.tenant_id)

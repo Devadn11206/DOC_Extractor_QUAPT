@@ -21,6 +21,7 @@ from doc_extractor.api.composition import ApplicationContainer
 from doc_extractor.api.config import ApiSettings, load_api_settings
 from doc_extractor.api.exceptions import register_exception_handlers
 from doc_extractor.api.middleware import RequestIdMiddleware
+from doc_extractor.api.routers.documents import router as documents_router
 from doc_extractor.api.routers.health import router as health_router
 from doc_extractor.logging import setup_logging
 
@@ -165,6 +166,12 @@ def create_app(
     app.include_router(health_router, prefix="", tags=["Health & Status"])
     if resolved_settings.api_prefix:
         app.include_router(health_router, prefix=resolved_settings.api_prefix, tags=["Health & Status"])
+
+    # Register document read router under api_prefix (API-003)
+    if resolved_settings.api_prefix:
+        app.include_router(documents_router, prefix=resolved_settings.api_prefix, tags=["Documents"])
+    else:
+        app.include_router(documents_router, prefix="", tags=["Documents"])
 
     # The API-key management router (API-019) is intentionally not mounted: it is held back until
     # decision M5-D08 is approved. Document, review-task and webhook routers are later stages.

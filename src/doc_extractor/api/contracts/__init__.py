@@ -2,6 +2,7 @@
 API Contracts package.
 """
 
+from doc_extractor.api.contracts.documents import SCOPE_DOCUMENTS_READ, validate_document_id
 from doc_extractor.api.contracts.errors import ErrorDetail, ErrorEnvelope
 from doc_extractor.api.contracts.records import (
     ApiKeyCreateRequest,
@@ -22,6 +23,8 @@ from doc_extractor.api.contracts.records import (
 __all__ = [
     "ErrorDetail",
     "ErrorEnvelope",
+    "SCOPE_DOCUMENTS_READ",
+    "validate_document_id",
     "ApiKeyCreateRequest",
     "ApiKeyCreationResult",
     "ApiKeyRecord",
