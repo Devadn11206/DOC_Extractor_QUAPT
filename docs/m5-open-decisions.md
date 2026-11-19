@@ -110,7 +110,9 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 ### M5-D06 Pagination shape
 
 - **Description.** PRD API-015 specifies `content[]`, `stats` and `paging` (page/size, default 10); the foundation's
-  repository ports use `limit`/`offset` and return a bare list.
+  repository ports use `limit`/`offset` and return a bare list. For Milestone 2D, this blocks the API-015 pagination and
+  filtering contract (`GET /api/v1/documents`), resolving alignment between repository port `list_by_tenant(limit, offset)`
+  and the PRD API-015 envelope (`content[]`, `stats`, and `paging` with 10 per page default).
 - **PRD reference.** API-015.
 - **Options.** A) the PRD shape everywhere. **Plan's recommendation.** A (cheapest while no list endpoint exists).
 - **Owner.** PRD owner, backend lead. **Blocks.** S2, S5. **Status.** Open. **Resolution.** none.
@@ -228,6 +230,10 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
   tenant-bound `StorageBackend.save_document_record` and read by the API through the asynchronous, tenant-per-call
   `DocumentMetadataRepository` port. Two abstractions for one entity need one source of truth before any adapter exists.
   Also open: the repository `create(tenant_id, record)` states in a docstring only that `record.tenant_id` must equal `tenant_id`.
+  For Milestone 2D, this blocks the authoritative persistence interface and StorageBackend read ownership: whether the API
+  reads and updates document records directly via `StorageBackend` or exclusively through `DocumentMetadataRepository` (with
+  `StorageBackend` restricted to page images and artifacts). Also open for M2D: which component owns persisting terminal status
+  (`auto_approved`, `needs_review`, `failed`) and the `CanonicalExtractionEnvelope` upon processing completion.
 - **PRD reference.** PRD section 20; OQ-DOCX-05 (store choice).
 - **Owner.** Team Member 2 and Team Member 3. **Blocks.** S4, S5. **Status.** Open. **Resolution.** none.
 - **In the code.** `doc_extractor/storage.py`, `doc_extractor/api/ports/repositories.py`; `docs/m5-api-ownership.md`.
@@ -246,3 +252,81 @@ These are implemented because the work required a behaviour, not because an owne
 | M4 `SchemaRollbackError` and `BenchmarkVerificationError` answer 422, other M4 conflicts 409 | `api/exceptions.py` (`_M4_STATUS_BY_CLASS_NAME`) | Implementer's choice; codes unchanged (see M5-D01) |
 | An unwritable audit trail answers `503 AUDIT_UNAVAILABLE`; revocation stays applied | `api/services/api_key_service.py` | Implementer's choice (see M5-D15) |
 | Cross-tenant access answers 404 and matches M4's wording marker `Cross-tenant access violation` | `api/exceptions.py` | PRD section 19 (404 `DOCUMENT_NOT_FOUND`); the marker is a stop-gap until M4 raises a typed error |
+
+---
+
+## Milestone 2D unresolved decisions (M2D)
+
+The following decisions were identified during the Milestone 2D architecture audit for REST endpoints and page image retrieval.
+Per repository convention, existing decisions must not be assigned duplicate IDs; new decisions use the `M2D-Dnn` prefix.
+
+| ID | Decision | Owner | Blocks | Status |
+| --- | --- | --- | --- | --- |
+| Existing: M5-D18 | Authoritative persistence interface and StorageBackend read ownership | Team Member 2 and 3 | S4, S5 | Open |
+| Existing: M5-D06 | API-015 pagination and filtering contract | PRD owner, backend lead | S2, S5 | Open |
+| M2D-D01 | Terminal status and canonical envelope persistence owner | Team Member 2 and 3 | S4, S5 | Open |
+| M2D-D02 | SEC-007 API masking policy | PRD owner (security) | S5, S7, S9 | Open |
+| M2D-D03 | Default page-image representation | PRD owner, API lead | S5 | Open |
+| M2D-D04 | Authorization scopes for page-image retrieval | PRD owner, Team Member 3 | S5 | Open |
+| M2D-D05 | Missing or not-yet-rendered page error code | PRD owner | S5 | Open |
+
+### M2D Decision Details
+
+#### M2D-D01 Terminal status and canonical envelope persistence owner
+
+- **Description.** When document extraction completes (either auto-approved or routed to needs-review), the processing
+  pipeline produces a final `DocumentStatus` and a `CanonicalExtractionEnvelope`. Who is authoritative for persisting this
+  envelope and updating terminal status:
+  - Option A: `StorageBackend` writes the envelope into tenant storage (e.g. `extracted/envelope.json`) and updates local record status.
+  - Option B: The API layer / worker writes through a durable document/run repository owned by Team Member 3.
+  - Option C: A two-tier model where the raw envelope JSON is written to `StorageBackend` while structured status and metadata live in the relational repository.
+- **PRD reference.** PRD section 6.3 (Canonical Extraction Envelope), PRD section 20 (Data Model); ARC-003.
+- **Owner.** Team Member 2 and Team Member 3. **Blocks.** S4, S5. **Status.** Open. **Resolution.** none.
+- **In the code.** `src/doc_extractor/processing_service.py`, `doc_extractor/contracts_c.py`.
+
+#### M2D-D02 SEC-007 API masking policy
+
+- **Description.** PRD SEC-007 and SCH-014 require that fields marked PII in schema definitions (`pii_class`) SHALL be masked
+  by default in API responses, UI and exports, with unmasking restricted to callers with explicit role permissions. Open questions for M2D:
+  - What masking transform applies at the API boundary (e.g., full redaction `***`, partial masking `****1234`, or null value with `masked=True` flag)?
+  - How is visual evidence text (`evidence.text`) masked when it contains PII?
+  - What exact role/permission string grants unmasking (`documents:unmask`, `pii:reveal`, or admin role)?
+  - Who owns the masking transform component (API presentation layer DTO mapping vs. core extraction envelope assembly)?
+- **PRD reference.** SEC-007, SCH-014, API-017, API-021, PRD section 10.1.
+- **Owner.** PRD owner (security), Team Member 2. **Blocks.** S5, S7, S9. **Status.** Open. **Resolution.** none.
+- **In the code.** `src/schema_lifecycle/metamodel.py`, `src/doc_extractor/api/contracts/records.py`.
+
+#### M2D-D03 Default page-image representation
+
+- **Description.** PRD API-003 and US-DOCX-007 specify `GET /api/v1/documents/{id}/pages/{n}` returning the "page image". The
+  storage backend maintains both `original` (raw rendered PDF page) and `preprocessed` (contrast-enhanced, deskewed) image files.
+  Open questions for M2D:
+  - Which image artifact should be returned by default: preprocessed image (what the model read) or original image (clean visual representation for human reviewer)?
+  - What response format / Content-Type should be returned: raw binary image bytes (`image/png` / `image/jpeg`), base64 JSON payload, or a redirect (302) to a presigned object storage URL?
+  - Should a query parameter (e.g. `?variant=original|preprocessed`) allow selecting the artifact?
+- **PRD reference.** API-003, US-DOCX-007, PRD section 5.2.
+- **Owner.** PRD owner, API lead (Team Member 2). **Blocks.** S5. **Status.** Open. **Resolution.** none.
+- **In the code.** `src/doc_extractor/storage.py`, `src/doc_extractor/processing_service.py`.
+
+#### M2D-D04 Authorization scopes for page-image retrieval
+
+- **Description.** PRD API-003 states that page image retrieval is "subject to permission". PRD section 15.5 defines distinct
+  roles (analyst, reviewer, auditor, admin). Open questions for M2D:
+  - What specific scope governs page image access (e.g., standard `documents:read`, dedicated `pages:read`, or reviewer role requirement)?
+  - Can a non-reviewer client role retrieve page images, or is image access restricted because page images may contain unmasked raw PII/PHI?
+  - How does SEC-006 tenant isolation interact with page-image authorization (cross-tenant access must answer 404, but does an unauthorized tenant user answer 403 or 404)?
+- **PRD reference.** API-003, SEC-003, SEC-006, PRD section 15.5.
+- **Owner.** PRD owner (security), Team Member 3. **Blocks.** S5. **Status.** Open. **Resolution.** none.
+- **In the code.** `src/doc_extractor/api/ports/authentication.py`.
+
+#### M2D-D05 Missing or not-yet-rendered page error code
+
+- **Description.** When `GET /api/v1/documents/{id}/pages/{n}` is requested, the page number `n` might be out of range
+  (`n > page_count` or `n < 1`), or the document may still be undergoing asynchronous Module A ingestion/rendering so page `n`
+  is not yet available on disk. Open questions for M2D:
+  - For out-of-range pages: Should the API return `404 DOCUMENT_NOT_FOUND` (concealing document structure per SEC-006), `404 PAGE_NOT_FOUND`, or `422/400 INVALID_PAGE_NUMBER`?
+  - For pages still rendering: Should the API return `409 CONFLICT` (or `409 PAGE_PROCESSING`), `503 SERVICE_UNAVAILABLE`, or `404`?
+  - Error code naming alignment with PRD section 19 and M5-D01.
+- **PRD reference.** API-003, API-010, SEC-006, PRD section 19, M5-D01.
+- **Owner.** PRD owner. **Blocks.** S5. **Status.** Open. **Resolution.** none.
+- **In the code.** `src/doc_extractor/api/exceptions.py`.

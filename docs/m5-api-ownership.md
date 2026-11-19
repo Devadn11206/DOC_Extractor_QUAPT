@@ -59,6 +59,34 @@ A job message never embeds a hand-off, page image or extracted content. Do not a
 - An object-store backend must keep the same guarantees: a deterministic key per exact identity, identity verified on
   access, no aliasing.
 
+## Public boundary and serialization contract (API and SSE)
+
+A mandatory boundary rule governs all HTTP JSON endpoints and Server-Sent Events (SSE) progress streams:
+**never serialize internal processing models directly**. Internal domain entities, pipeline hand-off payloads,
+and processing results contain host filesystem paths, internal storage URIs, raw exceptions, and tenant identifiers
+that violate security isolation (SEC-006, SEC-012, API-011) if exposed.
+
+All public API responses and SSE events require **explicit allow-listed public DTOs** (such as `DocumentResource`
+and sanitized event contracts). The following internal fields and structures **must never** be serialized directly
+into public JSON or SSE responses:
+
+- **`DocumentProcessingResult.page_items`**, including absolute filesystem paths (`prep_path`, `orig_path`).
+- **`ProcessingProgressEvent.data["page_items"]`** and un-sanitized event payload dictionaries.
+- **`payload_b.pages[].page_image_path`** and internal Module B layout working paths.
+- **`payload_a` storage URIs** (`original_storage_uri`, `preprocessed_storage_uri`, `metadata_storage_uri`).
+- **Internal tenant identifiers** (`tenant_id`), preserving SEC-006 tenant concealment.
+- **Raw diagnostic messages, exception traces and unfiltered envelope flag messages**, which may reveal server paths
+  or component wiring. Original diagnostics route exclusively to server logs and the trusted in-process `diagnostic_sink`.
+
+### Data protection and masking (SEC-007)
+
+Extracted field values and evidence text (`field.value`, `evidence.text`) returned in canonical envelopes,
+document query endpoints (`GET /api/v1/documents/{id}`), SSE extraction events, or document export (`API-017`)
+require the approved **SEC-007 masking policy**:
+- Schema fields classified with a `pii_class` (PRD §6.1, §6.2, §10.1, SCH-014) must be masked by default in API output.
+- Unmasking is restricted to authorized caller roles with explicit permission and must produce an immutable audit event (SEC-008).
+- Public DTO mappers must apply masking rules before serializing extracted values and visual evidence to callers.
+
 ## Audit semantics
 
 Two different things must not be confused: **best-effort audit logging** and **mandatory durable auditing**.
