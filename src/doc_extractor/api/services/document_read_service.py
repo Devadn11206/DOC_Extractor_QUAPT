@@ -31,7 +31,7 @@ from typing import Iterable, Optional, Tuple
 
 from PIL import Image
 
-from doc_extractor.api.contracts.documents import validate_document_id
+from doc_extractor.api.contracts.documents import document_record_from_stored, validate_document_id
 from doc_extractor.api.exceptions import (
     ApiValidationError,
     TenantResourceNotFoundError,
@@ -43,6 +43,7 @@ from doc_extractor.exceptions import (
     TenantStorageIsolationError,
 )
 from doc_extractor.handoff import ModuleAHandoffPayload
+from doc_extractor.models import DocumentRecord
 from doc_extractor.storage import LocalDiskStorage
 
 logger = logging.getLogger("doc_extractor.api.read_service")
@@ -53,6 +54,10 @@ PNG_MAGIC_BYTES = b"\x89PNG\r\n\x1a\n"
 # Smallest structurally valid PNG: signature + IHDR (12 + 13) + IEND (12)
 _PNG_MIN_SIZE = len(PNG_MAGIC_BYTES) + 25 + 12
 _PNG_MAX_CHUNK_LENGTH = 0x7FFFFFFF
+
+# Files Module A writes inside a document directory and that this service reads.
+_HANDOFF_FILE = "module_a_handoff.json"
+_RECORD_FILE = "document_record.json"
 
 # Open flags the descriptor-relative walk cannot do without. There is deliberately no silent ``getattr(..., 0)``
 # fallback: a platform that lacks one of them refuses to serve files at all.
@@ -123,6 +128,31 @@ def _require_regular_file(fd: int) -> None:
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         logger.warning("Storage file refused (reason=not_a_regular_file)")
         raise TenantStorageIsolationError("not_a_regular_file")
+
+
+def _read_regular_text_file(name: str, dir_fd: int, symlink_reason: str, unreadable_reason: str) -> str:
+    """
+    Read the UTF-8 text of regular file ``name`` relative to the verified directory descriptor ``dir_fd``.
+
+    The file is opened ``O_NOFOLLOW | O_NONBLOCK``, the OPENED descriptor must be a regular file (a FIFO, socket,
+    device or directory is refused), and the bytes are read from that descriptor only. Ownership of the descriptor moves
+    to the file object (``os.fdopen``) and the raw variable is cleared at once, so it can never be closed twice. Read or
+    decode failures become a typed ``StorageError`` carrying the fixed ``unreadable_reason``; nothing stored is logged.
+    """
+    fd: Optional[int] = _open_leaf_nofollow(name, dir_fd, symlink_reason)
+    try:
+        _require_regular_file(fd)
+        text_file = os.fdopen(fd, "r", encoding="utf-8")
+    except BaseException:
+        _close_owned_descriptors((fd,), strict=False)
+        raise
+    fd = None                          # the file object is now the sole owner of this descriptor
+    try:
+        with text_file as f:
+            return f.read()
+    except (OSError, ValueError) as exc:        # ValueError covers UnicodeDecodeError
+        logger.error("Stored file read failed (reason=%s, error_type=%s)", unreadable_reason, type(exc).__name__)
+        raise StorageError("Failed to read stored file.", details={"reason": unreadable_reason}) from exc
 
 
 def _close_owned_descriptors(fds: Iterable[Optional[int]], *, strict: bool) -> None:
@@ -211,6 +241,85 @@ class DocumentReadService:
         self.storage = storage
         self.tenant_id = tenant_id
 
+    def _open_document_directory(self, safe_doc_id: str) -> Tuple[int, int, int]:
+        """
+        Shared descriptor-relative walk for every read: the configured storage root, then the principal's tenant
+        directory, then the document directory, each opened relative to its parent's descriptor with ``O_NOFOLLOW``
+        (and ``O_DIRECTORY``). Nothing is ever created: a tenant or document that does not exist is the concealed 404.
+
+        Returns ``(base_dir_fd, tenant_fd, doc_fd)``; the caller owns all three and must close them. If the walk fails
+        part-way, whatever it had opened is closed here before the error propagates, so nothing leaks.
+        """
+        base_dir_fd: Optional[int] = None
+        tenant_fd: Optional[int] = None
+        doc_fd: Optional[int] = None
+        try:
+            try:
+                base_dir_fd = os.open(str(self.storage.base_dir), os.O_RDONLY | os.O_DIRECTORY)
+            except FileNotFoundError:
+                raise TenantResourceNotFoundError() from None
+            except OSError as exc:
+                logger.error("Storage root open failed (reason=storage_root_unreadable, errno=%s)", exc.errno)
+                raise StorageError(
+                    "Tenant storage is unavailable.", details={"reason": "storage_root_unreadable"}
+                ) from exc
+
+            tenant_name = self.storage._tenant_dir(create=False).name
+            tenant_fd = _open_directory_nofollow(tenant_name, base_dir_fd, "tenant_directory_is_a_symlink")
+            doc_fd = _open_directory_nofollow(safe_doc_id, tenant_fd, "document_directory_is_a_symlink")
+        except BaseException:
+            _close_owned_descriptors((doc_fd, tenant_fd, base_dir_fd), strict=False)
+            raise
+        return base_dir_fd, tenant_fd, doc_fd
+
+    def get_document(self, document_id: str) -> DocumentRecord:
+        """
+        Retrieves the validated persisted ``DocumentRecord`` of one document of this service's tenant (API-002).
+
+        - ``document_record.json`` is read through the same descriptor-relative walk as the page image (``O_NOFOLLOW``
+          per component, ``O_NONBLOCK`` leaf, ``fstat`` regular-file check, ownership transfer through ``os.fdopen``),
+          never through the path-based ``LocalDiskStorage.get_document_record``.
+        - Unknown, malformed, wrong-case and foreign ids, a document directory without a record, and a record whose
+          tenant or document id differs from the principal's tenant or the requested id are ALL the concealed 404.
+        - A record that cannot be trusted (unreadable, not JSON, not an object, missing or mistyped fields, unknown
+          ``status`` or ``internal_state``) is a typed storage fault with a fixed reason: a generic 500 for the caller.
+        - Reads never create a directory.
+        """
+        safe_doc_id = validate_document_id(document_id)
+        _require_platform_support()
+
+        base_dir_fd: Optional[int] = None
+        tenant_fd: Optional[int] = None
+        doc_fd: Optional[int] = None
+        try:
+            base_dir_fd, tenant_fd, doc_fd = self._open_document_directory(safe_doc_id)
+            record_text = _read_regular_text_file(_RECORD_FILE, doc_fd, "record_file_is_symlink", "record_unreadable")
+        except BaseException:
+            _close_owned_descriptors((doc_fd, tenant_fd, base_dir_fd), strict=False)
+            raise
+        _close_owned_descriptors((doc_fd, tenant_fd, base_dir_fd), strict=True)
+
+        try:
+            stored = json.loads(record_text)
+        except Exception as exc:
+            logger.error("Record parse failed (reason=record_json_decode_error, error_type=%s)", type(exc).__name__)
+            raise StorageError(
+                "Failed to read document record.", details={"reason": "record_json_decode_error"}
+            ) from exc
+        if not isinstance(stored, dict):
+            logger.error("Record parse failed (reason=record_not_an_object)")
+            raise StorageError("Failed to read document record.", details={"reason": "record_not_an_object"})
+
+        # Identity first, on the raw values: another tenant's or another document's record is simply "not found".
+        if stored.get("tenant_id") != self.tenant_id:
+            logger.warning("Cross-tenant document access rejected (reason=record_tenant_mismatch)")
+            raise CrossTenantStorageAccessError(details={"reason": "record_tenant_mismatch"})
+        if stored.get("document_id") != safe_doc_id:
+            logger.warning("Document ID mismatch rejected (reason=record_doc_id_mismatch)")
+            raise TenantResourceNotFoundError()
+
+        return document_record_from_stored(stored)
+
     def get_page_image(self, document_id: str, page_number: int) -> Tuple[bytes, str]:
         """
         Retrieves raw image bytes and media type for the specified document page.
@@ -246,39 +355,14 @@ class DocumentReadService:
         tenant_fd: Optional[int] = None
         doc_fd: Optional[int] = None
         pages_fd: Optional[int] = None
-        handoff_fd: Optional[int] = None
         file_fd: Optional[int] = None
 
         try:
-            # Step A: open the configured storage root
-            try:
-                base_dir_fd = os.open(str(self.storage.base_dir), os.O_RDONLY | os.O_DIRECTORY)
-            except FileNotFoundError:
-                raise TenantResourceNotFoundError() from None
-            except OSError as exc:
-                logger.error("Storage root open failed (reason=storage_root_unreadable, errno=%s)", exc.errno)
-                raise StorageError(
-                    "Tenant storage is unavailable.", details={"reason": "storage_root_unreadable"}
-                ) from exc
+            # Steps A-B: storage root, tenant, then document directory (shared descriptor-relative walk)
+            base_dir_fd, tenant_fd, doc_fd = self._open_document_directory(safe_doc_id)
 
-            # Step B: tenant, then document directory, each relative to its parent's descriptor
-            tenant_name = self.storage._tenant_dir(create=False).name
-            tenant_fd = _open_directory_nofollow(tenant_name, base_dir_fd, "tenant_directory_is_a_symlink")
-            doc_fd = _open_directory_nofollow(safe_doc_id, tenant_fd, "document_directory_is_a_symlink")
-
-            # Step C: read module_a_handoff.json from the verified descriptor
-            handoff_fd = _open_leaf_nofollow("module_a_handoff.json", doc_fd, "handoff_file_is_symlink")
-            _require_regular_file(handoff_fd)
-            handoff_file = os.fdopen(handoff_fd, "r", encoding="utf-8")
-            handoff_fd = None                  # the file object is now the sole owner of this descriptor
-            try:
-                with handoff_file as f:
-                    handoff_raw = f.read()
-            except (OSError, ValueError) as exc:        # ValueError covers UnicodeDecodeError
-                logger.error("Handoff read failed (reason=handoff_unreadable, error_type=%s)", type(exc).__name__)
-                raise StorageError(
-                    "Failed to read handoff payload.", details={"reason": "handoff_unreadable"}
-                ) from exc
+            # Step C: read module_a_handoff.json from the verified document descriptor
+            handoff_raw = _read_regular_text_file(_HANDOFF_FILE, doc_fd, "handoff_file_is_symlink", "handoff_unreadable")
 
             try:
                 handoff_data = json.loads(handoff_raw)
@@ -351,11 +435,11 @@ class DocumentReadService:
                 ) from exc
         except BaseException:
             # Another error is propagating: release what is still owned, never mask the original error.
-            _close_owned_descriptors((file_fd, handoff_fd, pages_fd, doc_fd, tenant_fd, base_dir_fd), strict=False)
+            _close_owned_descriptors((file_fd, pages_fd, doc_fd, tenant_fd, base_dir_fd), strict=False)
             raise
 
         # Success: the directory descriptors are the only ones still owned; a failure to close them is not ignored.
-        _close_owned_descriptors((file_fd, handoff_fd, pages_fd, doc_fd, tenant_fd, base_dir_fd), strict=True)
+        _close_owned_descriptors((file_fd, pages_fd, doc_fd, tenant_fd, base_dir_fd), strict=True)
 
         # Step G: strict structure (ends exactly at IEND), then full Pillow verification
         validate_png_structure(image_bytes)

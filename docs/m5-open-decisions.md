@@ -282,7 +282,8 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
   - Option C: A two-tier model where the raw envelope JSON is written to `StorageBackend` while structured status and metadata live in the relational repository.
 - **PRD reference.** PRD section 6.3 (Canonical Extraction Envelope), PRD section 20 (Data Model); ARC-003.
 - **Owner.** Team Member 2 and Team Member 3. **Blocks.** S4, S5. **Status.** Open. **Resolution.** none.
-- **In the code.** `src/doc_extractor/processing_service.py`, `doc_extractor/contracts_c.py`.
+  - *Provisional implementation assumption (API-002):* Nothing persists a terminal status or an envelope today, so `GET /api/v1/documents/{id}` returns only the persisted Module A `document_record.json` metadata. The stored `status` is returned exactly as persisted and is NOT authoritative (see "M2D API-002 Provisional Behavior and Limitations" below), and `result` is always `null`. This is not a choice among Options A, B or C.
+- **In the code.** `src/doc_extractor/processing_service.py`, `doc_extractor/contracts_c.py`, `src/doc_extractor/api/services/document_read_service.py`, `src/doc_extractor/api/contracts/documents.py`.
 
 #### M2D-D02 SEC-007 API masking policy
 
@@ -294,7 +295,8 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
   - Who owns the masking transform component (API presentation layer DTO mapping vs. core extraction envelope assembly)?
 - **PRD reference.** SEC-007, SCH-014, API-017, API-021, PRD section 10.1.
 - **Owner.** PRD owner (security), Team Member 2. **Blocks.** S5, S7, S9. **Status.** Open. **Resolution.** none.
-- **In the code.** `src/schema_lifecycle/metamodel.py`, `src/doc_extractor/api/contracts/records.py`.
+  - *Provisional implementation assumption (API-002):* No extracted value or evidence text is returned (`result` is always `null`), so no masking transform is chosen or applied. The client-supplied `filename` is still returned as a plain string because it is an existing field of the sanctioned `DocumentResource`; whether it must be masked is part of this decision and remains unresolved.
+- **In the code.** `src/schema_lifecycle/metamodel.py`, `src/doc_extractor/api/contracts/records.py`, `src/doc_extractor/api/contracts/documents.py`.
 
 #### M2D-D03 Default page-image representation
 
@@ -319,6 +321,7 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 - **PRD reference.** API-003, SEC-003, SEC-006, PRD section 15.5.
 - **Owner.** PRD owner (security), Team Member 3. **Blocks.** S5. **Status.** Open. **Resolution.** none.
   - *Provisional implementation assumption (M2D Slice 1):* Enforce provisional scope `SCOPE_DOCUMENTS_READ = "documents:read"`. Cross-tenant attempts answer concealed 404 (`DOCUMENT_NOT_FOUND`), whereas principals authenticated within the tenant who lack the scope receive 403 (`FORBIDDEN_SCOPE`).
+  - *Provisional implementation assumption (API-002):* `GET /api/v1/documents/{id}` enforces the same provisional `documents:read` scope with the same 404/403 behaviour. Whether document metadata needs a different scope than page images is part of this open decision.
 - **In the code.** `src/doc_extractor/api/ports/authentication.py`, `src/doc_extractor/api/contracts/documents.py`, `src/doc_extractor/api/routers/documents.py`.
 
 #### M2D-D05 Missing or not-yet-rendered page error code
@@ -336,9 +339,69 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 
 ### M2D Remediation Follow-ups
 
-- **F5: Bounded or streaming page-image reads. Status: open follow-up (not implemented).** Bound or stream page-image reads to avoid loading arbitrarily large files into memory. `DocumentReadService.get_page_image` still reads the whole file into memory before validating it.
+- **F5: Bounded or streaming file reads. Status: open follow-up (not implemented).** Bound or stream the reads in `DocumentReadService` so a file cannot load arbitrarily large content into memory. Three reads are affected and none has an explicit byte bound or streaming strategy today:
+  - API-003 page-image reads (`get_page_image` reads the whole PNG into memory before validating it);
+  - API-002 handoff reads (`module_a_handoff.json`, read in full and parsed by `get_page_image`);
+  - API-002 document-record reads (`document_record.json`, read in full and parsed by `get_document`).
+
+  These files are written only by Module A, which is why this is deferred, but a very large file would be loaded completely. Bounded or streaming reads remain deferred; no new streaming architecture was introduced.
 - **F6: Sanitized logging with fixed reason codes. Status: resolved for `DocumentReadService` only; the wider audit remains open.**
   - *Done (M2D Slice 1 remediation).* Every `logger.*` call in `src/doc_extractor/api/services/document_read_service.py` was inspected. Each now uses a constant message with a fixed reason code, an exception class name or an integer `errno`; no raw exception text, handoff URI, tenant identifier, document identifier or handoff key name is interpolated. `StorageError` details raised by this module carry a fixed `reason` code instead of the raw URI or foreign tenant value. Regression tests in `tests/test_api_documents_page_image.py` cover log forging through a newline in a URI or a handoff key, foreign tenant and document identifiers, and decode-error text, and a static AST test fails if a logger call takes an untrusted name.
   - *Inspected on the same request path, no change needed.* `api/exceptions.py`: `document_extractor_error_handler` logs only the error code, the fixed `reason` and the request id, and `unhandled_exception_handler` logs nothing.
   - *Not audited for untrusted content, still open.* Logging in these other modules is outside this follow-up: `src/doc_extractor/api/providers/api_key_auth.py` (authentication provider, on the request path), `src/doc_extractor/api/app.py`, `src/doc_extractor/api/ports/audit.py`, and `src/doc_extractor/api/composition.py` (tenant identifiers and exception text in cleanup messages), plus any server-level logging of unhandled exceptions. The review found no logger calls in `src/doc_extractor/storage.py`, `src/doc_extractor/tenancy.py` or `src/doc_extractor/handoff.py`. F6 must not be treated as closed for the API as a whole until the modules listed above are reviewed.
 - **F7: Strengthen handoff structural integrity validation. Status: open follow-up (not implemented).** Validate duplicate page numbers, page sequence continuity and `page_count` consistency in the handoff. `get_page_image` still takes the first page record whose number matches and does not compare `page_count` with `pages`.
+
+### M2D API-002 Provisional Behavior and Limitations
+
+`GET /api/v1/documents/{document_id}` (API-002) implements only the persisted-metadata portion of the PRD contract
+("status, metadata and, when ready, the output envelope"). The envelope portion is NOT implemented. No owner decision
+below is approved or resolved by this behaviour; M2D-D01, M2D-D02 and M2D-D04 stay **Open**.
+
+- **Source of the data.** The Module A `document_record.json` of the caller's tenant, read through the same hardened
+  descriptor-relative walk as the page image (`DocumentReadService.get_document`), not through the path-based
+  `LocalDiskStorage.get_document_record`. This reads the existing store and is not a new persistence adapter; the
+  authoritative persistence interface remains open (M5-D18).
+- **Response.** `DocumentDetailResponse` extends the sanctioned `DocumentResource` (`document_id`, `status`, `filename`,
+  `mime_type`, `file_size_bytes`, `page_count`, `sha256`, `created_at`, `updated_at`, `error_code`, `error_message`) and adds
+  `result`, typed `None` and always returned as JSON `null`. `tenant_id`, `internal_state`, `idempotency_key`, storage URIs
+  and paths are never returned.
+- **`status` is persisted but NOT authoritative.** Module A writes `status="processing"` (internal state `queued`) once at
+  ingestion and nothing updates it. It is returned exactly as stored and never inferred, so a document whose extraction
+  finished by another route (for example a synchronous extraction, whose result is not persisted) still reads `processing`.
+  `queued` and `rejected_malware` from PRD section 20 are not part of the status enum (M5-D04) and are never emitted.
+- **Timestamps.** `updated_at` equals `created_at` for every current record and is never synthesized. `created_at` and
+  `updated_at` keep their persisted INSTANT; the serialized text may be normalized by the response DTO (for example a
+  persisted `+00:00` offset can be written as `Z`), so the text is not guaranteed to be byte-identical to the stored string.
+  A timestamp is validated with the same parser the DTO uses; text it rejects is an invalid record (generic `500`, reason
+  `record_timestamp_invalid`).
+- **`result` is always `null`** until a canonical extraction envelope is persisted (M2D-D01). Nothing is invented: there is
+  no `document_type`, `schema_id`, `schema_version`, classification, confidence, model version, run id, prompt version,
+  field, flag or evidence in this response.
+- **Ingestion failures and the record.** Whether a document record exists depends on WHEN ingestion fails:
+  - Failures before the record is saved (validation and unsupported-file rejections, malware detection, scanner
+    failures) write no document record, so those documents answer the concealed 404. PRD section 19 lists a
+    `rejected_malware` status; making such documents retrievable needs a persistence decision and is not done here.
+  - A failure after the record has been saved (for example while saving the idempotency record or running the downstream
+    callback, which Module A reports as a failed ingestion) can leave the record persisted with its original
+    `processing` status, because no terminal-status update writer exists. API-002 returns the status actually stored in
+    that record and does not infer a terminal status, so it can report `processing` for such a document.
+  Not every failed ingestion is absent from storage.
+- **`filename`** is the client-supplied name, returned only as a string and never interpreted as a path. Its exposure is
+  provisional pending M2D-D02. API-002 imposes no length limit on it, because Module A imposes none (a 2,000-character
+  basename is accepted and persisted) and the response DTO has none.
+- **Error text is allow-listed, and a malformed stored error is refused.** A stored error is accepted only as `null`, `{}`
+  (both mean no error) or an object with a non-empty string `code` and, if present, a `message` that is a string or
+  `null`; other keys such as `details` and `request_id` are tolerated but never used or exposed. `error_code` /
+  `error_message` then come from a fixed table (`UNSUPPORTED_FILE`, `FILE_TOO_LARGE`, `MALWARE_DETECTED`, with the PRD
+  section 19 texts); any other non-empty string code becomes `INTERNAL_ERROR` with the generic message, and that unknown
+  code and the stored message are withheld. Any other shape (a non-object, an object without a string `code`, a non-string
+  `message`) is an invalid record: generic `500`, reason `record_error_invalid`, never a fabricated successful answer. No
+  stored error exists today (the field is always empty); the validation and allow-list protect future writers.
+- **Errors.** Unknown, malformed, wrong-case and foreign ids, a directory without a record, and a record whose tenant or
+  document id differs from the principal's tenant or the requested id are all the same concealed `404 DOCUMENT_NOT_FOUND`.
+  An unreadable, non-JSON, non-object or invalid record (missing keys, wrong types, unknown `status` or `internal_state`,
+  an invalid timestamp, a malformed stored error) and any symlink, FIFO, socket, directory or other special file at the
+  record path are a generic `500` with a fixed reason
+  logged server-side. A shut-down container is the typed `503`.
+- **Logging.** The log statements added for API-002 follow the F6 rule (fixed reason codes, exception class names, integer
+  `errno`) and are covered by the same static test; the F6 scope statement above is unchanged (`DocumentReadService` only).
