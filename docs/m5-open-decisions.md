@@ -880,3 +880,53 @@ M2D-D02 (masking), M2D-D04 (scopes) or any other open decision; all of them stay
 - **Observation (existing, unchanged).** `rule_evaluator._flag_violation` compares `str(rule.on_fail).lower()` with `"review"`;
   for a string-valued enum `str()` is `"ruleonfail.review"`, so a comparison rule never sets `review_required` on its field. The
   correction result uses the rule's flag, not `review_required`, so it is unaffected; the evaluator itself was not changed.
+
+### M5 Phase 3 Slice 2B-prep Provisional Behavior and Limitations (review routing and task draft generation)
+
+Everything in this section is a provisional implementation assumption. It is not owner-approved, and it does not resolve M5-D11
+(review-task states), M5-D07, M2D-D01 (envelope persistence and terminal status), M2D-D02, M2D-D04 or any other open decision; all
+of them stay **Open**. It is pure logic: it stores nothing, creates no task, updates no document status, reads no clock, adds no
+endpoint or webhook and no production adapter.
+
+- **One gate, not two.** FR-CNF-003 was already implemented, inline, inside `field_assembly.assemble_canonical_envelope` (it sets
+  `needs_review` versus `auto_approved`). That rule is now `field_assembly.assess_review_requirement`, extracted from the assembler
+  (not copied): the assembler calls it, and so does `api/services/review_routing.py`. The extraction is behavior-neutral: the
+  Module C, gating and dynamic-adapter tests are unchanged, and a test compares the original inline expression with the new gate and
+  the assembler over an exhaustive grid. Routing adds no confidence threshold, validation rule or review policy; it never compares
+  a confidence with a threshold (a field's own threshold, FR-CNF-002, is applied when the field is assembled and recorded in its
+  `review_required`, which routing reads). The reasons are the clauses of the existing rule as fixed codes (`DOCUMENT_TYPE_UNKNOWN`,
+  `NOTHING_EXTRACTED`, `UPSTREAM_NEEDS_REVIEW`, `FLAGS_RAISED`, `FIELD_REVIEW_REQUIRED`, `FIELD_VALIDATION_FAILED`,
+  `CONFIDENCE_NOT_AUTHORIZING`).
+- **Decision.** `route_extraction(envelope, tenant_id=, document_id=, now=)` returns `AUTO_APPROVE` (no reason, no draft) or
+  `NEEDS_REVIEW` (reasons and a draft). Only an envelope recorded as `auto_approved` or `needs_review` is routed; `failed`,
+  `processing`, `reviewed` and `rejected` are refused (`STATUS_NOT_ROUTABLE`). The envelope carries no tenant: the caller states the
+  tenant and the expected document identifier (from the trusted document record), and the envelope's own `document_id` must equal
+  the latter (`DOCUMENT_ID_MISMATCH`). `now` is the draft's creation time (timezone-aware; the function reads no clock).
+- **Integrity guards (not policies).** Missing or contradictory metadata fails toward review, never toward approval: a field whose
+  indicators cannot be trusted (a confidence outside [0, 1], NaN, a boolean or a string; a `validation` or `review_required` of the
+  wrong type; a provenance that is not an enum member; an object that is not an `ExtractedField`) is a flagged field
+  (`FIELD_METADATA_INVALID`); a recorded `auto_approved` that the gate contradicts is routed to review (`STATUS_CONFLICT`); a
+  recorded `needs_review` that nothing else explains is kept (`UPSTREAM_NEEDS_REVIEW`). An envelope that cannot be read at all (not
+  an envelope, flags that are not flags, non-string field keys) is refused (`INVALID_ENVELOPE`), not guessed.
+- **The draft** (`ReviewTaskDraft`, frozen and validated): `tenant_id`, `document_id`, `status` (always `unassigned`), `created_at`,
+  `flagged_fields` (each: a public `path`, its gate `reasons` and the `flag_codes` of the envelope flags that name it), the distinct
+  `flag_codes` and the document-level `document_reasons`. A field is flagged when the gate flags it or a flag names it; a document
+  reason with no field (an unknown type, nothing extracted, a flag naming no field) gives a draft with no flagged field. It holds
+  no extracted value, evidence text, flag message, run diagnostic, prompt or document type. Field identifiers use the SAME mapping
+  as the API-004 response (`_FieldNames`): a schema-canonical path keeps its name, every other field becomes `field_N`, and an
+  unmappable flag reference is dropped, so a model-chosen key is never copied; a test compares them with the response. Flag codes
+  are copied only when they are upper-case tokens (else `RULE_VIOLATION`, as in correction validation).
+- **Not provided, by design.** A task identifier (the persisting side assigns it), `priority` and `slaDueAt` (PRD section 20; no
+  trusted contract supplies a source and `ReviewTaskRecord` does not model them), the document type, and any guarantee of
+  idempotency or one draft per document (that needs a persistence-side constraint). The draft's identity, state and time map onto
+  `ReviewTaskRecord` (a test builds one); where `flaggedFields` and the reasons live on the persisted record is a contract decision
+  for the persistence slice, so `ReviewTaskRecord` was not changed.
+- **Remaining dependencies.** Review-task creation and persistence (a production `ReviewTaskRepository` adapter and a unique
+  constraint per document); the document-status update and its atomicity with task creation (M2D-D01, Team Member 3); persisted
+  extraction envelopes; a `ReviewTaskRecord` extension or a metadata policy for flagged fields (and an SLA source); the reverse
+  mapping from a public `field_N` to the internal field key for corrections of unbound or dynamic documents (recomputable from the
+  stored envelope with the same mapping); the completion, role and scope policies (M5-D11, M2D-D04, SEC-003).
+- **Known limitations.** A flag that names a schema path with no field entry of its own (`nominees.share_percentage`) is kept as a
+  flagged path although it is not itself a correctable path (corrections need a position); a flag reference that cannot be mapped
+  (for example a dynamic rule's `items[].amount`) is dropped while its code is kept. Per-field thresholds exist only in the schema,
+  not in the envelope, so the gate cannot and does not re-evaluate them.
