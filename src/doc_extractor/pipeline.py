@@ -341,6 +341,20 @@ class ModuleAPipeline:
             )
             # Ensure failed status and rollback
             self.storage.cleanup_preprocessed(doc_id)
+            # Invalidate orphaned idempotency record if processing failed and document was rolled back
+            if idempotency_key and hasattr(self, "idempotency_store") and self.idempotency_store is not None:
+                try:
+                    if hasattr(self.idempotency_store, "get_key_lock"):
+                        with self.idempotency_store.get_key_lock(self.tenant_id, idempotency_key):
+                            rec = self.idempotency_store.get_record(self.tenant_id, idempotency_key)
+                            if rec and rec.document_id == doc_id and self.storage.get_document_record(doc_id) is None:
+                                self.idempotency_store.delete_record(self.tenant_id, idempotency_key)
+                    else:
+                        rec = self.idempotency_store.get_record(self.tenant_id, idempotency_key)
+                        if rec and rec.document_id == doc_id and self.storage.get_document_record(doc_id) is None:
+                            self.idempotency_store.delete_record(self.tenant_id, idempotency_key)
+                except Exception:
+                    pass
             completed_at = datetime.now(timezone.utc).isoformat()
             err_dict = (
                 exc.to_envelope()["error"]

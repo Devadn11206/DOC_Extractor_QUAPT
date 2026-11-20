@@ -8,12 +8,13 @@ Defines:
   record dictionary to ``DocumentRecord``, and the allow-list that decides which error text may be shown to a caller.
 - The public response DTOs of API-015 (``DocumentListResponse`` with its statistics and paging models) and the
   validation of the list query parameters.
+- The public response DTO of API-001 (``DocumentUploadResponse``) and the validation of the upload inputs.
 """
 
 import re
 from dataclasses import replace
 from datetime import date, datetime, time, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
@@ -24,6 +25,9 @@ from doc_extractor.models import DocumentRecord, DocumentStatus, IngestionState
 
 # Provisional authorization scope for document read operations (M2D-D04)
 SCOPE_DOCUMENTS_READ: str = "documents:read"
+
+# PROVISIONAL scope for document upload (API-001), not owner-approved: part of the open scope decision M2D-D04.
+SCOPE_DOCUMENTS_WRITE: str = "documents:write"
 
 # Safe document ID pattern: alphanumeric, hyphen, underscore, 1 to 128 characters.
 # Strict path segment format prohibiting directory traversal (..), path separators (/ or \\),
@@ -455,3 +459,113 @@ def reject_unsupported_list_filter(parameter: str, value: Optional[str]) -> None
         raise _list_validation_error(
             parameter, "This filter is not supported: the data it needs is not persisted.", "unsupported_filter"
         )
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# API-001 upload response and input validation (PROVISIONAL, see docs/m5-open-decisions.md)
+# ---------------------------------------------------------------------------------------------------------------------
+
+class DocumentUploadResponse(BaseModel):
+    """
+    API-001 response (PRD: "returns ``202`` with ``document_id``"). It carries the document id and NOTHING else: no
+    status, no metadata and no result are invented. The document's state is read through API-002.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    document_id: str = Field(..., min_length=1, description="Identifier of the accepted document")
+
+
+# The ONLY multipart form fields the upload accepts. Any other name (a misspelling, ``tenant_id``...) is refused.
+UPLOAD_FORM_FIELDS = frozenset({"file", "document_type_hint", "schema_id", "callback_url"})
+
+# Idempotency-Key: visible ASCII only (no spaces or control characters), 1 to 255 characters. The store hashes the key, so
+# the bound exists for the lock table and for the log/header hygiene, not for path safety.
+_IDEMPOTENCY_KEY_REGEX = re.compile(r"[\x21-\x7e]{1,255}")
+
+
+def reject_unexpected_upload_input(
+    query_names: Iterable[str],
+    form_names: Iterable[str],
+    file_count_or_counts: Any = None,
+) -> None:
+    """
+    The upload takes no query parameters, only the four documented form fields, and exactly one ``file`` part.
+    Duplicate form fields are prohibited. Anything else is a 422 that names and echoes nothing the client sent
+    (a tenant identifier in the query or body is refused, never silently ignored).
+    """
+    if any(True for _ in query_names):
+        raise _list_validation_error_at(["query"], "This endpoint takes no query parameters.", "unknown_parameter")
+    if any(name not in UPLOAD_FORM_FIELDS for name in form_names):
+        raise _list_validation_error_at(
+            ["body"],
+            "Unknown form field. Allowed fields: file, document_type_hint, schema_id, callback_url.",
+            "unknown_parameter",
+        )
+    if isinstance(file_count_or_counts, Mapping):
+        for field, count in file_count_or_counts.items():
+            if count > 1:
+                raise _list_validation_error_at(
+                    ["body", field],
+                    "Multiple values are not permitted for this field.",
+                    "duplicate_parameter",
+                )
+    elif isinstance(file_count_or_counts, int):
+        if file_count_or_counts > 1:
+            raise _list_validation_error_at(
+                ["body", "file"],
+                "Multiple values are not permitted for this field.",
+                "duplicate_parameter",
+            )
+
+
+def validate_idempotency_key(value: Optional[str]) -> Optional[str]:
+    """``None`` (header absent) or a well-formed key; anything else is a 422 that does not echo the value."""
+    if value is None:
+        return None
+    if not _IDEMPOTENCY_KEY_REGEX.fullmatch(value):
+        raise _list_validation_error_at(
+            ["header", "Idempotency-Key"],
+            "Must be 1 to 255 visible ASCII characters without spaces.",
+            "invalid_value",
+        )
+    return value
+
+
+def reject_unsupported_upload_parameters(form_names: Iterable[str]) -> None:
+    """
+    ``document_type_hint``, ``schema_id`` and ``callback_url`` are PRD-named but have no capability behind them yet:
+    there is no approved-schema registry wired to extraction, no downstream persistence for the hint, and no webhook
+    delivery or SEC-011 egress control that could make a caller-supplied URL safe. Supplying any of them is a 422,
+    never a silently ignored value. The check is on the PRESENCE of the form field (it is given the names of the parsed
+    form), because the framework turns an empty form value into "absent" for a declared parameter, which would let
+    them through unnoticed.
+    """
+    names = set(form_names)
+    for name in ("document_type_hint", "schema_id", "callback_url"):
+        if name in names:
+            raise _list_validation_error_at(
+                ["body", name],
+                "This parameter is not supported yet.",
+                "unsupported_parameter",
+            )
+
+
+def validate_document_type_hint(value: Optional[str]) -> Optional[str]:
+    """
+    ``None`` or one of the existing fixed document-type choices (the keys of ``extractor.SCHEMA_MAP``, the same values the
+    extraction pipeline accepts as ``doc_type_choice``). Matching is exact and case-sensitive; anything else is a 422 that
+    does not echo the value.
+    """
+    if value is None:
+        return None
+    from doc_extractor.extractor import SCHEMA_MAP          # lazy: the extractor module is heavy and only needed here
+
+    allowed = sorted(SCHEMA_MAP)
+    if not isinstance(value, str) or value not in allowed:
+        raise _list_validation_error_at(
+            ["body", "document_type_hint"],
+            "Unsupported document type hint. Allowed values: " + ", ".join(allowed) + ".",
+            "invalid_value",
+        )
+    return value

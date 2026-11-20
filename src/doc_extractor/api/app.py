@@ -20,7 +20,8 @@ from fastapi.openapi.utils import get_openapi
 from doc_extractor.api.composition import ApplicationContainer
 from doc_extractor.api.config import ApiSettings, load_api_settings
 from doc_extractor.api.exceptions import register_exception_handlers
-from doc_extractor.api.middleware import RequestIdMiddleware
+from doc_extractor.api import middleware as api_middleware
+from doc_extractor.api.middleware import RequestIdMiddleware, UploadSizeLimitMiddleware
 from doc_extractor.api.routers.documents import router as documents_router
 from doc_extractor.api.routers.health import router as health_router
 from doc_extractor.logging import setup_logging
@@ -135,6 +136,19 @@ def create_app(
     app.state.queue_producer = resolved_container.queue_producer
     app.state.queue_consumer = resolved_container.queue_consumer
     app.state.audit_logger = resolved_container.audit_logger
+
+    # API-001 upload body limit: a pure ASGI guard in front of the multipart parser (refuses an over-limit body before it is
+    # parsed or spooled). It is registered BEFORE (so inner to) the CORS and request-id middleware: its 413 then carries the request id and CORS headers.
+    app.add_middleware(
+        UploadSizeLimitMiddleware,
+        path=f"{resolved_settings.api_prefix}/documents" if resolved_settings.api_prefix else "/documents",
+        max_body_bytes=(
+            resolved_container.engine_settings.max_file_size_bytes + api_middleware.UPLOAD_MULTIPART_OVERHEAD_BYTES
+        ),
+        max_concurrent_uploads=resolved_settings.max_concurrent_uploads,
+        body_idle_timeout=resolved_settings.upload_body_idle_timeout_seconds,
+        body_total_timeout=resolved_settings.upload_body_total_timeout_seconds,
+    )
 
     # Register CORS if origins configured
     if resolved_settings.cors_origins:

@@ -7,6 +7,7 @@ combination is a ConfigurationError, never a silent fall-back to development.
 import pytest
 
 pytest.importorskip("fastapi", reason="optional API extra not installed (pip install -e '.[dev,api]')")
+pytest.importorskip("multipart", reason="optional API extra not installed (pip install -e '.[dev,api]')")
 
 from fastapi.testclient import TestClient
 
@@ -248,3 +249,89 @@ def test_production_from_the_environment_serves_no_documentation_even_with_every
     monkeypatch.setenv("DOC_API_PREFIX", "/api/v1")
     monkeypatch.setenv("DOC_API_CORS_ORIGINS", "https://app.example.com")
     assert doc_urls(TestClient(create_app())) == (404, 404, 404)
+
+
+# -- upload body timeouts (N3, R4): finite, positive, bounded ------------------------------------------
+
+IDLE = "upload_body_idle_timeout_seconds"
+TOTAL = "upload_body_total_timeout_seconds"
+IDLE_ENV = "DOC_API_UPLOAD_BODY_IDLE_TIMEOUT_SECONDS"
+TOTAL_ENV = "DOC_API_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS"
+
+
+def test_the_upload_timeout_defaults_are_unchanged():
+    settings = ApiSettings(app_env="development")
+    assert (getattr(settings, IDLE), getattr(settings, TOTAL)) == (30.0, 300.0)
+
+
+@pytest.mark.parametrize("overrides", [
+    {IDLE: float("inf")}, {IDLE: float("-inf")}, {IDLE: float("nan")}, {IDLE: 1e308}, {IDLE: 0}, {IDLE: -1}, {IDLE: -0.001},
+    {IDLE: 300.001}, {IDLE: 301},
+    {IDLE: 301, TOTAL: 3600}, {IDLE: 1000, TOTAL: 3600}, {IDLE: 3600, TOTAL: 3600},       # idle above its own maximum, total fine
+    {IDLE: float("inf"), TOTAL: float("inf")},
+    {TOTAL: float("inf")}, {TOTAL: float("-inf")}, {TOTAL: float("nan")}, {TOTAL: 1e308}, {TOTAL: 0}, {TOTAL: -1},
+    {TOTAL: 3600.001}, {TOTAL: 3601},
+    {IDLE: 60, TOTAL: 59.999}, {IDLE: 300, TOTAL: 299}, {TOTAL: 29.9},            # total below idle (the default idle is 30)
+])
+def test_invalid_upload_timeouts_are_refused_when_constructing_the_settings(overrides):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ApiSettings(app_env="development", **overrides)
+
+
+@pytest.mark.parametrize("overrides", [
+    {IDLE: 0.001, TOTAL: 0.001},            # smallest sensible: positive, total == idle
+    {IDLE: 1, TOTAL: 1}, {IDLE: 30, TOTAL: 30}, {IDLE: 30, TOTAL: 300}, {IDLE: 300, TOTAL: 300},
+    {IDLE: 300, TOTAL: 3600},               # both maxima
+    {IDLE: 299.999, TOTAL: 3599.999}, {TOTAL: 3600}, {IDLE: 5},
+])
+def test_valid_upload_timeout_boundaries_are_accepted(overrides):
+    settings = ApiSettings(app_env="development", **overrides)
+    assert getattr(settings, IDLE) == overrides.get(IDLE, 30.0) and getattr(settings, TOTAL) == overrides.get(TOTAL, 300.0)
+
+
+@pytest.mark.parametrize("variable, value", [
+    (IDLE_ENV, "inf"), (IDLE_ENV, "-inf"), (IDLE_ENV, "Infinity"), (IDLE_ENV, "-Infinity"), (IDLE_ENV, "INF"), (IDLE_ENV, "nan"),
+    (IDLE_ENV, "NaN"), (IDLE_ENV, "1e308"), (IDLE_ENV, "0"), (IDLE_ENV, "0.0"), (IDLE_ENV, "-5"), (IDLE_ENV, "301"),
+    (IDLE_ENV, "300.5"), (IDLE_ENV, "abc"),
+    (TOTAL_ENV, "inf"), (TOTAL_ENV, "-inf"), (TOTAL_ENV, "Infinity"), (TOTAL_ENV, "nan"), (TOTAL_ENV, "1e308"), (TOTAL_ENV, "0"),
+    (TOTAL_ENV, "-1"), (TOTAL_ENV, "3601"), (TOTAL_ENV, "1e309"), (TOTAL_ENV, "abc"),
+    (TOTAL_ENV, "29"),                      # below the default idle timeout (30)
+])
+def test_invalid_upload_timeouts_from_the_environment_are_refused(monkeypatch, variable, value):
+    monkeypatch.setenv("DOC_API_ENV", "development")
+    monkeypatch.setenv(variable, value)
+    with pytest.raises(ConfigurationError):
+        load_api_settings()
+
+
+@pytest.mark.parametrize("idle", ["301", "1000", "3600"])
+def test_an_idle_timeout_above_its_maximum_is_refused_from_the_environment_even_with_a_large_total(monkeypatch, idle):
+    monkeypatch.setenv("DOC_API_ENV", "development")
+    monkeypatch.setenv(IDLE_ENV, idle)
+    monkeypatch.setenv(TOTAL_ENV, "3600")
+    with pytest.raises(ConfigurationError):
+        load_api_settings()
+
+
+def test_a_total_timeout_below_the_idle_timeout_is_refused_from_the_environment(monkeypatch):
+    monkeypatch.setenv("DOC_API_ENV", "development")
+    monkeypatch.setenv(IDLE_ENV, "120")
+    monkeypatch.setenv(TOTAL_ENV, "60")
+    with pytest.raises(ConfigurationError):
+        load_api_settings()
+
+
+@pytest.mark.parametrize("idle, total", [("0.5", "0.5"), ("1", "10"), ("30", "300"), ("300", "300"), ("300", "3600"), ("299.5", "3599.5")])
+def test_valid_upload_timeout_boundaries_are_accepted_from_the_environment(monkeypatch, idle, total):
+    monkeypatch.setenv("DOC_API_ENV", "development")
+    monkeypatch.setenv(IDLE_ENV, idle)
+    monkeypatch.setenv(TOTAL_ENV, total)
+    settings = load_api_settings()
+    assert (getattr(settings, IDLE), getattr(settings, TOTAL)) == (float(idle), float(total))
+
+
+def test_the_bounds_are_the_documented_constants():
+    assert api_config.MAX_UPLOAD_BODY_IDLE_TIMEOUT_SECONDS == 300.0
+    assert api_config.MAX_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS == 3600.0

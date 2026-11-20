@@ -116,30 +116,52 @@ def test_api_package_parses_with_the_python_3_10_grammar(path):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
 
 
-def _can_run_the_api(exe: str) -> bool:
-    """True when ``exe`` has the API dependencies, so importing the API there is a meaningful check."""
+def _has_base_api_deps(exe: str) -> bool:
+    """True when ``exe`` has base API dependencies (fastapi, pydantic, httpx)."""
+    code = "import fastapi, pydantic, httpx"
     try:
-        probe = subprocess.run([exe, "-c", "import fastapi, pydantic, httpx"], capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+        probe = subprocess.run([exe, "-c", code], capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+def _has_multipart_dep(exe: str) -> bool:
+    """True when ``exe`` has python-multipart installed."""
+    code = (
+        "import importlib.util as u; "
+        "assert u.find_spec('python_multipart') or u.find_spec('multipart')"
+    )
+    try:
+        probe = subprocess.run([exe, "-c", code], capture_output=True, env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     except OSError:
         return False
     return probe.returncode == 0
 
 
 def _interpreters():
-    """The running interpreter, plus every other CPython 3.10-3.13 on PATH that can actually run the API.
-    Others are not skipped, they are simply not part of the parametrization (nothing to check there)."""
+    """The running interpreter, plus every other CPython 3.10-3.13 on PATH that has base API dependencies."""
     found = {sys.executable}
     for minor in (10, 11, 12, 13):
         exe = shutil.which(f"python3.{minor}")
-        if exe and _can_run_the_api(exe):
+        if exe and _has_base_api_deps(exe):
             found.add(exe)
     return sorted(found, key=lambda exe: (exe != sys.executable, exe))
 
 
 @pytest.mark.parametrize("exe", _interpreters(), ids=lambda exe: "running-interpreter" if exe == sys.executable else Path(exe).name)
 def test_api_package_imports_in_a_fresh_interpreter(exe):
-    if exe == sys.executable and importlib.util.find_spec("fastapi") is None:
-        pytest.skip("optional API extra not installed (pip install -e '.[dev,api]')")   # fails in a DOC_FAIL_ON_SKIP=1 job
+    if not _has_base_api_deps(exe):
+        pytest.skip(f"{Path(exe).name} lacks optional API dependencies (pip install -e '.[dev,api]')")
+    if not _has_multipart_dep(exe):
+        msg = (
+            f"{Path(exe).name} lacks python-multipart, which is a declared extra dependency "
+            "required to import API routes declaring form parameters (pip install python-multipart)."
+        )
+        if os.environ.get("DOC_FAIL_ON_SKIP") == "1":
+            pytest.fail(msg)
+        else:
+            pytest.skip(msg)
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
     probe = subprocess.run([exe, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True, text=True, env=env)
     assert probe.returncode == 0
@@ -147,4 +169,26 @@ def test_api_package_imports_in_a_fresh_interpreter(exe):
         [exe, "-c", "import doc_extractor.api, doc_extractor.api.dependencies, doc_extractor.api.app"],
         capture_output=True, text=True, env=env, cwd=str(ROOT),
     )
+    assert run.returncode == 0, run.stderr[-600:]
+
+
+def test_api_package_imports_when_starlette_has_no_get_route_path():
+    """
+    ``pyproject.toml`` declares ``starlette>=0.27.0``, but ``starlette.routing.get_route_path`` only exists from 0.35.
+    The upload guard therefore carries its own root-path-aware helper. This simulates the older Starlette in a fresh
+    interpreter (the attribute is removed after FastAPI has loaded) and imports the whole API; the real 0.27/FastAPI 0.100
+    environment was exercised separately (see the API-001 remediation report).
+    """
+    if importlib.util.find_spec("fastapi") is None or not _has_multipart_dep(sys.executable):
+        pytest.skip("optional API extra not installed (pip install -e '.[dev,api]')")
+    code = (
+        "import fastapi, starlette.routing as r\n"
+        "if hasattr(r, 'get_route_path'): delattr(r, 'get_route_path')\n"
+        "import doc_extractor.api, doc_extractor.api.dependencies, doc_extractor.api.app\n"
+        "import doc_extractor.api.middleware as m\n"
+        "assert m.route_path_of({'path': '/svc/api/v1/documents', 'root_path': '/svc'}) == '/api/v1/documents'\n"
+        "assert m.route_path_of({'path': '/api/v1/documents', 'root_path': ''}) == '/api/v1/documents'\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
+    run = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=str(ROOT))
     assert run.returncode == 0, run.stderr[-600:]

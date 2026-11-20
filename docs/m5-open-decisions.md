@@ -106,6 +106,7 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **Options.** A) the API creates a metadata-only record from the ingestion result. B) Module A creates it.
 - **Plan's recommendation.** A, if a metadata row does not count as "stored" (needs a PRD clarification).
 - **Owner.** PRD owner. **Blocks.** S5. **Status.** Open. **Resolution.** none.
+  - *Provisional implementation assumption (API-001):* an upload that is rejected as unsupported (unsupported, spoofed, corrupt or password-protected file, over a size or page limit), as malware, or because the scanner failed is answered once, as an error response, and leaves no record, page, original bytes or idempotency record. Most of these are decided before Module A saves its record; some (a file with a valid header whose body the renderer cannot open, or a password-protected PDF) are only discovered after the record was saved, and the upload service then rolls that one document back and verifies it (see the API-001 section); if that cannot be verified the answer is a generic `500`, not a `400`. It is therefore never visible afterwards through API-002 or API-015, and the PRD status `rejected_malware` exists only as the error code of that one response. Operational failures (HTTP 500) are different and can leave a `processing` record (API-001 section). Nothing is persisted for a rejection here.
 
 ### M5-D06 Pagination shape
 
@@ -326,6 +327,7 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
   - *Provisional implementation assumption (M2D Slice 1):* Enforce provisional scope `SCOPE_DOCUMENTS_READ = "documents:read"`. Cross-tenant attempts answer concealed 404 (`DOCUMENT_NOT_FOUND`), whereas principals authenticated within the tenant who lack the scope receive 403 (`FORBIDDEN_SCOPE`).
   - *Provisional implementation assumption (API-002):* `GET /api/v1/documents/{id}` enforces the same provisional `documents:read` scope with the same 404/403 behaviour. Whether document metadata needs a different scope than page images is part of this open decision.
   - *Provisional implementation assumption (API-015):* `GET /api/v1/documents` enforces the same provisional `documents:read` scope (403 `FORBIDDEN_SCOPE` without it, 401 without authentication). Whether listing needs its own scope is part of this open decision.
+  - *Provisional implementation assumption (API-001):* `POST /api/v1/documents` requires the provisional scope `documents:write` (`SCOPE_DOCUMENTS_WRITE`). It is not owner-approved: the PRD names the roles analyst and integrator (section 18) but defines no scope string, and a read-only token (`documents:read`) cannot upload. Whether upload needs a different scope is part of this open decision.
 - **In the code.** `src/doc_extractor/api/ports/authentication.py`, `src/doc_extractor/api/contracts/documents.py`, `src/doc_extractor/api/routers/documents.py`.
 
 #### M2D-D05 Missing or not-yet-rendered page error code
@@ -516,3 +518,171 @@ M5-D06 and M2D-D01, M2D-D02 and M2D-D04 stay **Open**.
   file size of ALL of a tenant's documents are exposed in bulk.
 - **Logging.** The log statements added for API-015 follow the F6 rule (constant messages, fixed reason codes, integer `errno`)
   and are covered by the same static test; the F6 scope statement is unchanged (`DocumentReadService` only).
+
+### M2D API-001 Provisional Behavior and Limitations
+
+`POST /api/v1/documents` (API-001) is a thin REST adapter over the EXISTING Module A pipeline
+(`ModuleAPipeline.process_document`, reached through the tenant component of the application container). It implements the
+upload only: no extraction runs, and `DocumentService.process_document` is deliberately not used. Every choice below is a
+PROVISIONAL assumption, not owner-approved; the relevant M2D and M5 decisions stay **Open**.
+
+- **Contract.** Multipart `file` (required), optional `document_type_hint`, `schema_id`, `callback_url` and the
+  `Idempotency-Key` header. Success is `202` with `{"document_id": ...}` and NOTHING else: no `status` and no `result` are
+  added (the PRD names only `document_id`). `Cache-Control: private, no-store` is set. The document's state is read through
+  API-002.
+- **What Module A does (reused, not reimplemented).** Validation by magic bytes, size and page limits, SHA-256 hashing, the
+  existing idempotency store and request fingerprint, the malware scan, the document record (`document_record.json`,
+  `processing` / `queued`), page rendering at 200 DPI, preprocessing and the handoff payload. A document uploaded here is
+  served by API-002, API-003 and API-015 (covered by tests).
+- **Errors (fixed text, empty `details`).** Module A reports most problems INSIDE the returned payload, not by raising; both
+  that path and a raised exception go through one mapping: unsupported, spoofed, empty, corrupt or password-protected file `400 UNSUPPORTED_FILE`
+  ("This file type isn't supported."); byte limit or page limit exceeded `413 FILE_TOO_LARGE` (Module A reports both as
+  `UNSUPPORTED_FILE`; they are told apart by its reason code); malware `400 MALWARE_DETECTED` ("This file was blocked by the
+  safety scan."); scanner not operational or failing `503 SCANNER_UNAVAILABLE` (fails closed; the default scanner is the
+  non-operational `UnconfiguredScanner`); a reused idempotency key with a different request `409 IDEMPOTENCY_KEY_CONFLICT`
+  (the existing code; the PRD name `IDEMPOTENCY_CONFLICT` is M5-D01); anything else a generic `500 INTERNAL_ERROR`. Nothing
+  Module A puts in an error (the filename, a header dump, a threat name, a scanner name, a path, the idempotency key, an
+  exception text) is forwarded.
+- **Request-size guard.** A pure ASGI middleware (`UploadSizeLimitMiddleware`), scoped to `POST` on exactly this path, in front of
+  the multipart parser, which Starlette would otherwise let spool the whole body first. A declared `Content-Length` above the
+  limit is refused without reading any body byte; `Content-Length` is never trusted alone: the bytes that actually arrive are
+  counted, so a chunked request or one that understates its length is cut off once the running total exceeds the limit (at most
+  one more chunk is read). Nothing is buffered by the guard. The answer is the sanitized `413 FILE_TOO_LARGE` with the request
+  id and `Connection: close`. The guard recognises the route through its own root-path-aware path helper
+  (`route_path_of`, a copy of `starlette.routing.get_route_path`, which only exists from Starlette 0.35), so it works at the
+  declared floor `starlette>=0.27.0` and keeps matching when a server such as uvicorn is started with a `root_path`
+  (`/svc/api/v1/documents` is still the upload route); the dependency floor was not changed. The limit is the configured maximum file size plus 1 MiB of multipart headroom
+  (`UPLOAD_MULTIPART_OVERHEAD_BYTES`, a placeholder, not a PRD figure); the per-file limit itself is still enforced by Module A,
+  so a file between the two numbers is also a `413`, decided by Module A after it was received.
+- **Limitation: the body is parsed before authentication.** The framework parses the multipart body before it evaluates the
+  route dependencies, so an unauthenticated or under-scoped caller still makes the server parse and spool a body of up to the
+  limit before the `401` or `403` (a pinned test records this). The size limit, the body timeouts and the admission limit
+  (below) bound it; general rate limiting (API-012) does not exist yet. Admission and the timeouts apply BEFORE authentication,
+  so they also bound anonymous callers: a silent connection can hold a permit only until the body timeout (below), but
+  anyone who can reach the path can still occupy all permits for that long. A gateway with its own body timeouts, rate limits
+  and authentication in front of the API is still expected.
+- **Authentication and tenant.** The tenant comes only from the authenticated principal. The provisional scope
+  `documents:write` is required (M2D-D04, Open); a read-only token gets `403`. A tenant identifier in a form field or in the
+  query string is refused with a `422` (never accepted, never silently ignored); a tenant HEADER is not an input and is ignored.
+  The upload accepts no query parameters, exactly the four documented form fields and exactly one `file` part; anything else is
+  a `422` that reflects nothing the client sent.
+- **Idempotency (the existing mechanism).** With an `Idempotency-Key`, the same key with the same file and filename
+  returns the same `document_id`; the same key with a different file or filename is `409`; keys are scoped per tenant.
+  A key is 1 to 255 visible ASCII characters (no spaces), otherwise `422`. Without a key, the same file uploaded
+  twice is two documents. Within ONE worker process, concurrent identical requests produce one document, because Module A
+  runs under a process-wide lock (below) and the second request then replays the finished handoff. This is a single-process
+  guarantee only: see the hard deployment prerequisite below for what happens with several processes.
+- **Idempotency record retention and privacy (F10).** Two different things must not be confused. (1) EXPIRY METADATA: the
+  idempotency artifact (`<tenant>/idempotency/<sha256 of the key>.json`) carries `created_at_utc` and an `expires_at_utc` 24
+  hours later, and an expired record is ignored (a retry then creates a new document and overwrites it). (2) PHYSICAL
+  RETENTION: nothing deletes it. `LocalIdempotencyStore.cleanup_expired_record` exists but has no caller anywhere in the
+  code, so there is NO automatic 24-hour deletion: the artifact, which holds the RAW idempotency key and the client's
+  claimed filename (in its stored response), stays on disk until it is removed by hand or overwritten by a later request
+  with the same key. The claimed filename and the raw key are also persisted in the document's `document_record.json`, which
+  lives as long as the document does: that file, not the idempotency artifact, is the longer-lived filename store. API-002 and
+  API-015 show the filename (provisionally, as before) and never the key; the 202 response, its headers and the logs
+  contain neither. The storage format is unchanged here; deletion and masking are an open storage privacy consideration for
+  Team Member 3 and the PRD owner (SEC-007).
+- **`document_type_hint`, `schema_id` and `callback_url` are rejected (F5).** Supplying any of them, even empty, is a `422`
+  (`unsupported_parameter`). `document_type_hint` is rejected because it is not persisted and cannot be consumed downstream
+  without background extraction; `schema_id` and `callback_url` have no registry or egress control behind them yet. All three are
+  declared on the route so they appear in the OpenAPI contract, and are refused by presence before processing. Duplicate form
+  fields of any kind are also rejected with `422` (`duplicate_parameter`).
+- **Synchronous, no queue.** Page rendering and preprocessing run inside the request (in the threadpool). Nothing continues in
+  the background and no async job queue exists, so an uploaded document stays `processing` indefinitely (the stored status is
+  not authoritative, see the API-002 section). The PDF renderer is not known to be thread-safe, so a process-wide lock runs one
+  Module A execution at a time; throughput is limited to that until a worker exists, and the lock is single-process only.
+- **Concurrent upload admission control (F3, N1).** `UploadSizeLimitMiddleware` enforces process-local, nonblocking admission
+  control (default max 2 concurrent uploads, configurable via `DOC_API_MAX_CONCURRENT_UPLOADS` / `max_concurrent_uploads`).
+  When capacity is exceeded, it immediately rejects incoming uploads with HTTP 429 `RATE_LIMITED` ("Too many concurrent uploads. Try again shortly.")
+  with `Retry-After: 5` and `Connection: close` before reading request bodies or consuming worker threads from FastAPI's shared
+  threadpool, preventing threadpool starvation for read endpoints like `GET /documents`. Nothing is queued. The blocking
+  lock around the counter is held only for the synchronous check-and-increment and the decrement and never across an
+  `await`: holding it while a response was sent let a second over-capacity request block the event-loop thread and freeze the
+  whole server (found in review, fixed, regression-tested on one shared event loop). The permit is returned in a `finally`:
+  success, an exception, a disconnect, a timeout and a cancellation all release it. The limit is per process.
+- **Upload body timeouts (N3).** An admitted request must keep delivering body bytes and finish the body in time, or it is
+  answered with a sanitized `408 REQUEST_TIMEOUT` ("The upload was not received in time.", request id, `Connection: close`)
+  and its permit is released; the application then sees a disconnected client, so it can neither finish parsing an incomplete
+  body nor reach Module A. Idle timeout (`DOC_API_UPLOAD_BODY_IDLE_TIMEOUT_SECONDS`, default 30): the longest pause without
+  body bytes; it resets only when bytes actually arrive (empty frames do not count). Total timeout
+  (`DOC_API_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS`, default 300, never below the idle timeout): the whole body, from admission to
+  the last byte; at the default 50 MiB limit that is an average of about 170 KiB/s. Both defaults are PROVISIONAL, not PRD
+  figures, and both are validated: finite, greater than zero, idle at most 300 s, total at most 3,600 s, total not below
+  idle (`inf`, `nan`, `1e308`, zero, negative and out-of-range values are refused at startup, from the environment as well as
+  in code). Time after the body is complete (Module A) is not counted. Slow uploads over a connection slower than the total
+  timeout allows are refused by design.
+  How the idle timer is measured: it is the interval between received body-progress events, that is, from the moment a
+  chunk with body bytes was received to the moment the application asks for the next one. That interval therefore includes
+  any SERVER-SIDE work done between two receive calls (multipart parsing, spooling a chunk to a temporary file). An
+  unusually slow server-side stall between chunks (for example a very slow disk) can therefore produce a `408` even though
+  the client is still connected and sending. The three clocks stay distinct: the body idle timeout (no body progress), the
+  total body-receive timeout (admission to the last body byte) and Module A processing time, which starts after the body is
+  complete and is included in neither.
+- **Hard deployment prerequisite: ONE worker process and ONE application instance per shared storage/idempotency namespace
+  (F4).** API-001 is supported only in that shape. `LocalIdempotencyStore`'s per-key locks, `_MODULE_A_EXECUTION_LOCK` and the
+  admission counter are process-local thread synchronization: they give NO cross-process atomicity. With several worker
+  processes (for example `uvicorn --workers N`) or several replicas sharing the same storage directory, concurrent identical
+  requests with the same `Idempotency-Key` can each pass the idempotency check before either has written its record, and
+  create DUPLICATE documents (measured in review: two processes, same key and file, started together, produced two documents
+  in every trial); the admission limit also multiplies by the number of processes. Multi-worker and multi-replica
+  deployment is therefore PROHIBITED until Team Member 3 supplies cross-process locking or atomic idempotency-store
+  operations. This is not solved here and no distributed locking was added.
+- **Renderer rollback, postconditions and idempotency cleanup (F1, F6).** When PDF rendering fails on any page,
+  `PdfRenderer.render_pdf` triggers rollback by deleting the document directory (`storage.cleanup_document(document_id)`),
+  removing `document_record.json`. Such a rolled-back upload is never accepted. To prevent orphaned idempotency records from
+  serving a non-existent document on retry, `pipeline.py` and `ingestion.py` detect when a document record is absent and
+  invalidate/delete the orphaned idempotency record under key lock. Furthermore, `DocumentUploadService.upload()` verifies as a
+  strict postcondition that `document_record.json` exists for the authenticated tenant before returning HTTP 202, failing closed
+  with a sanitized 500 otherwise. The renderer's rollback covers only a failure while rendering a page of a PDF.
+- **Late client rejection is rolled back and the rollback is verified (N4, R1).** Module A can only discover some
+  unsupported files after it saved the document record: a PDF with a valid header and a corrupt body that the renderer cannot
+  open (`UNSUPPORTED_FILE`), or a password-protected PDF (`DOCUMENT_ENCRYPTED`, R2). Both are answered `400 UNSUPPORTED_FILE`
+  with the same fixed text. PROVISIONAL reading of the PRD, not owner-approved: FR-ING-002 lists magic bytes, size and page
+  limit and does not name passwords, but the PRD error table answers an "unsupported or unsafe file" with `400
+  UNSUPPORTED_FILE`, and a file the client protected is the client's problem, not a server fault; the PRD names no separate
+  code (M5-D05 and the error-code decision stay Open). For such a rejection `DocumentUploadService` removes what that one
+  request stored and CONFIRMS the removal before it answers:
+  1. It calls the storage backend's `cleanup_document` for exactly that document, but never trusts it (the local backend
+     swallows errors). The document counts as removed only when its record is absent, it has no page artifacts and its
+     tenant-relative directory no longer exists. A cleanup that raises is handled the same way.
+  2. Only then is the idempotency record removed, under its key lock, and only if it names the same document id AND carries
+     the fingerprint of this request (file hash and filename); its removal is verified too. Another request's record (for
+     example a successful upload with the same key) is never touched. Nothing happens when this tenant has no record of that
+     document id (rejections decided earlier, another tenant's id).
+  3. If the document cannot be confirmed removed, the idempotency record is deliberately left in place, and if only the
+     idempotency removal fails the document is already gone. In both cases the answer is a sanitized generic `500`
+     (`INTERNAL_ERROR`), NOT the `400`: the 400 would claim that nothing is stored. One log line is written with a constant
+     message, a fixed reason (`late_rejection_rollback_incomplete` or `late_rejection_idempotency_cleanup_incomplete`), the
+     request id and the document id, and never a filename, file content, exception text or the idempotency key. (The generic
+     500 handler also logs its own existing line with the same reason.)
+  4. Recovery: after an incomplete rollback the leftover is a visible `processing` document (and its idempotency record). A
+     retry with the same key and file re-processes it, is rejected again and retries the rollback. If only an orphaned
+     idempotency record remains (its document no longer exists), Module A discards it on ANY retry with that key, whatever the
+     file (R3: the orphan check now runs before the fingerprint comparison, under the key lock, so a stale record can no
+     longer answer `409`; a record whose document still exists keeps replaying or answering `409` as before, and is never
+     deleted). A same-key retry after a verified rollback is a fresh ingestion, and the key can be reused with a different,
+     valid file.
+  The upload service itself is API-specific and uses the existing Module A pipeline unchanged as a client. The rollback
+  described here (R1) lives only in that service. The F1 renderer-rollback idempotency cleanup (`pipeline.py`) and the R3
+  orphan-idempotency ordering (`ingestion.py`) are different: they are changes to shared Module A code and therefore also
+  apply to its other callers (for example `DocumentProcessingService`).
+- **Operational post-save failures are NOT rolled back (HTTP 500).** A failure after the record was saved that is not a
+  client rejection (preprocessing, saving the original document or the handoff, an image that passes the structure check but
+  cannot be decoded, an unexpected exception) is answered with a generic `500`, but the record,
+  the already stored files and the idempotency record may remain: such a document stays visible through API-002 and API-015
+  as `processing` and is never completed. A retry with the same key reuses it. These leftovers are a known limitation, not a
+  guarantee; only a failure while rendering a page of a PDF is rolled back (renderer rollback above).
+- **Rejected uploads are not persisted** (M5-D05): see that decision. A `400`/`413` for an unsupported or password-protected
+  file, a `400` for malware and a `503` for a scanner failure mean that nothing is stored: an unsupported file discovered late
+  is rolled back and the removal is verified as above, and when the removal cannot be verified the answer is a `500`, never
+  a `400`. A `500` may therefore leave a `processing` record (operational failure, or an incomplete rollback).
+- **Not implemented here.** General rate limiting (API-012), audit logging of uploads (the only audit sink is best-effort,
+  M5-D15), webhook callbacks, extraction (API-004), a cross-process lock and an automatic purge of expired idempotency artifacts.
+- **Logging.** The Module A request log no longer carries the client's filename (`ingestion.py`, `ingest_document`), and the
+  route logs nothing; the upload service logs only the one fixed-reason line of an incomplete late-rejection rollback (see
+  N4). Observed and NOT changed: Module A's failure paths still log raw exception text
+  (`pipeline.py` "Document processing pipeline failed", the renderer's per-page failure and the preprocessor's failure), which
+  can contain paths; they are outside this change and remain part of the open F6 audit. A web server's own access log of the
+  request is outside this code.
+- **Linux.** Filesystem behavior was verified on macOS only.

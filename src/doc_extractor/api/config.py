@@ -27,8 +27,15 @@ ENV_VARIABLES: Dict[str, str] = {
     "DOC_API_ALLOW_CLIENT_REQUEST_ID": "allow_client_request_id",
     "DOC_API_LOG_LEVEL": "log_level",
     "DOC_API_STORAGE_BASE_DIR": "storage_base_dir",
+    "DOC_API_MAX_CONCURRENT_UPLOADS": "max_concurrent_uploads",
+    "DOC_API_UPLOAD_BODY_IDLE_TIMEOUT_SECONDS": "upload_body_idle_timeout_seconds",
+    "DOC_API_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS": "upload_body_total_timeout_seconds",
 }
 _LIST_FIELDS = frozenset({"cors_origins"})
+# Upper bounds of the upload body timeouts (seconds). A timeout that is infinite or absurdly long would let one silent
+# client hold an upload admission permit indefinitely, which is what the timeouts exist to prevent.
+MAX_UPLOAD_BODY_IDLE_TIMEOUT_SECONDS = 300.0
+MAX_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS = 3600.0
 ENV_PREFIX = "DOC_API_"
 ENVIRONMENT_VARIABLE = "DOC_API_ENV"
 ENVIRONMENT_CHOICES = ("development", "staging", "production")
@@ -118,6 +125,34 @@ class ApiSettings(Settings):
             "only; it can never be enabled in production."
         ),
     )
+    max_concurrent_uploads: int = Field(
+        default=2,
+        ge=1,
+        description="Maximum concurrent upload requests admitted before HTTP 429",
+    )
+    upload_body_idle_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=MAX_UPLOAD_BODY_IDLE_TIMEOUT_SECONDS,
+        allow_inf_nan=False,
+        description=(
+            "PROVISIONAL. Longest an upload client may send NO body bytes before the request is answered with HTTP 408 and "
+            "its admission permit is released. Resets only when body bytes actually arrive. Finite, greater than 0 and at "
+            "most 300 seconds. The interval is measured between receive calls, so it can include server-side multipart "
+            "parsing or spooling delays."
+        ),
+    )
+    upload_body_total_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        le=MAX_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS,
+        allow_inf_nan=False,
+        description=(
+            "PROVISIONAL. Longest the complete upload body may take to arrive (from admission until the last body byte); "
+            "HTTP 408 afterwards. Module A processing time is not counted. Finite, greater than 0, at most 3600 seconds and "
+            "not smaller than the idle timeout. The default allows the default 50 MiB limit at about 170 KiB/s on average."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_production_guards(self) -> "ApiSettings":
@@ -131,6 +166,8 @@ class ApiSettings(Settings):
             )
         if self.app_env in ("production", "staging") and "*" in self.cors_origins:
             raise ValueError("Wildcard CORS origin ('*') is strictly prohibited in production and staging environments.")
+        if self.upload_body_total_timeout_seconds < self.upload_body_idle_timeout_seconds:
+            raise ValueError("upload_body_total_timeout_seconds must not be smaller than upload_body_idle_timeout_seconds.")
         if self.docs_enabled is True and self.app_env == "production":
             raise ValueError("Interactive API documentation must not be enabled in production.")
         # Development-only documentation: off in staging and production unless staging opts in explicitly.

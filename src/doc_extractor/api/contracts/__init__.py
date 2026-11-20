@@ -7,7 +7,9 @@ from doc_extractor.api.contracts.documents import (
     DocumentDetailResponse,
     DocumentListResponse,
     DocumentStats,
+    DocumentUploadResponse,
     PagingInfo,
+    SCOPE_DOCUMENTS_WRITE,
     validate_document_id,
 )
 from doc_extractor.api.contracts.errors import ErrorDetail, ErrorEnvelope
@@ -33,6 +35,8 @@ __all__ = [
     "SCOPE_DOCUMENTS_READ",
     "DocumentDetailResponse",
     "DocumentListResponse",
+    "DocumentUploadResponse",
+    "SCOPE_DOCUMENTS_WRITE",
     "DocumentStats",
     "PagingInfo",
     "validate_document_id",

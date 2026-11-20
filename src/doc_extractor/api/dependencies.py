@@ -36,6 +36,7 @@ from doc_extractor.api.ports.repositories import (
 )
 from doc_extractor.api.services.document_read_service import DocumentReadService
 from doc_extractor.api.services.document_service import DocumentService
+from doc_extractor.api.services.document_upload_service import DocumentUploadService
 from doc_extractor.processing_service import DocumentProcessingService
 
 
@@ -290,6 +291,21 @@ def get_document_service(
         document_metadata_repo=doc_repo,
         queue_producer=queue_prod,
         audit_logger=audit_log,
+    )
+
+
+def get_document_upload_service(
+    tenant_context: TenantContext = Depends(get_tenant_context),
+    container: ApplicationContainer = Depends(get_application_container),
+) -> DocumentUploadService:
+    """
+    Dependency injection provider for the tenant-bound API-001 upload service.
+    Wraps the principal's own tenant Module A component (``ModuleAPipeline``) from the application container: the tenant
+    comes only from the authenticated principal (SEC-005), and no second ingestion pipeline is created.
+    """
+    components = container.get_tenant_components(tenant_context.tenant_id)
+    return DocumentUploadService(
+        module_a=components.module_a, tenant_id=tenant_context.tenant_id, storage=components.storage
     )
 
 
