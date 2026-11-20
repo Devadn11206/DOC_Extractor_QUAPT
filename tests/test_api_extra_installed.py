@@ -23,7 +23,7 @@ def _script():
 
 def test_the_check_targets_the_whole_api_extra_and_httpx():
     names = {r.split(">")[0].split("<")[0].split("=")[0].strip().lower() for r in _script().declared_requirements()}
-    assert names == {"fastapi", "starlette", "uvicorn", "python-multipart", "httpx"}
+    assert names == {"fastapi", "starlette", "anyio", "uvicorn", "python-multipart", "httpx"}
 
 
 def test_the_api_extra_is_installed_importable_and_the_app_answers_health():

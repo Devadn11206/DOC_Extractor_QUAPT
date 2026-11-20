@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 IMPORT_NAMES = {
     "fastapi": ["fastapi"],
     "starlette": ["starlette"],
+    "anyio": ["anyio"],
     "uvicorn": ["uvicorn"],
     "python-multipart": ["python_multipart", "multipart"],
     "httpx": ["httpx"],
@@ -80,7 +81,7 @@ def main() -> int:
             print(f"  - {problem}")
         return 1
     versions = ", ".join(f"{Requirement_name}=={metadata.version(Requirement_name)}" for Requirement_name in
-                         ("fastapi", "starlette", "uvicorn", "python-multipart", "httpx"))
+                         ("fastapi", "starlette", "anyio", "uvicorn", "python-multipart", "httpx"))
     print(f"API extra check OK on Python {sys.version.split()[0]}: {versions}")
     return 0
 

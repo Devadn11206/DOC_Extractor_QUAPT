@@ -147,7 +147,7 @@ def test_core_matches_the_reproducible_gpu_baseline():
 
 # -- REST API foundation: a dedicated optional group, nothing added to core ------------------------
 
-API_STACK = {"fastapi", "starlette", "uvicorn", "python-multipart"}
+API_STACK = {"fastapi", "starlette", "anyio", "uvicorn", "python-multipart"}
 
 
 def test_api_stack_is_a_dedicated_optional_extra_and_never_core():

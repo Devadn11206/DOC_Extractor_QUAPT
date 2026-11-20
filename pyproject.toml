@@ -55,6 +55,7 @@ dev = [
 api = [
     "fastapi>=0.100.0,<1.0.0",
     "starlette>=0.27.0",
+    "anyio>=3.4.0",           # imported directly by the upload guard (already required by every supported starlette)
     "uvicorn>=0.22.0,<1.0.0",
     "python-multipart>=0.0.9",
 ]
