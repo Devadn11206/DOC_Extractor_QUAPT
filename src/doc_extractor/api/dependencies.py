@@ -8,6 +8,7 @@ Adheres to:
 - Provider-independent injection of repositories, queue brokers, and audit loggers.
 """
 
+import threading
 from typing import Any, Callable, Optional, Sequence
 from fastapi import Depends, Header, Request
 
@@ -35,6 +36,7 @@ from doc_extractor.api.ports.repositories import (
     WebhookSubscriptionRepository,
 )
 from doc_extractor.api.services.document_read_service import DocumentReadService
+from doc_extractor.api.services.document_extraction_service import ExtractionGate
 from doc_extractor.api.services.document_service import DocumentService
 from doc_extractor.api.services.document_upload_service import DocumentUploadService
 from doc_extractor.processing_service import DocumentProcessingService
@@ -320,3 +322,25 @@ def get_document_read_service(
     Tenant context originates exclusively from authenticated principal (SEC-005).
     """
     return container.get_document_read_service(tenant_context.tenant_id)
+
+
+_EXTRACTION_GATE_LOCK = threading.Lock()
+
+
+def get_extraction_gate(request: Request) -> ExtractionGate:
+    """
+    The process-local admission gate and deadline of API-004, created once per application from its settings.
+    One gate per application instance: its capacity is shared by every tenant (provisional, process-local).
+    """
+    gate = getattr(request.app.state, "extraction_gate", None)
+    if gate is None:
+        with _EXTRACTION_GATE_LOCK:
+            gate = getattr(request.app.state, "extraction_gate", None)
+            if gate is None:
+                settings = request.app.state.settings
+                gate = ExtractionGate(
+                    max_concurrent=settings.max_concurrent_extractions,
+                    timeout_seconds=settings.extract_sync_timeout_seconds,
+                )
+                request.app.state.extraction_gate = gate
+    return gate

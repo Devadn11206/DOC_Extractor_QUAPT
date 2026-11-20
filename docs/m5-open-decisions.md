@@ -156,6 +156,9 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **Options.** A) `504 EXTRACTION_TIMEOUT` [Proposed; not in the PRD], the document continues asynchronously.
 - **Plan's recommendation.** A (needs a PRD addition).
 - **Owner.** PRD owner. **Blocks.** S6. **Status.** Open. **Resolution.** none.
+  - *Provisional implementation assumption (API-004):* `POST /api/v1/documents/{id}/extract-sync` answers a timeout with `504
+    EXTRACTION_TIMEOUT` (the proposed code, not owner-approved). The document does NOT continue asynchronously: the worker
+    thread is not killed and runs to its end, but its result is discarded (nothing is persisted or delivered). The decision stays Open.
 
 ### M5-D11 Review-task states
 
@@ -300,6 +303,7 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 - **Owner.** PRD owner (security), Team Member 2. **Blocks.** S5, S7, S9. **Status.** Open. **Resolution.** none.
   - *Provisional implementation assumption (API-002):* No extracted value or evidence text is returned (`result` is always `null`), so no masking transform is chosen or applied. The client-supplied `filename` is still returned as a plain string because it is an existing field of the sanctioned `DocumentResource`; whether it must be masked is part of this decision and remains unresolved.
   - *Provisional implementation assumption (API-015):* each list row is the same `DocumentResource`, so `GET /api/v1/documents` returns, for every listed document in bulk, the client-supplied `filename`, the `sha256` content hash, the `mime_type` and the `file_size_bytes`, together with the other fields of that row (`document_id`, `status`, `page_count`, `created_at`, `updated_at`, `error_code`, `error_message`). The PRD list screen (SCR-02) does not display filenames or hashes, so this widens the exposure that API-002 introduced for one document at a time. Whether list rows must omit or mask `filename` or any other of these fields is part of this open decision. `q` searches the document ID only, never the filename.
+  - *Provisional implementation assumption (API-004):* `extract-sync` is the first endpoint that returns extraction output. Until a masking policy is approved it redacts EVERY extracted value (`value` is `null`, `value_present` says only whether one was extracted), never returns evidence text (evidence keeps page and bounding box) and omits flag messages. This is a deliberate narrowing of the PRD's "envelope" response, not a masking transform, and not owner-approved. The decision stays Open.
 - **In the code.** `src/schema_lifecycle/metamodel.py`, `src/doc_extractor/api/contracts/records.py`, `src/doc_extractor/api/contracts/documents.py`.
 
 #### M2D-D03 Default page-image representation
@@ -342,6 +346,16 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 - **Owner.** PRD owner. **Blocks.** S5. **Status.** Open. **Resolution.** none.
   - *Provisional implementation assumption (M2D Slice 1):* Missing, out-of-range (`n > page_count`), or not-yet-rendered pages return concealed 404 (`DOCUMENT_NOT_FOUND`, "Document not found.") with empty details to prevent enumeration. Path parameter validation (`n < 1` or non-integer) returns 422 (`VALIDATION_ERROR`).
 - **In the code.** `src/doc_extractor/api/exceptions.py`, `src/doc_extractor/api/services/document_read_service.py`.
+
+#### M2D-D06 Page selection for single-page synchronous extraction
+
+- **Description.** PRD API-004 is "single-page synchronous extraction" (`POST /api/v1/documents/{id}/extract-sync`, "none (single page)" request body) but defines no way to say which page of a multi-page document is meant. Open questions for M2D:
+  - Is the endpoint limited to documents that have exactly one page, or does it need a page selector (path, query or body)?
+  - What is the answer for a document with zero or several pages (`422`, `400`, `409`)?
+- **PRD reference.** API-004, section 18 (endpoint table: request "none (single page)").
+- **Owner.** PRD owner. **Blocks.** S6. **Status.** Open. **Resolution.** none.
+  - *Provisional implementation assumption (API-004):* only a document whose persisted page count is exactly 1 is accepted; zero or several pages are a sanitized `422 VALIDATION_ERROR` (`unsupported_page_count`). No page is chosen silently and no request parameter was invented.
+- **In the code.** `src/doc_extractor/api/routers/documents.py`.
 
 ### M2D Remediation Follow-ups
 
@@ -686,3 +700,63 @@ PROVISIONAL assumption, not owner-approved; the relevant M2D and M5 decisions st
   can contain paths; they are outside this change and remain part of the open F6 audit. A web server's own access log of the
   request is outside this code.
 - **Linux.** Filesystem behavior was verified on macOS only.
+
+### M2D API-004 Provisional Behavior and Limitations
+
+`POST /api/v1/documents/{id}/extract-sync` (API-004) runs the EXISTING single-page pipeline
+(`DocumentService.process_stored_page` -> `DocumentProcessingService.process_stored_page`: stored Module A handoff, Module B,
+routing, Module C canonical assembly) on a document that API-001 stored. Nothing of extraction, routing, normalization or
+validation is reimplemented. Every choice below is a PROVISIONAL assumption, not owner-approved; the decisions named stay **Open**.
+
+- **Request.** No body, no query parameters. `Authorization: Bearer ...` with the provisional scope `documents:write` (M2D-D04,
+  Open; a read-only token gets `403`, no token `401`). The tenant comes only from the principal; the document is read through the
+  tenant-scoped read path, so an unknown, malformed or another tenant's id is the concealed `404 DOCUMENT_NOT_FOUND`.
+- **Single page only (M2D-D06, Open).** The PRD has no page selector, so only a document with exactly one page (its persisted
+  page count) is processed. Zero or several pages: `422 VALIDATION_ERROR` with `type: unsupported_page_count`. No page is chosen
+  silently; no request parameter was invented.
+- **Response `200` (explicit DTO, `ExtractionResponse`).** `document_id`; `document_metadata` (document type, schema id and
+  version, classification confidence, status, page count, category, subtype, language, pages processed); `fields` (per field:
+  `value` always `null`, `value_present`, `confidence`, `confidence_provenance`, `null_reason`, `review_required`, `validation`,
+  `evidence` and `additional_evidence` as page and bounding box only); `flags` (`code` and `fields`); `run` (`run_id`,
+  `prompt_version`, `confidence_calibrated`); `redaction` (states what is redacted, in every response). The internal envelope is
+  never serialized as is, and the redaction touches the response only, not the internal object. Not exposed: extracted values,
+  evidence text, flag messages, provider or model names, fallback reasons and details, routing, grounding, prompts, paths.
+  `Cache-Control: private, no-store`.
+- **Field names and free-text metadata (M1 fix).** In generic or unbound extraction the model chooses the field keys (the
+  prompt asks for the printed label), so a key can be document content. A field name is therefore exposed only when it is a
+  canonical identifier of the schema that is really bound: `document_type` must be a key of `extractor.SCHEMA_MAP` (a schema id
+  that merely exists is not a binding) and the path must belong to that schema's own field set (list positions such as
+  `nominees.0.name` are accepted as positions). Every other field gets a positional public id (`field_1`, `field_2`, in
+  order, never equal to a canonical name) through one mapping that is also applied to `flags[].fields`; a flag reference that
+  cannot be mapped is dropped. `document_category`, `document_subtype` and `language` come from a model and are exposed only
+  when they exactly equal a member of the sets the code already defines (`DocumentCategory`, `UNSTRUCTURED_SUBTYPES`, the
+  `LANGUAGES` codes), otherwise they are `null`. `document_type` and `schema_id` are not altered: in the extraction path
+  `document_type` is `generic` or a `SCHEMA_MAP` key. The `redaction` object states these two rules too.
+- **Open conflict with the PRD (M2D-D02, Open).** The PRD's contract is the full canonical envelope. Returning it would expose
+  extracted values and evidence text (PII) before any masking policy exists, so the response is narrowed instead. This is
+  reported as a conflict, not decided. Nothing is persisted: `GET /documents/{id}` still shows `result: null`.
+- **Deadline.** 30 s (PRD API-004), configurable only downwards (`DOC_API_EXTRACT_SYNC_TIMEOUT_SECONDS`, finite, above 0, at most
+  30). Exceeding it is a sanitized `504 EXTRACTION_TIMEOUT` (the code is proposed, not in the PRD: M5-D10, Open).
+- **Execution, capacity and overload.** The extraction runs in its own daemon worker thread, never on the event loop and not in
+  the shared request threadpool (`ExtractionGate`). At most `DOC_API_MAX_CONCURRENT_EXTRACTIONS` (default 2, 1..64) run at once
+  per process, shared by all tenants. A slot is returned only when the worker has really finished: after a timeout (or a client
+  disconnect) the worker is NOT killed, keeps running and keeps its slot, and its result is discarded. There is no queue: a
+  request that finds no free slot is refused at once with `429 RATE_LIMITED` (`Retry-After: 5`). So abandoned work is bounded by
+  the slot count, but a stuck worker keeps its slot until it ends and can starve the endpoint (there is no way to cancel it).
+  Capacity is process-local: with several worker processes the limit multiplies, which the single-worker deployment prerequisite
+  (see API-001) already excludes.
+- **Errors (fixed text, empty `details`).** Failed or unreadable stored data (`HANDOFF_NOT_FOUND`, `MALFORMED_HANDOFF`,
+  `PAGE_NOT_FOUND`, `STORAGE_ERROR`, `STORAGE_RESOLUTION_FAILED`, `INGESTION_ERROR`), Module B, routing, rotation or canonical
+  assembly failures, and any unexpected exception: generic `500 INTERNAL_ERROR`; the fixed reason (for example
+  `extract_module_b_error`) is logged server-side only. A handoff recorded as rejected: `400 UNSUPPORTED_FILE`. An LLM provider
+  failure: `502 LLM_EXECUTION_FAILED` with fixed text. A cross-tenant signal from the service: concealed `404`. No stack trace,
+  path, exception text, OCR content or document data is returned.
+- **Logging.** The API layer logs only fixed reason codes, the request id and the document id (constant messages), never values,
+  evidence text, filenames or exception texts (a static test pins this). NOT changed and outside this endpoint: the processing
+  service and Module B log their own diagnostics, including raw exception text (they can contain paths or provider messages);
+  this belongs to the open F6 logging audit.
+- **Not implemented.** Page selection, asynchronous continuation of a timed-out extraction, persistence of the result,
+  webhooks, review tasks, an approved masking transform, and any cross-process capacity control.
+- **Test scope.** The tests run the real upload, storage, handoff, `DocumentService` and Module B loading; the routed model
+  extractor, Module C's envelope assembly and (for injected failures) Module B inference are stubbed, because they stand for
+  models. A real model run was not tested. Linux filesystem behavior was verified on macOS only.

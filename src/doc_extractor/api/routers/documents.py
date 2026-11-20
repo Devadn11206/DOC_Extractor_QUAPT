@@ -2,6 +2,7 @@
 Documents REST API Router (Module M5 / Phase 2 Milestone 2D).
 
 Endpoints:
+- POST /documents/{document_id}/extract-sync (API-004, single-page synchronous extraction, redacted response)
 - POST /documents (API-001, upload only: Module A ingestion, rendering and preprocessing; no extraction)
 - GET /documents (API-015, persisted metadata only; see DocumentListResponse for the limitations)
 - GET /documents/{document_id} (API-002, persisted metadata only; see DocumentDetailResponse for the limitations)
@@ -10,6 +11,7 @@ Endpoints:
 
 from typing import Optional
 
+from starlette.concurrency import run_in_threadpool
 from fastapi import APIRouter, Depends, File, Form, Header, Path, Query, Request, Response, UploadFile
 
 from doc_extractor.api.contracts.documents import (
@@ -27,7 +29,15 @@ from doc_extractor.api.contracts.documents import (
     validate_list_date_range,
 )
 from doc_extractor.api.contracts.errors import ErrorEnvelope
-from doc_extractor.api.dependencies import get_document_read_service, get_document_upload_service, require_scopes
+from doc_extractor.api.contracts.extraction import ExtractionResponse
+from doc_extractor.api.exceptions import ApiValidationError
+from doc_extractor.api.dependencies import (
+    get_document_read_service,
+    get_document_service,
+    get_document_upload_service,
+    get_extraction_gate,
+    require_scopes,
+)
 from doc_extractor.api.services.document_listing import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
@@ -36,7 +46,9 @@ from doc_extractor.api.services.document_listing import (
     SortOrder,
     build_document_listing,
 )
+from doc_extractor.api.services.document_extraction_service import ExtractionGate, run_stored_page_extraction
 from doc_extractor.api.services.document_read_service import DocumentReadService
+from doc_extractor.api.services.document_service import DocumentService
 from doc_extractor.api.services.document_upload_service import DocumentUploadService
 from doc_extractor.models import DocumentStatus
 
@@ -276,3 +288,64 @@ def get_document_page(
         media_type=media_type,
         headers=headers,
     )
+
+
+@router.post(
+    "/documents/{document_id}/extract-sync",
+    dependencies=[Depends(require_scopes(SCOPE_DOCUMENTS_WRITE))],
+    response_model=ExtractionResponse,
+    summary="Extract a single-page document synchronously",
+    description=(
+        "Runs the existing single-page extraction pipeline on a stored document of the caller's tenant and returns the "
+        "result within 30 seconds (PRD API-004). PROVISIONAL: requires the provisional scope `documents:write` (M2D-D04, not "
+        "owner-approved). The PRD defines no page selector, so ONLY a document with exactly one page is accepted; a document "
+        "with zero or several pages is a `422` (no page is chosen silently). The response is the canonical envelope's safe "
+        "subset with every extracted VALUE and every evidence TEXT redacted (`value` is `null`, `value_present` says whether "
+        "one was extracted; evidence keeps page and bounding box only; flag messages are omitted) because no masking policy is "
+        "approved yet; the `redaction` object states this in every response. The result is not persisted. A timeout is a "
+        "sanitized `504 EXTRACTION_TIMEOUT` (code proposed): the worker is not killed and keeps its execution slot until it "
+        "really finishes, and when every slot is taken a request is refused at once with `429 RATE_LIMITED` (nothing is queued)."
+    ),
+    responses={
+        401: {"model": ErrorEnvelope, "description": "Authentication required"},
+        403: {"model": ErrorEnvelope, "description": "Insufficient scope (requires documents:write)"},
+        404: {"model": ErrorEnvelope, "description": "Document not found (also another tenant's document)"},
+        422: {"model": ErrorEnvelope, "description": "The document does not have exactly one page"},
+        429: {"model": ErrorEnvelope, "description": "RATE_LIMITED: all extraction slots are busy"},
+        500: {"model": ErrorEnvelope, "description": "Extraction failed (generic; the reason is logged server-side only)"},
+        502: {"model": ErrorEnvelope, "description": "LLM_EXECUTION_FAILED: the extraction provider failed"},
+        504: {"model": ErrorEnvelope, "description": "EXTRACTION_TIMEOUT: no result within the deadline"},
+    },
+)
+async def extract_document_sync(
+    request: Request,
+    response: Response,
+    document_id: str = Path(..., description="Unique document identifier"),
+    read_service: DocumentReadService = Depends(get_document_read_service),
+    document_service: DocumentService = Depends(get_document_service),
+    gate: ExtractionGate = Depends(get_extraction_gate),
+) -> ExtractionResponse:
+    """
+    API-004. Asynchronous only at the edge: the tenant-scoped read and the extraction itself run off the event loop (the
+    extraction in its own bounded worker thread, see ``ExtractionGate``).
+
+    The tenant comes only from the authenticated principal. An unknown, malformed or foreign id is the concealed 404.
+    """
+    request_id = getattr(request.state, "request_id", None)
+    record = await run_in_threadpool(read_service.get_document, document_id)
+    if record.page_count != 1:
+        raise ApiValidationError(
+            message="Request validation failed. Check parameter and body specifications.",
+            details={"validation_errors": [{
+                "location": ["path", "document_id"],
+                "message": "Synchronous extraction needs a document with exactly one page.",
+                "type": "unsupported_page_count",
+            }]},
+        )
+    result = await gate.run(
+        lambda: run_stored_page_extraction(document_service, record.document_id, 1, request_id),
+        request_id=request_id,
+        document_id=record.document_id,
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return result

@@ -191,6 +191,21 @@ class FileTooLargeError(ApiHttpError):
         super().__init__(message=message, code=code, status_code=413, request_id=request_id, details=details)
 
 
+class ExtractionTimeoutError(ApiHttpError):
+    """Raised when synchronous extraction exceeds its deadline (PRD API-004: 30 s). HTTP 504; the code is [Proposed]."""
+
+    status_code = 504
+
+    def __init__(
+        self,
+        message: str = "The extraction did not finish in time.",
+        code: str = "EXTRACTION_TIMEOUT",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, status_code=504, request_id=request_id, details=details)
+
+
 class ApiConflictError(ApiHttpError):
     """
     Raised when a request conflicts with the current state of a resource (HTTP 409, code ``CONFLICT``).
