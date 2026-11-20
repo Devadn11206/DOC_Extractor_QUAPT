@@ -2,7 +2,14 @@
 API Contracts package.
 """
 
-from doc_extractor.api.contracts.documents import SCOPE_DOCUMENTS_READ, DocumentDetailResponse, validate_document_id
+from doc_extractor.api.contracts.documents import (
+    SCOPE_DOCUMENTS_READ,
+    DocumentDetailResponse,
+    DocumentListResponse,
+    DocumentStats,
+    PagingInfo,
+    validate_document_id,
+)
 from doc_extractor.api.contracts.errors import ErrorDetail, ErrorEnvelope
 from doc_extractor.api.contracts.records import (
     ApiKeyCreateRequest,
@@ -25,6 +32,9 @@ __all__ = [
     "ErrorEnvelope",
     "SCOPE_DOCUMENTS_READ",
     "DocumentDetailResponse",
+    "DocumentListResponse",
+    "DocumentStats",
+    "PagingInfo",
     "validate_document_id",
     "ApiKeyCreateRequest",
     "ApiKeyCreationResult",

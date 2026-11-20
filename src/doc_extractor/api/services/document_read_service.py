@@ -1,7 +1,8 @@
 """
 Document Read Service (Module M5 / Phase 2 Milestone 2D).
 
-Provides tenant-bound read primitives for document retrieval (API-003).
+Provides tenant-bound read primitives for document retrieval (API-003), document detail (API-002) and the
+document listing (API-015).
 Strictly isolated by the authenticated principal's tenant identity.
 Does not instantiate extraction pipelines, parsers, or OCR models on read paths.
 
@@ -27,7 +28,7 @@ import logging
 import os
 import stat
 import zlib
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from PIL import Image
 
@@ -45,6 +46,7 @@ from doc_extractor.exceptions import (
 from doc_extractor.handoff import ModuleAHandoffPayload
 from doc_extractor.models import DocumentRecord
 from doc_extractor.storage import LocalDiskStorage
+from doc_extractor.tenancy import IDENTITY_MARKER
 
 logger = logging.getLogger("doc_extractor.api.read_service")
 
@@ -58,6 +60,41 @@ _PNG_MAX_CHUNK_LENGTH = 0x7FFFFFFF
 # Files Module A writes inside a document directory and that this service reads.
 _HANDOFF_FILE = "module_a_handoff.json"
 _RECORD_FILE = "document_record.json"
+
+# API-015 PROVISIONAL scan ceilings. Every request re-reads every record (there is no index), so these bound the work of
+# one request until a persistence index exists (M5-D18, M2D-D01). Above either one the listing is refused with a typed
+# error; it is NEVER truncated, and no partial list or statistics are produced.
+#
+# Two separate limits, because they bound two different costs:
+# - ``_MAX_LISTED_ENTRIES``: CANDIDATE document directories (names that are valid document ids, excluding the
+#   non-document entries below). Each candidate costs a directory open, a file read and a JSON parse.
+# - ``_MAX_EXAMINED_DIRECTORY_ENTRIES``: ALL directory entries the enumeration looks at, whatever they are (documents,
+#   the identity marker, ``idempotency``, stray files, junk). It bounds the cost of enumerating the directory itself and
+#   is checked while the directory is streamed, so enumeration stops as soon as the limit is exceeded. It must be at
+#   least as large as the candidate limit plus the handful of non-document entries a real tenant directory holds.
+_MAX_LISTED_ENTRIES = 10_000
+_MAX_EXAMINED_DIRECTORY_ENTRIES = 20_000
+
+_LIMIT_REASON_CANDIDATES = "document_listing_limit_exceeded"
+_LIMIT_REASON_ENTRIES = "directory_entry_limit_exceeded"
+
+# Entries of a tenant directory that are not documents: the identity marker and the idempotency store.
+_NON_DOCUMENT_ENTRIES = frozenset({IDENTITY_MARKER, "idempotency"})
+
+
+class DocumentListingLimitExceededError(StorageError):
+    """
+    The tenant directory exceeds a provisional scan ceiling (generic 500). ``details["reason"]`` is the fixed
+    ``document_listing_limit_exceeded`` (too many candidate document directories, the default) or
+    ``directory_entry_limit_exceeded`` (too many directory entries of any kind).
+    """
+
+    def __init__(self, reason: str = _LIMIT_REASON_CANDIDATES) -> None:
+        super().__init__(
+            message="Document listing exceeds the provisional scan ceiling.",
+            code="DOCUMENT_LISTING_LIMIT_EXCEEDED",
+            details={"reason": reason},
+        )
 
 # Open flags the descriptor-relative walk cannot do without. There is deliberately no silent ``getattr(..., 0)``
 # fallback: a platform that lacks one of them refuses to serve files at all.
@@ -155,6 +192,21 @@ def _read_regular_text_file(name: str, dir_fd: int, symlink_reason: str, unreada
         raise StorageError("Failed to read stored file.", details={"reason": unreadable_reason}) from exc
 
 
+def _decode_record_object(record_text: str) -> dict:
+    """Parse the text of a ``document_record.json`` into a ``dict``; anything else is a typed fault with a fixed reason."""
+    try:
+        stored = json.loads(record_text)
+    except Exception as exc:
+        logger.error("Record parse failed (reason=record_json_decode_error, error_type=%s)", type(exc).__name__)
+        raise StorageError(
+            "Failed to read document record.", details={"reason": "record_json_decode_error"}
+        ) from exc
+    if not isinstance(stored, dict):
+        logger.error("Record parse failed (reason=record_not_an_object)")
+        raise StorageError("Failed to read document record.", details={"reason": "record_not_an_object"})
+    return stored
+
+
 def _close_owned_descriptors(fds: Iterable[Optional[int]], *, strict: bool) -> None:
     """
     Close every descriptor the service STILL owns (``None`` means it was never opened or its ownership moved to a
@@ -241,18 +293,17 @@ class DocumentReadService:
         self.storage = storage
         self.tenant_id = tenant_id
 
-    def _open_document_directory(self, safe_doc_id: str) -> Tuple[int, int, int]:
+    def _open_tenant_directory(self) -> Tuple[int, int]:
         """
-        Shared descriptor-relative walk for every read: the configured storage root, then the principal's tenant
-        directory, then the document directory, each opened relative to its parent's descriptor with ``O_NOFOLLOW``
-        (and ``O_DIRECTORY``). Nothing is ever created: a tenant or document that does not exist is the concealed 404.
+        Descriptor-relative walk to the principal's tenant directory: the configured storage root, then the tenant
+        directory opened relative to it with ``O_NOFOLLOW | O_DIRECTORY``. Nothing is ever created: a missing storage
+        root or tenant directory raises ``TenantResourceNotFoundError``.
 
-        Returns ``(base_dir_fd, tenant_fd, doc_fd)``; the caller owns all three and must close them. If the walk fails
-        part-way, whatever it had opened is closed here before the error propagates, so nothing leaks.
+        Returns ``(base_dir_fd, tenant_fd)``; the caller owns both. If the walk fails part-way, whatever it had opened
+        is closed here before the error propagates, so nothing leaks.
         """
         base_dir_fd: Optional[int] = None
         tenant_fd: Optional[int] = None
-        doc_fd: Optional[int] = None
         try:
             try:
                 base_dir_fd = os.open(str(self.storage.base_dir), os.O_RDONLY | os.O_DIRECTORY)
@@ -266,6 +317,23 @@ class DocumentReadService:
 
             tenant_name = self.storage._tenant_dir(create=False).name
             tenant_fd = _open_directory_nofollow(tenant_name, base_dir_fd, "tenant_directory_is_a_symlink")
+        except BaseException:
+            _close_owned_descriptors((tenant_fd, base_dir_fd), strict=False)
+            raise
+        return base_dir_fd, tenant_fd
+
+    def _open_document_directory(self, safe_doc_id: str) -> Tuple[int, int, int]:
+        """
+        Shared descriptor-relative walk for every single-document read: the tenant directory (see
+        ``_open_tenant_directory``), then the document directory opened relative to it with ``O_NOFOLLOW`` (and
+        ``O_DIRECTORY``). A tenant or document that does not exist is the concealed 404.
+
+        Returns ``(base_dir_fd, tenant_fd, doc_fd)``; the caller owns all three and must close them. If the walk fails
+        part-way, whatever it had opened is closed here before the error propagates, so nothing leaks.
+        """
+        base_dir_fd, tenant_fd = self._open_tenant_directory()
+        doc_fd: Optional[int] = None
+        try:
             doc_fd = _open_directory_nofollow(safe_doc_id, tenant_fd, "document_directory_is_a_symlink")
         except BaseException:
             _close_owned_descriptors((doc_fd, tenant_fd, base_dir_fd), strict=False)
@@ -299,16 +367,7 @@ class DocumentReadService:
             raise
         _close_owned_descriptors((doc_fd, tenant_fd, base_dir_fd), strict=True)
 
-        try:
-            stored = json.loads(record_text)
-        except Exception as exc:
-            logger.error("Record parse failed (reason=record_json_decode_error, error_type=%s)", type(exc).__name__)
-            raise StorageError(
-                "Failed to read document record.", details={"reason": "record_json_decode_error"}
-            ) from exc
-        if not isinstance(stored, dict):
-            logger.error("Record parse failed (reason=record_not_an_object)")
-            raise StorageError("Failed to read document record.", details={"reason": "record_not_an_object"})
+        stored = _decode_record_object(record_text)
 
         # Identity first, on the raw values: another tenant's or another document's record is simply "not found".
         if stored.get("tenant_id") != self.tenant_id:
@@ -318,6 +377,105 @@ class DocumentReadService:
             logger.warning("Document ID mismatch rejected (reason=record_doc_id_mismatch)")
             raise TenantResourceNotFoundError()
 
+        return document_record_from_stored(stored)
+
+    def list_documents(self) -> List[DocumentRecord]:
+        """
+        Every valid persisted ``DocumentRecord`` of this service's tenant, in ascending directory-name order (API-015).
+        The caller filters, sorts and paginates (``document_listing``); nothing is truncated here.
+
+        - Only the principal's own tenant directory is enumerated, through the same descriptor-relative walk as the
+          single-document reads (``O_NOFOLLOW`` per component, ``O_NONBLOCK`` leaf, ``fstat`` regular-file check,
+          ownership transfer through ``os.fdopen``). Nothing is created: a missing storage root or tenant directory is
+          an empty list.
+        - Skipped silently, not counted: the identity marker, the ``idempotency`` directory, names that are not valid
+          document ids, and document directories without a ``document_record.json`` (the single read answers 404 for
+          those too).
+        - Fail closed, as a generic 500 with a fixed reason: a symlinked, non-directory or special entry that looks like
+          a document, an unreadable, non-JSON, non-object or invalid record, a record that claims another tenant or
+          another document id, a tenant with more candidate entries than ``_MAX_LISTED_ENTRIES`` and a directory with
+          more entries of any kind than ``_MAX_EXAMINED_DIRECTORY_ENTRIES``. A record is never skipped quietly, because
+          that would silently shrink every total.
+        - So the listed ids are exactly the ids for which ``get_document`` succeeds.
+        """
+        _require_platform_support()
+        try:
+            base_dir_fd, tenant_fd = self._open_tenant_directory()
+        except TenantResourceNotFoundError:
+            return []
+
+        records: List[DocumentRecord] = []
+        try:
+            for name in self._candidate_document_names(tenant_fd):
+                record = self._read_listed_record(name, tenant_fd)
+                if record is not None:
+                    records.append(record)
+        except BaseException:
+            _close_owned_descriptors((tenant_fd, base_dir_fd), strict=False)
+            raise
+        _close_owned_descriptors((tenant_fd, base_dir_fd), strict=True)
+        return records
+
+    @staticmethod
+    def _candidate_document_names(tenant_fd: int) -> List[str]:
+        """
+        Sorted names of the tenant directory entries that could be documents.
+
+        The directory is STREAMED (``os.scandir`` is an iterator; the listing is never materialized) and two ceilings are
+        enforced while it is read: no more than ``_MAX_EXAMINED_DIRECTORY_ENTRIES`` entries of any kind, and no more than
+        ``_MAX_LISTED_ENTRIES`` candidates. Exceeding either stops the enumeration at once with the typed error, so a
+        directory with a huge number of unrelated entries cannot cost unbounded time or memory, and nothing partial is
+        ever returned. Only candidate names are kept.
+        """
+        names: List[str] = []
+        examined = 0
+        try:
+            with os.scandir(tenant_fd) as entries:
+                for entry in entries:
+                    examined += 1
+                    if examined > _MAX_EXAMINED_DIRECTORY_ENTRIES:
+                        logger.error("Document listing refused (reason=directory_entry_limit_exceeded)")
+                        raise DocumentListingLimitExceededError(_LIMIT_REASON_ENTRIES)
+                    name = entry.name
+                    if name in _NON_DOCUMENT_ENTRIES:
+                        continue
+                    try:
+                        validate_document_id(name)
+                    except TenantResourceNotFoundError:
+                        continue
+                    names.append(name)
+                    if len(names) > _MAX_LISTED_ENTRIES:
+                        logger.error("Document listing refused (reason=document_listing_limit_exceeded)")
+                        raise DocumentListingLimitExceededError()
+        except OSError as exc:
+            logger.error("Tenant directory listing failed (reason=directory_listing_failed, errno=%s)", exc.errno)
+            raise StorageError(
+                "Failed to list tenant storage.", details={"reason": "directory_listing_failed"}
+            ) from exc
+        names.sort()
+        return names
+
+    def _read_listed_record(self, name: str, tenant_fd: int) -> Optional[DocumentRecord]:
+        """The validated record of candidate directory ``name``, or ``None`` when it has no record (not a document)."""
+        doc_fd: Optional[int] = None
+        try:
+            doc_fd = _open_directory_nofollow(name, tenant_fd, "document_directory_is_a_symlink")
+            record_text = _read_regular_text_file(_RECORD_FILE, doc_fd, "record_file_is_symlink", "record_unreadable")
+        except TenantResourceNotFoundError:          # the directory vanished, or it holds no record
+            _close_owned_descriptors((doc_fd,), strict=False)
+            return None
+        except BaseException:
+            _close_owned_descriptors((doc_fd,), strict=False)
+            raise
+        _close_owned_descriptors((doc_fd,), strict=True)
+
+        stored = _decode_record_object(record_text)
+        if stored.get("tenant_id") != self.tenant_id:
+            logger.warning("Listed record refused (reason=record_tenant_mismatch)")
+            raise TenantStorageIsolationError("record_tenant_mismatch")
+        if stored.get("document_id") != name:
+            logger.warning("Listed record refused (reason=record_doc_id_mismatch)")
+            raise TenantStorageIsolationError("record_doc_id_mismatch")
         return document_record_from_stored(stored)
 
     def get_page_image(self, document_id: str, page_number: int) -> Tuple[bytes, str]:

@@ -6,17 +6,19 @@ Defines:
 - Path-safe document ID validation rules compliant with PRD SEC-006.
 - The public response DTO of API-002 (``DocumentDetailResponse``), the validated conversion from the persisted Module A
   record dictionary to ``DocumentRecord``, and the allow-list that decides which error text may be shown to a caller.
+- The public response DTOs of API-015 (``DocumentListResponse`` with its statistics and paging models) and the
+  validation of the list query parameters.
 """
 
 import re
 from dataclasses import replace
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from datetime import date, datetime, time, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from doc_extractor.api.contracts.records import DocumentResource
-from doc_extractor.api.exceptions import GENERIC_INTERNAL_MESSAGE, TenantResourceNotFoundError
+from doc_extractor.api.exceptions import GENERIC_INTERNAL_MESSAGE, ApiValidationError, TenantResourceNotFoundError
 from doc_extractor.exceptions import StorageError
 from doc_extractor.models import DocumentRecord, DocumentStatus, IngestionState
 
@@ -97,6 +99,19 @@ def _required_timestamp(data: Dict[str, Any], key: str) -> str:
     except ValidationError:
         raise _record_fault("record_timestamp_invalid") from None
     return value
+
+
+def parse_stored_timestamp(value: str) -> datetime:
+    """
+    The instant of a persisted timestamp, parsed with the SAME validator the converter and the DTO use. A naive value
+    (no offset) is read as UTC, so naive and aware timestamps can always be compared. A value that the converter
+    already accepted cannot fail here; a failure is the fixed ``record_timestamp_invalid`` fault.
+    """
+    try:
+        parsed = _TIMESTAMP_ADAPTER.validate_python(value)
+    except ValidationError:
+        raise _record_fault("record_timestamp_invalid") from None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _validated_stored_error(error: Any) -> Optional[Dict[str, Any]]:
@@ -242,6 +257,23 @@ def public_error(error: Any) -> Tuple[Optional[str], Optional[str]]:
 # API-002 response DTO
 # ---------------------------------------------------------------------------------------------------------------------
 
+def public_document_resource(record: DocumentRecord) -> DocumentResource:
+    """
+    The public row for one validated ``DocumentRecord``: the sanctioned ``DocumentResource`` fields with the error text
+    taken from the allow-list ONLY. Shared by API-002 and API-015, so no endpoint can expose a stored error message.
+    """
+    # The stored error is replaced BEFORE any DTO sees it: raw stored code, message, request id and details never
+    # enter a model, so they can neither be exposed nor make an otherwise valid record fail validation.
+    error_code, error_message = public_error(record.error)
+    sanitized = replace(
+        record, error={"code": error_code, "message": error_message} if error_code is not None else None
+    )
+    try:
+        return DocumentResource.from_record(sanitized)
+    except ValidationError as exc:
+        raise _record_fault("record_field_type_invalid") from exc
+
+
 class DocumentDetailResponse(DocumentResource):
     """
     API-002 response: the persisted metadata of one document (the sanctioned ``DocumentResource`` fields) plus the
@@ -266,13 +298,160 @@ class DocumentDetailResponse(DocumentResource):
     @classmethod
     def from_record(cls, record: DocumentRecord) -> "DocumentDetailResponse":
         """Map a validated ``DocumentRecord`` to the public response (error text from the allow-list only)."""
-        # The stored error is replaced BEFORE any DTO sees it: raw stored code, message, request id and details never
-        # enter a model, so they can neither be exposed nor make an otherwise valid record fail validation.
-        error_code, error_message = public_error(record.error)
-        sanitized = replace(
-            record, error={"code": error_code, "message": error_message} if error_code is not None else None
-        )
         try:
-            return cls(**DocumentResource.from_record(sanitized).model_dump(), result=None)
+            return cls(**public_document_resource(record).model_dump(), result=None)
         except ValidationError as exc:
             raise _record_fault("record_field_type_invalid") from exc
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# API-015 response DTOs and list query validation (PROVISIONAL, see docs/m5-open-decisions.md M5-D06)
+# ---------------------------------------------------------------------------------------------------------------------
+
+class DocumentStats(BaseModel):
+    """
+    The five PRD API-015 statistics keys, counted over the WHOLE valid tenant record set, ignoring every filter.
+
+    PERSISTED-STATUS statistics only: each key counts records whose stored ``status`` equals it. Module A writes
+    ``processing`` once and no writer persists a terminal status (M2D-D01), so ``needs_review``, ``auto_approved`` and
+    ``failed`` count only what is stored, which today is zero: a zero means "none persisted", not "none exist". The
+    categories need not add up to ``total`` (``reviewed`` and ``rejected`` count only toward ``total``).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    total: int = Field(..., ge=0, description="All valid records of the tenant")
+    processing: int = Field(..., ge=0, description="Records whose persisted status is `processing`")
+    needs_review: int = Field(..., ge=0, description="Records whose persisted status is `needs_review`")
+    auto_approved: int = Field(..., ge=0, description="Records whose persisted status is `auto_approved`")
+    failed: int = Field(..., ge=0, description="Records whose persisted status is `failed`")
+
+
+class PagingInfo(BaseModel):
+    """Pagination metadata of one response. ``total_items`` counts the records that match the filters."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    page: int = Field(..., ge=1, description="The requested 1-based page")
+    size: int = Field(..., ge=1, description="The requested page size")
+    total_items: int = Field(..., ge=0, description="Records matching the filters (all pages)")
+    total_pages: int = Field(..., ge=0, description="ceil(total_items / size); 0 when nothing matches")
+
+
+class DocumentListResponse(BaseModel):
+    """
+    API-015 response (PRD: ``content[]``, ``stats``, ``paging``). PROVISIONAL (M5-D06 is Open): the field names inside
+    ``paging`` and ``stats`` are this implementation's choice.
+
+    Each row is the sanctioned ``DocumentResource``, built through the same error allow-list as API-002, so it carries
+    the same persisted-only metadata (``status`` is non-authoritative, ``filename`` is provisionally exposed under
+    M2D-D02). There is no ``result``, document type or confidence: none is persisted.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    content: List[DocumentResource]
+    stats: DocumentStats
+    paging: PagingInfo
+
+    @classmethod
+    def from_listing(cls, listing: Any) -> "DocumentListResponse":
+        """Map a ``services.document_listing.DocumentListing`` (validated records) to the public response."""
+        try:
+            return cls(
+                content=[public_document_resource(record) for record in listing.records],
+                stats=DocumentStats(**listing.stats),
+                paging=PagingInfo(
+                    page=listing.page,
+                    size=listing.size,
+                    total_items=listing.total_items,
+                    total_pages=listing.total_pages,
+                ),
+            )
+        except ValidationError as exc:
+            raise _record_fault("record_field_type_invalid") from exc
+
+
+# Query values for ``from`` / ``to``: ASCII-only ISO 8601, either a calendar date or a datetime (offset optional). The
+# strict shape keeps the accepted set identical on every supported Python and keeps numeric epoch strings, compact and
+# week dates out. A literal ``+`` in a URL query must be sent as ``%2B``.
+_QUERY_DATE_ONLY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_QUERY_DATETIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]{1,6})?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?"
+)
+
+
+def _list_validation_error_at(location: List[str], message: str, error_type: str) -> ApiValidationError:
+    """A 422 VALIDATION_ERROR in the same ``details`` shape as the framework's own parameter errors (value never echoed)."""
+    return ApiValidationError(
+        message="Request validation failed. Check parameter and body specifications.",
+        details={"validation_errors": [{"location": location, "message": message, "type": error_type}]},
+    )
+
+
+def _list_validation_error(parameter: str, message: str, error_type: str) -> ApiValidationError:
+    return _list_validation_error_at(["query", parameter], message, error_type)
+
+
+def parse_list_date_param(value: str, parameter: str, *, end_of_range: bool) -> datetime:
+    """
+    An inclusive bound of the ``from`` / ``to`` filter, as an aware UTC-comparable instant.
+
+    - A calendar date (``2026-11-19``) means the whole UTC day: as ``from`` its first instant (00:00:00), as ``to`` its
+      LAST instant (23:59:59.999999), so a date-only ``to`` includes the entire day.
+    - A datetime is taken as given and is inclusive; a value without an offset is read as UTC.
+    - Anything else (epoch numbers, compact or week dates, impossible dates, an offset beyond range) is a 422.
+    """
+    invalid = _list_validation_error(parameter, "Must be an ISO 8601 date or datetime.", "invalid_date")
+    if _QUERY_DATE_ONLY.fullmatch(value):
+        try:
+            day = date.fromisoformat(value)
+        except ValueError:
+            raise invalid from None
+        return datetime.combine(day, time.max if end_of_range else time.min, tzinfo=timezone.utc)
+    if _QUERY_DATETIME.fullmatch(value):
+        try:
+            return parse_stored_timestamp(value)
+        except Exception:
+            raise invalid from None
+    raise invalid
+
+
+def validate_list_date_range(created_from: Optional[datetime], created_to: Optional[datetime]) -> None:
+    """``from`` later than ``to`` can never match anything: a 422 instead of a silently empty page."""
+    if created_from is not None and created_to is not None and created_from > created_to:
+        raise _list_validation_error("from", "Must not be later than `to`.", "invalid_range")
+
+
+# Every query parameter name the list route recognizes (the route signature declares exactly these, in their wire
+# spelling). A name outside this set is never silently ignored.
+LIST_QUERY_PARAMETERS = frozenset(
+    {"page", "size", "status", "from", "to", "q", "sort", "order", "documentType", "confidenceBelow"}
+)
+_UNKNOWN_PARAMETER_MESSAGE = (
+    "Unknown query parameter. Allowed parameters: page, size, status, from, to, q, sort, order, documentType, "
+    "confidenceBelow."
+)
+
+
+def reject_unknown_list_parameters(names: Iterable[str]) -> None:
+    """
+    A misspelled or invented query parameter (``stauts``, ``tenant_id``, ``limit``, any case variant) is a 422, never a
+    silently ignored name that would return an unfiltered list that only looks filtered.
+
+    Nothing the client sent is reflected: the error names no offending parameter and carries no value, only the fixed list
+    of allowed names, so attacker-controlled text can reach neither the response nor a log record.
+    """
+    if any(name not in LIST_QUERY_PARAMETERS for name in names):
+        raise _list_validation_error_at(["query"], _UNKNOWN_PARAMETER_MESSAGE, "unknown_parameter")
+
+
+def reject_unsupported_list_filter(parameter: str, value: Optional[str]) -> None:
+    """
+    ``documentType`` and ``confidenceBelow`` are named by the PRD, but neither value is persisted anywhere. Using one
+    is a 422, never a silently ignored filter that would return an unfiltered list that merely looks filtered.
+    """
+    if value is not None:
+        raise _list_validation_error(
+            parameter, "This filter is not supported: the data it needs is not persisted.", "unsupported_filter"
+        )

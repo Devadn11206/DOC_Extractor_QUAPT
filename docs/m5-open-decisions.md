@@ -116,7 +116,8 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **PRD reference.** API-015.
 - **Options.** A) the PRD shape everywhere. **Plan's recommendation.** A (cheapest while no list endpoint exists).
 - **Owner.** PRD owner, backend lead. **Blocks.** S2, S5. **Status.** Open. **Resolution.** none.
-- **In the code.** `list_by_tenant(limit, offset)` and `list_tasks(...)` in `api/ports/repositories.py`.
+  - *Provisional implementation assumption (API-015):* `GET /api/v1/documents` answers the PRD envelope (`content[]`, `stats`, `paging`) with `page` (default 1) and `size` (default 10, provisional maximum 100), and `paging` carries `page`, `size`, `total_items` and `total_pages`. These names, the maximum size and the sort parameters (`sort`, `order`) are this implementation's choice, not owner-approved, and may change when this decision is made. The repository port `list_by_tenant(limit, offset)` is NOT used: it has no adapter, is `async`, returns a bare list and cannot supply totals, statistics, date filters, prefix search or sorting. The details are in "M2D API-015 Provisional Behavior and Limitations" below.
+- **In the code.** `list_by_tenant(limit, offset)` and `list_tasks(...)` in `api/ports/repositories.py`; for API-015: `src/doc_extractor/api/services/document_listing.py`, `src/doc_extractor/api/services/document_read_service.py`, `src/doc_extractor/api/contracts/documents.py`, `src/doc_extractor/api/routers/documents.py`.
 
 ### M5-D07 Audit values versus PII
 
@@ -283,6 +284,7 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 - **PRD reference.** PRD section 6.3 (Canonical Extraction Envelope), PRD section 20 (Data Model); ARC-003.
 - **Owner.** Team Member 2 and Team Member 3. **Blocks.** S4, S5. **Status.** Open. **Resolution.** none.
   - *Provisional implementation assumption (API-002):* Nothing persists a terminal status or an envelope today, so `GET /api/v1/documents/{id}` returns only the persisted Module A `document_record.json` metadata. The stored `status` is returned exactly as persisted and is NOT authoritative (see "M2D API-002 Provisional Behavior and Limitations" below), and `result` is always `null`. This is not a choice among Options A, B or C.
+  - *Provisional implementation assumption (API-015):* `GET /api/v1/documents` lists only the persisted Module A records and counts PERSISTED statuses in `stats`. Because no writer persists a terminal status, `stats.needs_review`, `stats.auto_approved` and `stats.failed` read 0 today; a 0 means "none persisted", not "none exist". Documents rejected before the record is saved are never listed or counted, and a document whose ingestion failed after the record was saved stays listed as `processing`. There is no document type or confidence to filter or sort by. This is not a choice among Options A, B or C.
 - **In the code.** `src/doc_extractor/processing_service.py`, `doc_extractor/contracts_c.py`, `src/doc_extractor/api/services/document_read_service.py`, `src/doc_extractor/api/contracts/documents.py`.
 
 #### M2D-D02 SEC-007 API masking policy
@@ -296,6 +298,7 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 - **PRD reference.** SEC-007, SCH-014, API-017, API-021, PRD section 10.1.
 - **Owner.** PRD owner (security), Team Member 2. **Blocks.** S5, S7, S9. **Status.** Open. **Resolution.** none.
   - *Provisional implementation assumption (API-002):* No extracted value or evidence text is returned (`result` is always `null`), so no masking transform is chosen or applied. The client-supplied `filename` is still returned as a plain string because it is an existing field of the sanctioned `DocumentResource`; whether it must be masked is part of this decision and remains unresolved.
+  - *Provisional implementation assumption (API-015):* each list row is the same `DocumentResource`, so `GET /api/v1/documents` returns, for every listed document in bulk, the client-supplied `filename`, the `sha256` content hash, the `mime_type` and the `file_size_bytes`, together with the other fields of that row (`document_id`, `status`, `page_count`, `created_at`, `updated_at`, `error_code`, `error_message`). The PRD list screen (SCR-02) does not display filenames or hashes, so this widens the exposure that API-002 introduced for one document at a time. Whether list rows must omit or mask `filename` or any other of these fields is part of this open decision. `q` searches the document ID only, never the filename.
 - **In the code.** `src/schema_lifecycle/metamodel.py`, `src/doc_extractor/api/contracts/records.py`, `src/doc_extractor/api/contracts/documents.py`.
 
 #### M2D-D03 Default page-image representation
@@ -322,6 +325,7 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 - **Owner.** PRD owner (security), Team Member 3. **Blocks.** S5. **Status.** Open. **Resolution.** none.
   - *Provisional implementation assumption (M2D Slice 1):* Enforce provisional scope `SCOPE_DOCUMENTS_READ = "documents:read"`. Cross-tenant attempts answer concealed 404 (`DOCUMENT_NOT_FOUND`), whereas principals authenticated within the tenant who lack the scope receive 403 (`FORBIDDEN_SCOPE`).
   - *Provisional implementation assumption (API-002):* `GET /api/v1/documents/{id}` enforces the same provisional `documents:read` scope with the same 404/403 behaviour. Whether document metadata needs a different scope than page images is part of this open decision.
+  - *Provisional implementation assumption (API-015):* `GET /api/v1/documents` enforces the same provisional `documents:read` scope (403 `FORBIDDEN_SCOPE` without it, 401 without authentication). Whether listing needs its own scope is part of this open decision.
 - **In the code.** `src/doc_extractor/api/ports/authentication.py`, `src/doc_extractor/api/contracts/documents.py`, `src/doc_extractor/api/routers/documents.py`.
 
 #### M2D-D05 Missing or not-yet-rendered page error code
@@ -342,7 +346,8 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 - **F5: Bounded or streaming file reads. Status: open follow-up (not implemented).** Bound or stream the reads in `DocumentReadService` so a file cannot load arbitrarily large content into memory. Three reads are affected and none has an explicit byte bound or streaming strategy today:
   - API-003 page-image reads (`get_page_image` reads the whole PNG into memory before validating it);
   - API-002 handoff reads (`module_a_handoff.json`, read in full and parsed by `get_page_image`);
-  - API-002 document-record reads (`document_record.json`, read in full and parsed by `get_document`).
+  - API-002 document-record reads (`document_record.json`, read in full and parsed by `get_document`);
+  - API-015 listing reads (`list_documents` reads and parses the `document_record.json` of EVERY candidate document on every request). The number of candidate directories is bounded by the provisional scan ceiling of 10,000 and the number of directory entries examined by a second ceiling of 20,000, but the SIZE of each record file is not.
 
   These files are written only by Module A, which is why this is deferred, but a very large file would be loaded completely. Bounded or streaming reads remain deferred; no new streaming architecture was introduced.
 - **F6: Sanitized logging with fixed reason codes. Status: resolved for `DocumentReadService` only; the wider audit remains open.**
@@ -405,3 +410,109 @@ below is approved or resolved by this behaviour; M2D-D01, M2D-D02 and M2D-D04 st
   logged server-side. A shut-down container is the typed `503`.
 - **Logging.** The log statements added for API-002 follow the F6 rule (fixed reason codes, exception class names, integer
   `errno`) and are covered by the same static test; the F6 scope statement above is unchanged (`DocumentReadService` only).
+
+### M2D API-015 Provisional Behavior and Limitations
+
+`GET /api/v1/documents` (API-015) implements only the persisted-metadata portion of the PRD contract. Every choice below is a
+PROVISIONAL assumption made so the endpoint can exist before the owner decisions are taken. None of them is owner-approved;
+M5-D06 and M2D-D01, M2D-D02 and M2D-D04 stay **Open**.
+
+- **Source of the data and cost.** The endpoint enumerates the authenticated principal's OWN tenant directory through the
+  same hardened descriptor-relative walk as API-002 and API-003 and reads every `document_record.json` in it
+  (`DocumentReadService.list_documents`). It is a FULL SCAN on every request: there is no index and no persistence adapter,
+  and the repository port `list_by_tenant` is not used. Filtering, sorting, totals and statistics are computed in memory by
+  the pure `document_listing` module from one snapshot per request. Measured on a development machine (macOS, warm cache,
+  local disk), one request through the route took about 0.06 s at 2,000 records and about 0.3 s at 10,000 records, with
+  about 8 MB of peak memory for the scan; those figures are not a Linux, cold-cache or network-storage measurement. A real index or adapter belongs to M5-D18 and M2D-D01.
+- **Provisional scan ceilings (two, both placeholders, not PRD figures).** The tenant directory is STREAMED with `os.scandir`
+  (never materialized) and two limits are enforced while it is read. Exceeding either one stops the enumeration at once and
+  refuses the request with the typed `DocumentListingLimitExceededError`, a generic `500`. The result is NEVER truncated and
+  no partial list or statistics are produced, because a truncated list would silently shrink `total_items` and `stats`.
+  - **10,000 candidate document directories** (`_MAX_LISTED_ENTRIES`): names that are valid document ids, excluding
+    `idempotency`. Each candidate costs a directory open, a file read and a JSON parse. Fixed reason
+    `document_listing_limit_exceeded`.
+  - **20,000 directory entries of any kind** (`_MAX_EXAMINED_DIRECTORY_ENTRIES`): documents, the identity marker,
+    `idempotency`, stray files and junk all count. It bounds the cost of enumerating the directory itself, so a directory
+    with a huge number of unrelated entries cannot cost unbounded time or memory; enumeration stops at the first entry beyond
+    the limit. Fixed reason `directory_entry_limit_exceeded`. A tenant with exactly 20,000 entries is listed; with 20,001 it is
+    refused. It must stay larger than the candidate limit by at least the handful of non-document entries a real tenant
+    directory holds.
+  Both limits are checked before any record is read (the entry limit during enumeration, the candidate limit as soon as it
+  is crossed). A legitimate tenant holding more than 10,000 documents, or more than 20,000 entries, is refused until an
+  index replaces the scan (M5-D18, M2D-D01).
+- **Response.** `{"content": [...], "stats": {...}, "paging": {...}}`. Each row is the sanctioned `DocumentResource` built with
+  API-002's public error allow-list (a stored error message, request id and details are never returned), so it has the same
+  fields as API-002 without the reserved `result` key. There is no document type, schema, confidence, `result` or any other
+  field that is not persisted. `Cache-Control: private, no-store` is set.
+- **`status` is persisted but NOT authoritative.** Module A writes `processing` once and nothing updates it (see the API-002
+  section). The `status` filter and the `status` sort act on that stored value only.
+- **`stats` are persisted-status statistics only.** The five PRD keys are `total`, `processing`, `needs_review`,
+  `auto_approved` and `failed`. They are counted over the COMPLETE valid record set of the tenant, BEFORE any filter, so no
+  filter, page or sort changes them. `total` counts every valid record; each other key counts the records whose persisted
+  `status` equals it. `reviewed` and `rejected` records count only toward `total`, so the categories need not add up to
+  `total`. Because no terminal-status writer exists, every current record is `processing`: `needs_review`, `auto_approved` and
+  `failed` read 0, which means "none persisted", never "none exist".
+- **Supported filters.** `status` (a `DocumentStatus` value; anything else is `422 VALIDATION_ERROR`), `from` / `to` and `q`.
+  - `from` / `to` filter on `created_at` (`updated_at` is always equal to it). Both bounds are INCLUSIVE. Timestamps are
+    compared as instants, so mixed UTC offsets compare correctly, and a stored or queried value without an offset is read as
+    UTC. Accepted forms are ASCII ISO 8601: a calendar date (`2026-11-19`) or a datetime (`2026-11-19T10:00:00`, with an
+    optional `Z` or `+hh:mm` / `-hh:mm` offset and up to six fractional digits). A date-only `from` is the first instant of
+    that UTC day and a date-only `to` is its LAST instant (23:59:59.999999), so a date-only `to` includes the whole day. Epoch
+    numbers, compact and week dates, impossible dates and anything else are `422`. `from` later than `to` is `422`. A `+` in an
+    offset must be sent as `%2B` (a raw `+` becomes a space and is refused).
+  - `q` is a case-sensitive document-ID PREFIX (1 to 128 characters), not a substring and never a filename search.
+- **Unsupported filters and unknown parameters are rejected, not ignored.**
+  - `documentType` and `confidenceBelow` are declared and any use of them, including an empty value, is
+    `422 VALIDATION_ERROR` naming the parameter (error type `unsupported_filter`). Neither value is persisted, and silently
+    ignoring them would return an unfiltered list that only looks filtered.
+  - Every other query parameter NAME is also `422 VALIDATION_ERROR` (error type `unknown_parameter`): a misspelling such as
+    `stauts`, a case variant such as `Status`, an invented name such as `limit`, and any tenant parameter such as `tenant_id`,
+    including a name with an empty or missing value. The recognized names are exactly `page`, `size`, `status`, `from`, `to`,
+    `q`, `sort`, `order`, `documentType` and `confidenceBelow`. The error is fixed and reflects nothing the client sent: it
+    names no offending parameter, carries no value, and lists only the allowed names. The application logs nothing about it (a web server's own access log of the request URL is outside this code and is not covered).
+  - FastAPI checks the declared parameters first, so a request that has both an invalid known parameter (for example `page=0`)
+    and an unknown name is answered with the known parameter's `422`; either way it is a `422`. Authentication and scope still
+    come first (`401`, `403`). A tenant HEADER (`X-Tenant-ID`) is never read; it is not a query parameter and is ignored.
+  - Both are checked before any storage access.
+- **Sorting.** `sort` is one of `created_at`, `document_id`, `page_count`, `file_size_bytes`, `status` (anything else is `422`),
+  and `order` is `asc` or `desc` (default `created_at` `desc`, newest first). `status` sorts by the alphabetical order of its
+  stored value, not by workflow order. The tie-breaker is ALWAYS `document_id` ASCENDING, whichever direction was asked for, so
+  the order is total and repeatable for one data set; ascending and descending are therefore not exact mirror images when keys
+  tie. Timestamps sort as instants.
+- **Paging.** `page` is at least 1 and `size` is 1 to 100 (default 10; the maximum is provisional); anything else is `422`.
+  `paging.total_items` counts the records that match the filters and `paging.total_pages` is `ceil(total_items / size)`, 0 when
+  nothing matches. A page beyond the last returns `200` with empty `content` and the true totals. An empty tenant, or a tenant
+  directory that does not exist, returns `200` with empty `content` and all-zero `stats`, and nothing is created on disk.
+  A missing storage ROOT currently behaves the same way: an empty `200` list, not an error. That could conceal a storage
+  misconfiguration (a wrongly configured root looks like a tenant with no documents). This is a documented limitation;
+  the behavior is unchanged here, and a typed `503` for a missing root is not implemented.
+- **No snapshot between requests.** Totals, statistics and the page of ONE response always agree. Across requests nothing is
+  held: a document added between two page requests can shift records across a page boundary (a record can then appear on two
+  consecutive pages), and `total_items` can change. Offset paging with a stable order is all this contract offers.
+- **Tenant isolation.** Only the principal's tenant directory is opened. Every record is checked against the principal's tenant
+  id and against the name of its directory, and every listed id is one for which `GET /api/v1/documents/{id}` succeeds.
+  Authentication and scope are decided before the query parameters are judged (`401`, `403`), and parameters are validated
+  before any storage access.
+- **Not document candidates.** `.tenant-identity.json`, the `idempotency` directory, names that are not valid document ids,
+  and document directories without a `document_record.json` are skipped: they are not candidates, do not count toward the
+  10,000-candidate limit and never appear in `total_items` or `stats`. Their directory entries are still examined, so each of
+  them DOES count toward the 20,000-entry examination limit (a directory without a record is also a candidate for the
+  10,000 limit, because it can only be recognized by opening it).
+- **Corrupt records fail the whole list.** A document-like directory that is a symlink, a regular file or another special
+  entry, a record that is a symlink, FIFO, socket or directory, a record that is unreadable, not UTF-8, not JSON, not an object,
+  has missing or mistyped fields, an invalid timestamp, a malformed stored error, or that claims another tenant or another
+  document id is a generic `500` with a fixed reason logged server-side; nothing partial is returned and no stored value,
+  tenant identifier, path or raw exception text reaches the response or the logs. A record that claims another tenant is an
+  isolation fault (`500`), not a concealed `404`, because a collection has no single resource to hide. Skipping such a record
+  would silently shrink every total, so it is not done. The cost is availability: ONE corrupt record makes the whole list
+  unavailable until it is repaired. Partial results would need an additive response field and an owner decision.
+- **Ingestion failures and the list.** Documents rejected before the record is saved (validation, unsupported file, malware,
+  scanner failure) are never listed or counted, so the `rejected` status can never match and "nothing is lost" is not met for
+  rejected uploads; making them listable needs a persistence decision. A document whose ingestion failed after the record was
+  saved can remain listed as `processing`, which overstates `stats.processing` and understates `stats.failed`.
+- **Bulk exposure of row fields.** Every listed document returns the whole sanctioned `DocumentResource` row: `document_id`,
+  `status`, `filename`, `mime_type`, `file_size_bytes`, `page_count`, `sha256`, `created_at`, `updated_at`, `error_code` and
+  `error_message` (see M2D-D02). In particular the client-supplied filename, the SHA-256 content hash, the MIME type and the
+  file size of ALL of a tenant's documents are exposed in bulk.
+- **Logging.** The log statements added for API-015 follow the F6 rule (constant messages, fixed reason codes, integer `errno`)
+  and are covered by the same static test; the F6 scope statement is unchanged (`DocumentReadService` only).
