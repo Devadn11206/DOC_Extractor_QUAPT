@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 
 from doc_extractor.api.config import ApiSettings, bridge_to_engine_settings, load_api_settings
 from doc_extractor.api.contracts.tenant_bound import require_path_safe_tenant_id
-from doc_extractor.api.exceptions import ContainerUnavailableError
+from doc_extractor.api.exceptions import ContainerUnavailableError, PortNotConfiguredError
 from doc_extractor.api.ports.audit import AuditLogger
 from doc_extractor.api.ports.authentication import AuthenticationProvider
 from doc_extractor.api.ports.queue import QueueConsumer, QueueProducer
@@ -30,6 +30,7 @@ from doc_extractor.api.ports.repositories import (
 )
 from doc_extractor.api.services.document_read_service import DocumentReadService
 from doc_extractor.api.services.document_service import DocumentService
+from doc_extractor.api.services.review_task_service import ReviewTaskService
 from doc_extractor.config import Settings
 from doc_extractor.exceptions import InvalidTenantIdentifierError
 from doc_extractor.extractor import SchemaGuidedExtractor
@@ -361,6 +362,29 @@ class ApplicationContainer:
 
         storage = LocalDiskStorage(self.engine_settings.storage_base_dir, tenant_id=tenant_id)
         return DocumentReadService(storage=storage, tenant_id=tenant_id)
+
+    def get_review_task_service(
+        self,
+        tenant_id: str,
+        principal_id: str,
+        review_task_repo: Optional[ReviewTaskRepository] = None,
+    ) -> ReviewTaskService:
+        """
+        Retrieve a tenant- and principal-bound ReviewTaskService (API-005, API-016). Lightweight: no extraction pipeline is
+        created. There is no production adapter for the repository port yet, so an unconfigured port fails closed with the
+        typed 503 (``PortNotConfiguredError``): nothing is substituted.
+        """
+        if self._is_shutdown:
+            raise ContainerUnavailableError("ApplicationContainer has been shut down.")
+        if not isinstance(tenant_id, str):
+            raise InvalidTenantIdentifierError("Tenant ID must be a string.")
+        if not tenant_id.strip():
+            raise InvalidTenantIdentifierError("Tenant ID cannot be empty or whitespace.")
+        require_path_safe_tenant_id(tenant_id)
+        repository = review_task_repo or self.review_task_repo
+        if repository is None:
+            raise PortNotConfiguredError("ReviewTaskRepository")
+        return ReviewTaskService(repository=repository, tenant_id=tenant_id, principal_id=principal_id)
 
     def shutdown(self) -> None:
         """

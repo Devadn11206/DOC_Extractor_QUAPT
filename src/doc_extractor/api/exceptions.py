@@ -227,6 +227,51 @@ class ApiConflictError(ApiHttpError):
         super().__init__(message=message, code=code, status_code=409, request_id=request_id, details=details)
 
 
+class ReviewTaskNotFoundError(NotFoundError):
+    """
+    A review task that does not exist for the caller's tenant, or whose identifier is malformed, or that belongs to another
+    tenant: one answer for all three (SEC-006), HTTP 404 ``REVIEW_TASK_NOT_FOUND``.
+    """
+
+    def __init__(
+        self,
+        message: str = "Review task not found.",
+        code: str = "REVIEW_TASK_NOT_FOUND",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
+
+
+class ReviewTaskClaimedError(ApiConflictError):
+    """
+    The task is owned by another principal (PRD section 19: 409 ``TASK_CLAIMED`` [Proposed]). PROVISIONAL (M5-D11, Open):
+    ``details.claimed_by`` is the owner's principal ID, because no display name exists and none is invented.
+    """
+
+    def __init__(
+        self,
+        message: str = "This task is claimed by another reviewer.",
+        code: str = "TASK_CLAIMED",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
+
+
+class ReviewTaskCompletedError(ApiConflictError):
+    """The task is completed, so it can be neither claimed nor released (HTTP 409 ``TASK_COMPLETED``, a PROPOSED code: M5-D11)."""
+
+    def __init__(
+        self,
+        message: str = "This task is already completed.",
+        code: str = "TASK_COMPLETED",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
+
+
 class RateLimitExceededError(ApiHttpError):
     """Raised when client exceeds designated request rate limits per PRD §7.2 API-012 & §19 (HTTP 429)."""
 

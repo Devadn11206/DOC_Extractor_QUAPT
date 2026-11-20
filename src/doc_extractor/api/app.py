@@ -24,6 +24,7 @@ from doc_extractor.api import middleware as api_middleware
 from doc_extractor.api.middleware import RequestIdMiddleware, UploadSizeLimitMiddleware
 from doc_extractor.api.routers.documents import router as documents_router
 from doc_extractor.api.routers.health import router as health_router
+from doc_extractor.api.routers.review_tasks import router as review_tasks_router
 from doc_extractor.logging import setup_logging
 
 logger = logging.getLogger("doc_extractor.api")
@@ -187,8 +188,12 @@ def create_app(
     else:
         app.include_router(documents_router, prefix="", tags=["Documents"])
 
+    # Register the review-task router (API-005 list, API-016 claim and release; PROVISIONAL, M5-D11 is Open). Without an injected
+    # ReviewTaskRepository (no production adapter exists yet) every route answers 503 after authentication and the scope check.
+    app.include_router(review_tasks_router, prefix=resolved_settings.api_prefix or "", tags=["Review Tasks"])
+
     # The API-key management router (API-019) is intentionally not mounted: it is held back until
-    # decision M5-D08 is approved. Document, review-task and webhook routers are later stages.
+    # decision M5-D08 is approved. Webhook routers are a later stage.
 
     # Custom OpenAPI generator ensuring metadata and clean schemas
     def custom_openapi():

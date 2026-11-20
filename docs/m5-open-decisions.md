@@ -169,6 +169,9 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **Plan's recommendation.** A (needs a PRD addition).
 - **Owner.** PRD owner. **Blocks.** S7. **Status.** Open. **Resolution.** none.
 - **In the code.** `ReviewTaskRecord` is marked PROVISIONAL (`api/contracts/records.py`); no adapter persists it.
+  - *Provisional implementation assumption (Phase 3, Slice 1):* the code uses option A's vocabulary (`unassigned` /
+    `claimed` / `completed`) without an administrator release, and the choices listed under "M5 Phase 3 Slice 1" below. None of
+    it is owner-approved; the decision stays Open.
 
 ### M5-D12 Auto-approval policy
 
@@ -760,3 +763,60 @@ validation is reimplemented. Every choice below is a PROVISIONAL assumption, not
 - **Test scope.** The tests run the real upload, storage, handoff, `DocumentService` and Module B loading; the routed model
   extractor, Module C's envelope assembly and (for injected failures) Module B inference are stubbed, because they stand for
   models. A real model run was not tested. Linux filesystem behavior was verified on macOS only.
+
+### M5 Phase 3 Slice 1 Provisional Behavior and Limitations (review-task queue: API-005 list, API-016 claim and release)
+
+Everything in this section is a provisional implementation assumption. It is not owner-approved, and it does not resolve
+M5-D11 (review-task states), M2D-D02 (masking and what a response may expose), M2D-D04 (scopes), M5-D07 (where correction
+values may live) or any other open decision; all of them stay **Open**.
+
+- **Routes.** `GET /api/v1/review-tasks`, `POST /api/v1/review-tasks/{id}/claim`, `POST /api/v1/review-tasks/{id}/release`.
+  Not built: `POST /review-tasks/{id}/complete`, corrections, correction history, review-task creation from extraction,
+  durable audit, four-eyes approval, webhooks.
+- **States (M5-D11, option A without an administrator).** `unassigned`, `claimed`, `completed`. `completed` can be represented
+  and is rejected for claim and release, but nothing in this slice produces it.
+- **Ownership.** The owner is the authenticated principal's ID (`assigned_reviewer_id`). It is never read from a query, header
+  or body: claim and release refuse any query parameter or body with 422. No display name exists and none is invented.
+  Exposing a principal ID to the other reviewers of the tenant (the list shows it; `TASK_CLAIMED` carries it as
+  `details.claimed_by`) is a provisional answer to the PRD's "with the owner's display name"; whether a principal ID may be shown
+  (it can be an e-mail address for some identity providers) is open under M2D-D02 and M5-D11.
+- **Claim.** Unassigned becomes claimed by the caller. A repeated claim by the current owner succeeds and changes nothing (no
+  write, `updated_at` unchanged). A task owned by another principal answers `409 TASK_CLAIMED` (PRD section 19, a proposed code)
+  and stays theirs. A completed task answers `409 TASK_COMPLETED` (a code this slice proposes; it is not in the PRD).
+- **Release.** Only the current owner may release; anyone else gets `409 TASK_CLAIMED` and nothing changes (the PRD does not say;
+  an administrator release, option A's wording, is NOT implemented). Releasing a task nobody owns succeeds and changes nothing, so a
+  retry by the owner is safe. A completed task answers `409 TASK_COMPLETED`.
+- **No claim expiry.** A claim lasts until the owner releases it. There is no timeout, no SLA expiry and no reaper; an abandoned claim
+  stays claimed.
+- **List.** Tenant-scoped, oldest first (`created_at` ascending as instants, a naive timestamp read as UTC, then `task_id`
+  ascending); `priority` is not used. Filters: `status`, `assignee` (`mine` = the authenticated principal, `unassigned`, `all`,
+  default `all`), `document_id` (exact). With no `status`, tasks in every state are listed (no implicit "open only" filter).
+  `page` / `size` (default 10, provisional maximum 100) and the same `paging` block as API-015. The PRD toolbar filters
+  `documentType`, `flagType` and `slaAge` are rejected with 422 because the record has no such data; so is any unknown query name.
+  The PRD's flagged-field count, flag reasons and SLA age are absent for the same reason (the record models no `flaggedFields[]` or
+  `slaDueAt` yet).
+- **Scopes (provisional, M2D-D04 and SEC-003 stay Open).** `review_tasks:read` for the list; `review_tasks:claim` for claim and
+  release. No role check: authorization is by scope, like every other route. A missing scope is `403 FORBIDDEN_SCOPE`.
+- **Errors.** Unknown, malformed or another tenant's task: one concealed `404 REVIEW_TASK_NOT_FOUND`, with no details (the foreign
+  task is never touched). Repository faults and contradictory repository answers: generic `500 INTERNAL_ERROR` with a fixed reason
+  logged server-side only.
+- **Privacy (SEC-012).** A task exposes identifiers, state, the owner's principal ID and timestamps only. `reviewer_notes`,
+  `metadata`, `priority` and `tenant_id` are never returned. Logs carry a constant message, the outcome, the task ID and the
+  request ID; never a principal ID, a tenant ID, a note, a value or an exception text (a static test pins this).
+  No field value, old or new, is handled by this slice at all.
+- **Persistence: THERE IS NO PRODUCTION ADAPTER.** The `ReviewTaskRepository` port is extended with `claim`, `release` and
+  `list_page` and documents an ATOMICITY CONTRACT (one indivisible check-and-write per task; a conditional UPDATE or row lock in a
+  database). The application container leaves the port unconfigured, so every review-task route answers `503 SERVICE_UNAVAILABLE`
+  after authentication and the scope check until Team Member 3's adapter is injected. The only implementation is the in-memory
+  double `tests/review_task_double.py` (kept out of the package on purpose).
+- **Concurrency guarantee and its boundary.** The service makes ONE atomic repository call per claim or release and trusts the
+  outcome it returns (after checking it, see below). The double is atomic among the threads and the coroutines of ONE process.
+  Nothing here proves atomicity across processes or against a database: that depends on the production adapter honoring the port's
+  contract, and it has not been exercised.
+- **Defence in depth.** A result that names another tenant's task, another task, a state that contradicts the outcome, or an
+  outcome of the other operation is treated as an adapter fault (generic 500), never shown.
+- **Audit.** Claim and release are not written to the durable audit store (none exists; M5-D07 and SEC-008 are open). They are
+  only logged as described above.
+- **Existing behavior touched.** `ReviewTaskRecord.status` changed from free text (`pending`, `in_review`, ...) to the three states
+  above and gained state invariants; nothing persisted it, so nothing migrates. The pre-existing port methods `update_status` and
+  `list_tasks` are unchanged, and `update_status` is documented as an unconditional write that must not be used to claim or release.

@@ -39,6 +39,7 @@ from doc_extractor.api.services.document_read_service import DocumentReadService
 from doc_extractor.api.services.document_extraction_service import ExtractionGate
 from doc_extractor.api.services.document_service import DocumentService
 from doc_extractor.api.services.document_upload_service import DocumentUploadService
+from doc_extractor.api.services.review_task_service import ReviewTaskService
 from doc_extractor.processing_service import DocumentProcessingService
 
 
@@ -322,6 +323,22 @@ def get_document_read_service(
     Tenant context originates exclusively from authenticated principal (SEC-005).
     """
     return container.get_document_read_service(tenant_context.tenant_id)
+
+
+def get_review_task_service(
+    request: Request,
+    principal: ApiPrincipal = Depends(get_current_principal),
+    container: ApplicationContainer = Depends(get_application_container),
+) -> ReviewTaskService:
+    """
+    Dependency injection provider for the ReviewTaskService, bound to the authenticated principal's tenant AND identity
+    (SEC-005): the tenant and the reviewer are never read from the request. An unconfigured ReviewTaskRepository (there is no
+    production adapter yet) answers the typed 503 instead of a bare 500, after authentication and the scope check.
+    """
+    repo = getattr(request.app.state, "review_task_repo", None) or container.review_task_repo
+    return container.get_review_task_service(
+        tenant_id=principal.tenant_id, principal_id=principal.principal_id, review_task_repo=repo
+    )
 
 
 _EXTRACTION_GATE_LOCK = threading.Lock()

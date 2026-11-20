@@ -6,6 +6,7 @@ and enforce tenant scoping where appropriate.
 """
 
 from datetime import datetime, timezone
+from enum import Enum
 import json
 import math
 import re
@@ -68,28 +69,54 @@ class DocumentResource(BaseModel):
         )
 
 
+class ReviewTaskStatus(str, Enum):
+    """
+    PROVISIONAL review-task life cycle (decision M5-D11, Open; the PRD defines no task states). Option A of the register:
+    ``unassigned`` -> ``claimed`` -> ``completed``. Task state only: the document outcome (approved, rejected) is NOT a
+    task state. ``completed`` is representable but nothing in this slice produces it (completion is API-005's POST
+    ``/complete``, not built yet).
+    """
+
+    UNASSIGNED = "unassigned"
+    CLAIMED = "claimed"
+    COMPLETED = "completed"
+
+
 class ReviewTaskRecord(TenantBoundModel):
     """
     Human-in-the-loop review task (FR-REV, API-005, API-016). The review domain's OWN entity: no authoritative model
     of a review task exists elsewhere (Module B's ``ReviewerOverrideRequest`` is a one-shot document-type override,
     not a task with an owner and a life cycle), so this is not a duplicate.
 
-    PROVISIONAL: the status vocabulary below mixes task state with document outcome and the PRD does not yet define
-    task states (decision M5-D11); it is expected to change before any adapter persists it.
+    PROVISIONAL (decision M5-D11, Open): the states are ``ReviewTaskStatus``. Ownership is the authenticated principal's ID
+    (``assigned_reviewer_id``); no display name exists or is invented. Invariants, checked on every validated construction:
+    ``unassigned`` has no owner and no completion time; ``claimed`` has an owner and no completion time; ``completed`` has
+    a completion time. PRD section 20 also lists ``flaggedFields[]`` and ``slaDueAt``: they are NOT modelled here yet
+    (their producer, review-task creation from extraction, is outside this slice).
     """
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     task_id: str = Field(..., min_length=1, description="Unique review task identifier")
     document_id: str = Field(..., min_length=1, description="Associated document ID")
     tenant_id: str = Field(..., min_length=1, description="Owning tenant identifier")
-    status: str = Field(default="pending", description="Task status (pending, in_review, approved, rejected)")
-    assigned_reviewer_id: Optional[str] = Field(None, description="Principal ID of assigned reviewer")
+    status: ReviewTaskStatus = Field(default=ReviewTaskStatus.UNASSIGNED, description="Task state (provisional: M5-D11)")
+    assigned_reviewer_id: Optional[str] = Field(None, min_length=1, description="Principal ID of the task's owner")
     priority: int = Field(default=0, description="Task processing priority")
     created_at: datetime = Field(default_factory=utc_now, description="Task creation timestamp")
     updated_at: datetime = Field(default_factory=utc_now, description="Last update timestamp")
     completed_at: Optional[datetime] = Field(None, description="Task completion timestamp")
     reviewer_notes: Optional[str] = Field(None, description="Reviewer notes or reason for rejection")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Redacted task context metadata")
+
+    @model_validator(mode="after")
+    def _state_invariants(self) -> "ReviewTaskRecord":
+        if self.status is ReviewTaskStatus.UNASSIGNED and (self.assigned_reviewer_id is not None or self.completed_at is not None):
+            raise ValueError("an unassigned task has no owner and no completion time")
+        if self.status is ReviewTaskStatus.CLAIMED and (self.assigned_reviewer_id is None or self.completed_at is not None):
+            raise ValueError("a claimed task has an owner and no completion time")
+        if self.status is ReviewTaskStatus.COMPLETED and self.completed_at is None:
+            raise ValueError("a completed task has a completion time")
+        return self
 
 
 class ApiKeyRecord(TenantBoundModel):

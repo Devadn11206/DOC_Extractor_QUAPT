@@ -839,6 +839,9 @@ class MockReviewTaskRepo:
     async def create(self, tenant_id: str, task: ReviewTaskRecord) -> ReviewTaskRecord: return task
     async def update_status(self, tenant_id: str, task_id: str, status: str, reviewer_id: Optional[str] = None, notes: Optional[str] = None) -> Optional[ReviewTaskRecord]: return None
     async def list_tasks(self, tenant_id: str, status: Optional[str] = None, reviewer_id: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[ReviewTaskRecord]: return []
+    async def claim(self, tenant_id: str, task_id: str, reviewer_id: str, now: datetime) -> Any: return None
+    async def release(self, tenant_id: str, task_id: str, reviewer_id: str, now: datetime) -> Any: return None
+    async def list_page(self, tenant_id: str, query: Any) -> Any: return None
 
 
 class MockApiKeyRepo:
