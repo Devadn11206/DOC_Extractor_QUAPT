@@ -842,6 +842,7 @@ class MockReviewTaskRepo:
     async def claim(self, tenant_id: str, task_id: str, reviewer_id: str, now: datetime) -> Any: return None
     async def release(self, tenant_id: str, task_id: str, reviewer_id: str, now: datetime) -> Any: return None
     async def list_page(self, tenant_id: str, query: Any) -> Any: return None
+    async def complete(self, tenant_id: str, task_id: str, reviewer_id: str, now: datetime) -> Any: return None
 
 
 class MockApiKeyRepo:

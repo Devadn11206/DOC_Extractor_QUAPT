@@ -30,6 +30,7 @@ from doc_extractor.api.contracts.review_tasks import validate_task_id
 from doc_extractor.api.exceptions import (
     ReviewTaskClaimedError,
     ReviewTaskCompletedError,
+    ReviewTaskNotClaimedError,
     ReviewTaskNotFoundError,
     TenantAccessDeniedError,
 )
@@ -132,6 +133,19 @@ class ReviewTaskService:
         )
         return self._resolve("release", task_id, result, request_id)
 
+    async def complete(self, task_id: str, request_id: Optional[str] = None) -> ReviewTaskRecord:
+        """
+        PROVISIONAL (Phase 3, Slice 2A; M5-D11 is Open) and NOT EXPOSED by any route. Completes ``task_id`` for the
+        authenticated principal through the repository's atomic ``complete``: only the current owner may; a repeat by the
+        completer succeeds and changes nothing. It changes the REVIEW-TASK RECORD ONLY: it validates no correction, persists
+        nothing, updates no document status and writes no audit event (those are later slices and open dependencies).
+        """
+        task_id = validate_task_id(task_id)
+        result = await self._call(
+            self._repository.complete(self._tenant_id, task_id, self._principal_id, self._clock()), request_id
+        )
+        return self._resolve("complete", task_id, result, request_id)
+
     # ---- internals ----------------------------------------------------------------------------------------------------
 
     async def _call(self, awaitable: Any, request_id: Optional[str]) -> Any:
@@ -178,16 +192,28 @@ class ReviewTaskService:
         if outcome is ReviewTaskTransition.COMPLETED:
             if task.status is not ReviewTaskStatus.COMPLETED:                # type: ignore[union-attr]
                 raise _fault(REASON_ADAPTER_CONTRACT, request_id)
+            if operation == "complete" and mine:                             # the caller's own completion is ALREADY_COMPLETED
+                raise _fault(REASON_ADAPTER_CONTRACT, request_id)
             raise ReviewTaskCompletedError(request_id=request_id)
+        if outcome is ReviewTaskTransition.NOT_CLAIMED:
+            if operation != "complete" or task.status is not ReviewTaskStatus.UNASSIGNED:   # type: ignore[union-attr]
+                raise _fault(REASON_ADAPTER_CONTRACT, request_id)
+            raise ReviewTaskNotClaimedError(request_id=request_id)
 
         expected = {
             "claim": {ReviewTaskTransition.CLAIMED, ReviewTaskTransition.ALREADY_OWNED},
             "release": {ReviewTaskTransition.RELEASED, ReviewTaskTransition.ALREADY_UNASSIGNED},
+            "complete": {ReviewTaskTransition.COMPLETION_RECORDED, ReviewTaskTransition.ALREADY_COMPLETED},
         }[operation]
         if outcome not in expected:
             raise _fault(REASON_ADAPTER_CONTRACT, request_id)
         if operation == "claim":
             consistent = task.status is ReviewTaskStatus.CLAIMED and mine    # type: ignore[union-attr]
+        elif operation == "complete":
+            consistent = (
+                task.status is ReviewTaskStatus.COMPLETED and mine           # type: ignore[union-attr]
+                and task.completed_at is not None                            # type: ignore[union-attr]
+            )
         else:
             consistent = task.status is ReviewTaskStatus.UNASSIGNED          # type: ignore[union-attr]
         if not consistent:

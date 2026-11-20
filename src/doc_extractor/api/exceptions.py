@@ -272,6 +272,22 @@ class ReviewTaskCompletedError(ApiConflictError):
         super().__init__(message=message, code=code, request_id=request_id, details=details)
 
 
+class ReviewTaskNotClaimedError(ApiConflictError):
+    """
+    PROVISIONAL (Slice 2A, M5-D11 Open): the task is owned by nobody, so it cannot be completed (HTTP 409 ``TASK_NOT_CLAIMED``,
+    a PROPOSED code). Used by ``ReviewTaskService.complete``, which no route exposes yet.
+    """
+
+    def __init__(
+        self,
+        message: str = "This task must be claimed before it can be completed.",
+        code: str = "TASK_NOT_CLAIMED",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message=message, code=code, request_id=request_id, details=details)
+
+
 class RateLimitExceededError(ApiHttpError):
     """Raised when client exceeds designated request rate limits per PRD §7.2 API-012 & §19 (HTTP 429)."""
 

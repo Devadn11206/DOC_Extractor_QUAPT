@@ -820,3 +820,63 @@ values may live) or any other open decision; all of them stay **Open**.
 - **Existing behavior touched.** `ReviewTaskRecord.status` changed from free text (`pending`, `in_review`, ...) to the three states
   above and gained state invariants; nothing persisted it, so nothing migrates. The pre-existing port methods `update_status` and
   `list_tasks` are unchanged, and `update_status` is documented as an unconditional write that must not be used to claim or release.
+
+### M5 Phase 3 Slice 2A Provisional Behavior and Limitations (correction validation and the completion port)
+
+Everything in this section is a provisional implementation assumption. It is not owner-approved, and it does not resolve
+M5-D11 (review-task states), M5-D07 (where correction values may live), M2D-D01 (envelope persistence and terminal status),
+M2D-D02 (masking), M2D-D04 (scopes) or any other open decision; all of them stay **Open**. No endpoint is added: there is no
+`POST /review-tasks/{id}/complete`, and no production adapter exists.
+
+- **Correction validation (FR-REV-003)** is `api/services/correction_validation.py`: a pure, deterministic function over an
+  in-memory field set. It stores nothing, writes no audit, updates no status and completes no task.
+- **Reuse, no new business rule.** Static schemas DOC-01, DOC-02 and DOC-03 (version `1.0.0`) use the very validators Module C
+  applies per field (`validate_pan`, `normalize_date_to_iso`, `normalize_phone_number`, `validate_aadhaar`, `validate_ifsc`,
+  `normalize_currency_amount`), its required-field set, `validate_chronology` and `validate_arithmetic`; a test pins the table
+  against `ModuleCPipeline` itself. Dynamic schemas use `DynamicSchemaCompiler`, the dynamic adapter's own per-field normalizer and
+  `evaluate_dynamic_rules`. The scalar kind of a static field (integer, decimal, boolean) is read from the real pydantic model.
+- **Exact version, never a guess.** The caller must supply the schema ID and the version recorded on the extraction. A static ID
+  is judged only in version 1 (`1`, `"1"` or `"1.0.0"`). Any other ID is looked up with `SchemaRepository.get_snapshot` (an exact,
+  tenant-scoped lookup); the active, the latest and the listing lookups are never called, and a missing version is a rejection, not
+  a fallback to another version. A version is a positive integer, `"N"` or `"N.0.0"`: `"1.2.0"`, `"v1"`, `"1.0"` and the like are
+  refused, because `SchemaVersionAdapter.to_canonical` would round them down to a major version and silently select a different
+  schema. A snapshot whose tenant, ID or version differs from the request is a resolution failure. The snapshot's lifecycle status is
+  NOT checked (whether a retired or non-approved version may be used for corrections is a policy question left open under M5-D11).
+- **Result.** `valid`, `invalid` (a correction or a cross-field rule failed) or `rejected` (no exact schema could be used, so nothing
+  was judged), with fixed codes only (`INVALID_PAN_FORMAT`, `REQUIRED_FIELD_MISSING`, `CHRONOLOGY_MISMATCH`, `SCHEMA_VERSION_NOT_FOUND`,
+  ...) and schema-declared field paths. A validator or rule code that is not an upper-case token is replaced by a fixed fallback.
+  The result holds no old, new or normalized value, no evidence text, no rule message and no client-supplied path; a rejection does
+  not even echo the schema ID. The source field set is never mutated (the rules run on deep copies).
+- **Scope of judgment.** Only the corrected fields, and the cross-field rules that concern them, are judged. A violation that no
+  correction touches is outside the result; whether completion must also require a violation-free document is open.
+- **Paths.** ASCII dotted names; a position of one to three ASCII digits is required exactly after each repeating-group field
+  (`nominees.2.name`, not `nominees.name` or `nominees.name.0`). Containers (objects, repeating groups) are not correction targets.
+  A corrected path that no extraction produced (for example another nominee) is accepted when the schema declares it.
+- **Repeating groups of a dynamic schema follow the compiler.** Which fields are repeating groups is read from the metadata that
+  `DynamicSchemaCompiler` produces (the very shape the dynamic adapter extracts), not guessed from the declared `type`: every
+  declaration the compiler builds as a group (`items=[...]`, `items=<object field>`, `is_array` with `items`, bracket names, nested
+  groups, a group inside an object) takes `items.0.amount` and refuses `items.amount`. A field declared `type=ARRAY` with `fields=`
+  is built by the compiler as ONE nested object (`fields` wins), so its correctable path is `items.amount`. A scalar array and
+  each of its elements stay non-correctable (`FIELD_NOT_CORRECTABLE`). Tests compare the accepted paths with the flattened keys of a
+  real compiled model instance.
+- **Numeric corrections in dynamic rules.** A reviewer's free text ("₹500", "INR 500", "1,0") is rule input as the NORMALIZED number
+  for an integer or decimal field whose normalization raised no validator error, so a comparison rule such as `deposit >= 1000` is
+  evaluated, never skipped because of the formatting. When the validator reports an error, or for any other field type, the rules
+  receive the raw value as before. The normalizer is the dynamic adapter's own: it truncates a decimal amount typed into an INTEGER
+  field (`"1,5.5"` becomes 15), as it does in extraction; that existing behavior is unchanged and unreviewed here.
+- **Completion port (provisional).** `ReviewTaskRepository.complete(tenant_id, task_id, reviewer_id, now)` atomically moves a task
+  that is CLAIMED BY the caller to `completed` (the completer stays recorded). New outcomes: `COMPLETION_RECORDED`, `ALREADY_COMPLETED`
+  (the completer repeating the call: idempotent, nothing written) and `NOT_CLAIMED`; `HELD_BY_OTHER`, `COMPLETED` (completed by
+  someone else) and `NOT_FOUND` are reused. `ReviewTaskService.complete` maps them (`409 TASK_NOT_CLAIMED`, a proposed code, and the
+  existing `TASK_CLAIMED`, `TASK_COMPLETED`, `REVIEW_TASK_NOT_FOUND`) and checks what an adapter returns, but no route calls it.
+  The Slice 1 claim and release keep their strict contract: the new outcomes are an adapter fault when they come back from them.
+- **Atomicity boundary.** The contract covers the REVIEW-TASK RECORD ONLY. It is NOT atomic with the document's status change to
+  `reviewed`, the persistence of corrections or any audit record. How those are made one consistent step across stores is an open
+  dependency (Team Member 3; M2D-D01, M5-D07). The only implementation is the in-memory test double, atomic within one process.
+- **Remaining dependencies.** A production `ReviewTaskRepository` adapter with a real compare-and-set; persisted extraction
+  envelopes (the fields to correct); document-status writes with a compare-and-set; a durable, hash-chained audit store and the
+  decision on correction values (M5-D07); a source of schema snapshots wired into the application (only the in-memory
+  `SchemaRepository` exists); the completion policy and the role and scope policy (M5-D11, M2D-D04, SEC-003).
+- **Observation (existing, unchanged).** `rule_evaluator._flag_violation` compares `str(rule.on_fail).lower()` with `"review"`;
+  for a string-valued enum `str()` is `"ruleonfail.review"`, so a comparison rule never sets `review_required` on its field. The
+  correction result uses the rule's flag, not `review_required`, so it is unaffected; the evaluator itself was not changed.

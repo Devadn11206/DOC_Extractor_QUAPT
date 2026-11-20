@@ -93,6 +93,28 @@ class InMemoryReviewTaskRepository:
             self.write_count += 1
             return ReviewTaskTransitionResult(ReviewTaskTransition.RELEASED, updated.model_copy(deep=True))
 
+    async def complete(self, tenant_id: str, task_id: str, reviewer_id: str, now: datetime) -> ReviewTaskTransitionResult:
+        """PROVISIONAL (Slice 2A): complete a task claimed by ``reviewer_id``. The task RECORD only: no document, no audit."""
+        with self._lock:                                      # owner check, state check and write: one indivisible step
+            task = self._tasks.get((tenant_id, task_id))
+            if task is None:
+                return ReviewTaskTransitionResult(ReviewTaskTransition.NOT_FOUND, None)
+            if task.status is ReviewTaskStatus.COMPLETED:
+                outcome = (
+                    ReviewTaskTransition.ALREADY_COMPLETED
+                    if task.assigned_reviewer_id == reviewer_id
+                    else ReviewTaskTransition.COMPLETED
+                )
+                return ReviewTaskTransitionResult(outcome, task.model_copy(deep=True))
+            if task.status is ReviewTaskStatus.UNASSIGNED:
+                return ReviewTaskTransitionResult(ReviewTaskTransition.NOT_CLAIMED, task.model_copy(deep=True))
+            if task.assigned_reviewer_id != reviewer_id:
+                return ReviewTaskTransitionResult(ReviewTaskTransition.HELD_BY_OTHER, task.model_copy(deep=True))
+            updated = _changed(task, status=ReviewTaskStatus.COMPLETED, completed_at=now, updated_at=now)
+            self._tasks[(tenant_id, task_id)] = updated
+            self.write_count += 1
+            return ReviewTaskTransitionResult(ReviewTaskTransition.COMPLETION_RECORDED, updated.model_copy(deep=True))
+
     async def list_page(self, tenant_id: str, query: ReviewTaskListQuery) -> ReviewTaskPage:
         with self._lock:
             tasks = [task.model_copy(deep=True) for task in self._tenant_tasks(tenant_id)]
@@ -165,3 +187,19 @@ class RacyReviewTaskRepository(InMemoryReviewTaskRepository):
             )
             self.write_count += 1
             return ReviewTaskTransitionResult(ReviewTaskTransition.CLAIMED, self._tasks[(tenant_id, task_id)].model_copy(deep=True))
+
+    async def complete(self, tenant_id: str, task_id: str, reviewer_id: str, now: datetime) -> ReviewTaskTransitionResult:
+        """Non-atomic completion (read, yield, blind write): used only to prove the completion race tests detect it."""
+        task = self.snapshot(tenant_id, task_id)             # read
+        if task is None or task.status is not ReviewTaskStatus.CLAIMED or task.assigned_reviewer_id != reviewer_id:
+            return await super().complete(tenant_id, task_id, reviewer_id, now)
+        await asyncio.sleep(0)                               # a release or another completion interleaves here
+        with self._lock:                                     # write: no re-check of the state
+            current = self._tasks[(tenant_id, task_id)]
+            self._tasks[(tenant_id, task_id)] = _changed(
+                current, status=ReviewTaskStatus.COMPLETED, assigned_reviewer_id=reviewer_id, completed_at=now, updated_at=now
+            )
+            self.write_count += 1
+            return ReviewTaskTransitionResult(
+                ReviewTaskTransition.COMPLETION_RECORDED, self._tasks[(tenant_id, task_id)].model_copy(deep=True)
+            )

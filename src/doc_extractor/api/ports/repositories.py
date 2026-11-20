@@ -122,8 +122,13 @@ class ReviewTaskTransition(str, Enum):
     RELEASED = "released"                        # release: was owned by the caller, now unassigned
     ALREADY_UNASSIGNED = "already_unassigned"    # release: nobody owns it (idempotent; nothing was written)
     HELD_BY_OTHER = "held_by_other"              # claim or release: another principal owns it (nothing was written)
-    COMPLETED = "completed"                      # claim or release: the task is completed (nothing was written)
+    COMPLETED = "completed"                      # claim or release: the task is completed (nothing was written); complete: it was
+                                                 # completed by someone else, so the caller's completion is refused
     NOT_FOUND = "not_found"                      # no such task for this tenant (another tenant's task is absent too)
+    # PROVISIONAL (Phase 3, Slice 2A; decision M5-D11 is Open): outcomes of ``complete`` only.
+    COMPLETION_RECORDED = "completion_recorded"  # complete: was claimed by the caller, now completed (the task record was written)
+    ALREADY_COMPLETED = "already_completed"      # complete: the caller already completed it (idempotent; nothing was written)
+    NOT_CLAIMED = "not_claimed"                  # complete: nobody owns it, so it cannot be completed (claim it first)
 
 
 @dataclass(frozen=True)
@@ -170,6 +175,24 @@ class ReviewTaskRepository(Protocol):
         Atomically return a task OWNED BY ``reviewer_id`` to ``unassigned`` (``updated_at`` = ``now``). Only the current owner
         may release. Owned by someone else: ``HELD_BY_OTHER``, nothing written. Already unassigned: ``ALREADY_UNASSIGNED``,
         nothing written. Completed: ``COMPLETED``. Absent for the tenant: ``NOT_FOUND``.
+        """
+        ...
+
+    async def complete(
+        self, tenant_id: str, task_id: str, reviewer_id: str, now: datetime
+    ) -> ReviewTaskTransitionResult:
+        """
+        PROVISIONAL (Phase 3, Slice 2A; M5-D11 is Open). Atomically move a task that is CLAIMED BY ``reviewer_id`` to
+        ``completed`` (``completed_at`` and ``updated_at`` = ``now``; the owner stays recorded as the completer). The check of
+        the owner and the state and the write are one indivisible step per task (the ATOMICITY CONTRACT above).
+        Outcomes: claimed by the caller -> ``COMPLETION_RECORDED``; already completed by the caller -> ``ALREADY_COMPLETED``
+        (idempotent, nothing written); completed by anyone else -> ``COMPLETED``; unassigned -> ``NOT_CLAIMED``; claimed by
+        another principal -> ``HELD_BY_OTHER``; absent for the tenant -> ``NOT_FOUND``. Of two concurrent completions of one
+        task, exactly one is ``COMPLETION_RECORDED``; a completion racing a release by the owner has exactly one winner.
+
+        BOUNDARY: this changes the REVIEW-TASK RECORD ONLY. It does not update the document's status, persist corrections,
+        validate anything or write an audit record, and it is NOT atomic with any of those: the cross-store atomicity of
+        completing a task and moving its document to ``reviewed`` is an open persistence dependency (Team Member 3).
         """
         ...
 
