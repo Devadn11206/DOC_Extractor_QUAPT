@@ -82,6 +82,7 @@ def assemble_field_entry(
     evidence_required: bool = True,
     explicit_null_reason: Optional[Literal["absent", "illegible"]] = None,
     strict_boolean_evidence: bool = True,
+    model_confidence: float = 1.0,
 ) -> ExtractedField:
     """
     Assembles a validated ExtractedField envelope with evidence grounding (FR-EXT-004, GR-002),
@@ -147,7 +148,7 @@ def assemble_field_entry(
     # 4. Calibrated Confidence Math (FR-CNF-001)
     confidence = calculate_calibrated_confidence(
         ocr_confidence=optical_conf,
-        model_confidence=1.0,
+        model_confidence=model_confidence,  # token-probability from the VLM when available (FR-CNF-001)
         validation_passed=not has_validation_failed,
         has_evidence=(evidence_model is not None),
     )

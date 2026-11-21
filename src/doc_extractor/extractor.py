@@ -25,6 +25,7 @@ from doc_extractor.contracts_c import (
     ExtractionResult,
 )
 from doc_extractor.exceptions import LLMExecutionError
+from doc_extractor.routing import DEFAULT_MODEL
 from doc_extractor.schemas import (
     CASASchema,
     DischargeSummarySchema,
@@ -350,7 +351,7 @@ class SchemaGuidedExtractor:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
+        model_name: str = DEFAULT_MODEL,
         use_llm: bool = False,
         allow_fallback: bool = True,
         prompt_version: str = "1.0.0",
