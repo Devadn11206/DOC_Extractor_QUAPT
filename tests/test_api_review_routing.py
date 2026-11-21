@@ -20,8 +20,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from doc_extractor.api.contracts.extraction import ExtractionResponse
+from doc_extractor.api.contracts.extraction import ExtractionResponse, _FieldNames
 from doc_extractor.api.contracts.records import ReviewTaskRecord, ReviewTaskStatus
 from doc_extractor.api.services import correction_validation
 from doc_extractor.api.services import review_routing as module
@@ -436,6 +437,121 @@ def test_a_flag_reference_that_cannot_be_mapped_safely_is_dropped_but_its_code_i
     decision = _route(_envelope({"applicant.full_name": _good(), "applicant.pan_card_number": _good()}, flags))
     assert decision.needs_review and decision.draft.flagged_fields == () and decision.draft.flag_codes == ("RULE_X",)
     assert decision.draft.document_reasons == ("FLAGS_RAISED",) and SECRET not in repr(decision)
+
+
+ARABIC_ONE = chr(0x0661)         # Unicode digits (built with chr()) that a ``\d`` index check would accept
+FULLWIDTH_ONE = chr(0xFF11)
+UNMAPPABLE = [
+    f"nominees.{ARABIC_ONE}.name", f"nominees.{FULLWIDTH_ONE}.name", "nominees.0\n.name", "nominees.0 .name", "nominees.0\r\n.name",
+    "nominees..name", "nominees.1234.name", "nominees." + "0." * 70 + "name", f"free text {SECRET}", "", "\n", "x" * 400,
+]
+
+
+def _dropping_envelope(references):
+    """DOC-02: ``nominees.0.name`` is flagged by the gate (low OCR); the flag also names ``references``."""
+    flags = [FlagItem(code="RULE_X", message=SECRET_MESSAGE, fields=["nominees.0.name", *references, "nominees.share_percentage"])]
+    return _envelope({"proposer_name": _entry("proposer_name"), "nominees.0.name": _entry("nominees.0.name", ocr=0.2)}, flags,
+                     document_type="DOC-02")
+
+
+@pytest.mark.parametrize("reference", UNMAPPABLE)
+def test_an_unmappable_reference_is_dropped_and_the_valid_ones_still_route(reference):
+    decision = _route(_dropping_envelope([reference]))
+    assert decision.needs_review
+    assert _paths(decision) == ["nominees.0.name", "nominees.share_percentage"]
+    by_path = {item.path: item for item in decision.draft.flagged_fields}
+    assert by_path["nominees.0.name"].flag_codes == ("RULE_X",) and by_path["nominees.0.name"].reasons          # reasons kept
+    assert by_path["nominees.share_percentage"].flag_codes == ("RULE_X",)
+    assert decision.draft.flag_codes == ("RULE_X",)                                  # the flag's own code is kept
+    text = repr(decision)
+    assert SECRET not in text and SECRET_MESSAGE not in text and "free text" not in text
+
+
+def test_every_reference_unmappable_still_routes_with_the_flag_code_and_the_gate_reasons():
+    decision = _route(_dropping_envelope(UNMAPPABLE).model_copy(update={"flags": [FlagItem(code="RULE_X", message="m", fields=UNMAPPABLE)]}))
+    assert decision.needs_review and decision.draft.flag_codes == ("RULE_X",)
+    assert _paths(decision) == ["nominees.0.name"] and decision.draft.flagged_fields[0].flag_codes == ()
+    assert decision.draft.flagged_fields[0].reasons                                      # the low-confidence field keeps its gate reason
+
+
+def test_valid_references_keep_their_identifiers_unaltered_beside_unmappable_ones():
+    valid = ["nominees.0.name", "nominees.12.name", "nominees.999.share_percentage", "nominees.share_percentage"]
+    flags = [FlagItem(code="RULE_X", message="m", fields=[*UNMAPPABLE[:4], *valid, *UNMAPPABLE[4:]])]
+    decision = _route(_envelope({"nominees.0.name": _entry("nominees.0.name", ocr=0.2)}, flags, document_type="DOC-02"))
+    assert _paths(decision) == ["nominees.0.name", "nominees.12.name", "nominees.999.share_percentage", "nominees.share_percentage"]
+
+
+def test_the_over_long_but_canonical_looking_reference_is_dropped_by_the_routing_guard_itself():
+    """Every segment an index: the API-004 mapping calls it canonical, the draft cannot hold it (128 characters): dropped, not fatal."""
+    reference = "nominees." + "0." * 70 + "name"
+    envelope = _dropping_envelope([reference])
+    assert len(reference) > module.MAX_PATH_LENGTH
+    assert _FieldNames.for_envelope(envelope).public_reference(reference) == reference
+    assert reference not in _paths(_route(envelope)) and _paths(_route(envelope))
+
+
+def test_a_reference_that_is_not_text_is_dropped_too():
+    bad = FlagItem.model_construct(code="RULE_X", message="m", fields=["nominees.0.name", 7, None, b"nominees.0.name", ("a",), {"a": 1}])
+    decision = _route(_envelope({"nominees.0.name": _entry("nominees.0.name", ocr=0.2)}, [], document_type="DOC-02").model_copy(update={"flags": [bad]}))
+    assert _paths(decision) == ["nominees.0.name"] and decision.draft.flagged_fields[0].flag_codes == ("RULE_X",)
+
+
+@pytest.mark.parametrize("reference", UNMAPPABLE[:7])
+def test_the_draft_and_the_api_response_drop_the_same_references(reference):
+    envelope = _dropping_envelope([reference])
+    assert set(ExtractionResponse.from_envelope(envelope).flags[0].fields) == {"nominees.0.name", "nominees.share_percentage"}
+    assert set(_paths(_route(envelope))) == {"nominees.0.name", "nominees.share_percentage"}
+
+
+def test_dropping_a_reference_logs_nothing_and_leaves_the_envelope_unmodified(caplog):
+    envelope = _dropping_envelope(UNMAPPABLE)
+    before = envelope.model_dump_json()
+    with caplog.at_level(logging.DEBUG):
+        _route(envelope)
+    assert caplog.records == [] and envelope.model_dump_json() == before
+
+
+def test_an_unmappable_reference_does_not_turn_an_approval_into_a_review_or_the_reverse():
+    clean = _envelope({"applicant.full_name": _entry("applicant.full_name")}, [], document_type="DOC-01")
+    assert _route(clean).outcome is ReviewRoutingOutcome.AUTO_APPROVE
+    flagged = _envelope({"applicant.full_name": _entry("applicant.full_name", ocr=0.2)}, [FlagItem(code="RULE_X", message="m", fields=UNMAPPABLE)])
+    assert _route(flagged).needs_review
+
+
+def test_a_genuine_routing_failure_is_still_fail_closed_with_unmappable_references_present(monkeypatch):
+    envelope = _dropping_envelope(UNMAPPABLE)
+
+    def broken(self, reference):
+        raise RuntimeError(f"fault {SECRET}")
+
+    monkeypatch.setattr(_FieldNames, "public_reference", broken)
+    with pytest.raises(ReviewRoutingError) as caught:
+        _route(envelope)
+    assert caught.value.code == RoutingErrorCode.ROUTING_FAILED and SECRET not in str(caught.value)
+
+
+@pytest.mark.parametrize("kwargs, code", [
+    ({"document": "doc_other"}, RoutingErrorCode.DOCUMENT_ID_MISMATCH),
+    ({"tenant": ""}, RoutingErrorCode.TENANT_REQUIRED),
+    ({"now": datetime(2026, 3, 1)}, RoutingErrorCode.INVALID_TIMESTAMP),
+])
+def test_the_other_refusals_are_unchanged_when_the_flags_hold_unmappable_references(kwargs, code):
+    with pytest.raises(ReviewRoutingError) as caught:
+        _route(_dropping_envelope(UNMAPPABLE), **kwargs)
+    assert caught.value.code == code
+
+
+def test_a_non_routable_status_is_still_refused_with_unmappable_references_present():
+    with pytest.raises(ReviewRoutingError) as caught:
+        _route(_with_status(_dropping_envelope(UNMAPPABLE), "failed"))
+    assert caught.value.code == RoutingErrorCode.STATUS_NOT_ROUTABLE
+
+
+def test_a_flagged_field_still_refuses_an_unsafe_identifier_directly():
+    for path in (f"nominees.{ARABIC_ONE}.name", "nominees.0\n.name", "x" * 129, "", "a b"):
+        with pytest.raises(ValidationError):
+            FlaggedField(path=path, flag_codes=("RULE_X",))
+    assert FlaggedField(path="nominees.0.name", flag_codes=("RULE_X",)).path == "nominees.0.name"
 
 
 def test_the_draft_identifiers_equal_the_api_004_response_identifiers_for_the_same_envelope():

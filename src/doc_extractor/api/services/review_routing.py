@@ -27,7 +27,8 @@ What this module adds around the shared gate (integrity guards, none of them a p
 THE DRAFT HOLDS CODES AND IDENTIFIERS ONLY. It never holds an extracted value, evidence text, a flag message (which can quote
 values), a model prompt, a run diagnostic or a document type. Field identifiers go through the SAME mapping as the API-004
 response (``api.contracts.extraction._FieldNames``): a schema-canonical path keeps its name, every other field becomes a
-positional ``field_N`` and an unmappable flag reference is dropped, so a model-chosen field key (which can be document
+positional ``field_N`` and an unmappable flag reference is dropped (only that reference: the routing, the other references and
+the flag's own code are kept), so a model-chosen field key (which can be document
 content) is never copied. A test pins that the draft's identifiers equal the response's for the same envelope. Flag codes are
 copied only when they are upper-case tokens; anything else becomes the fixed ``RULE_VIOLATION``.
 
@@ -108,6 +109,11 @@ class ReviewRoutingOutcome(str, Enum):
 
 # ---- the draft and the decision ----------------------------------------------------------------------------------------------
 
+def _is_public_path(value: Any) -> bool:
+    """The ONE definition of a public field identifier a draft may hold (ASCII, bounded, no whitespace)."""
+    return isinstance(value, str) and len(value) <= MAX_PATH_LENGTH and _PUBLIC_PATH.fullmatch(value) is not None
+
+
 def _tokens(values: Tuple[str, ...], allowed: Optional[FrozenSet[str]] = None) -> Tuple[str, ...]:
     for value in values:
         if not isinstance(value, str) or not _CODE_TOKEN.fullmatch(value) or (allowed is not None and value not in allowed):
@@ -129,7 +135,7 @@ class FlaggedField(BaseModel):
     @field_validator("path")
     @classmethod
     def _path(cls, value: str) -> str:
-        if len(value) > MAX_PATH_LENGTH or not _PUBLIC_PATH.fullmatch(value):
+        if not _is_public_path(value):
             raise ValueError("not a public field identifier")
         return value
 
@@ -338,7 +344,9 @@ def _decide(
             flag_codes.append(code)
         for reference in flag.fields:
             path = names.public_reference(reference)
-            if path and code not in codes_by_path.setdefault(path, []):
+            if not _is_public_path(path):                          # an unmappable reference is dropped, never the whole routing
+                continue
+            if code not in codes_by_path.setdefault(path, []):
                 codes_by_path[path].append(code)
 
     flagged: List[FlaggedField] = []

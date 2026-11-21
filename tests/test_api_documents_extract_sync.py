@@ -24,11 +24,13 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from doc_extractor.api.app import create_app
 from doc_extractor.api.composition import ApplicationContainer
 from doc_extractor.api.config import ApiSettings
 from doc_extractor.api.contracts.documents import SCOPE_DOCUMENTS_READ, SCOPE_DOCUMENTS_WRITE
+from doc_extractor.api.contracts import extraction as contract
 from doc_extractor.api.contracts.extraction import ExtractionResponse
 from doc_extractor.api.ports.authentication import ApiPrincipal
 from doc_extractor.api.services import document_extraction_service as extraction_module
@@ -68,7 +70,7 @@ def _envelope(document_id: str) -> CanonicalExtractionEnvelope:
     return CanonicalExtractionEnvelope(
         document_id=document_id,
         document_metadata=DocumentMetadata(
-            document_type="DOC-01", schema_id="casa_account_opening", schema_version="1.0.0",
+            document_type="DOC-01", schema_id="DOC-01", schema_version="1.0.0",
             classification_confidence=0.8, status="needs_review", page_count=1, pages_processed=1,
             document_category="structured", language="en",
             pages=[{"page": 1, "model": SECRET_MODEL}],
@@ -337,8 +339,8 @@ def test_generic_extraction_gets_positional_identifiers_and_no_model_generated_n
 
 
 def test_a_document_type_that_is_not_a_bound_schema_is_not_trusted_even_with_a_canonical_looking_key():
-    """A schema id or document type that merely exists is not a binding: only a key of SCHEMA_MAP is."""
-    for document_type in ("generic", "DOC-99", "casa_account_opening", "UNKNOWN"):
+    """Of the exposable document types, only a key of SCHEMA_MAP is a binding (the generic and UNKNOWN types are not)."""
+    for document_type in ("generic", "UNKNOWN"):
         envelope = _hostile_envelope(
             document_type=document_type,
             fields={"applicant.full_name": ExtractedField(value="SECRET-V")},
@@ -390,6 +392,47 @@ def test_malformed_or_foreign_paths_are_never_canonical(path):
         document_type="DOC-01", fields={path: ExtractedField(value="v")}, flag_refs=[path]))
     assert list(public.fields) == ["field_1"]
     assert public.flags[0].fields == ["field_1"]
+
+
+ARABIC_ONE = chr(0x0661)          # built with chr(): Unicode digits that ``\d`` accepts
+FULLWIDTH_ONE = chr(0xFF11)
+DEVANAGARI_ONE = chr(0x0967)
+
+
+@pytest.mark.parametrize("segment", ["0", "7", "12", "999", "007"])
+def test_a_list_index_is_one_to_three_ascii_digits(segment):
+    assert contract._INDEX_SEGMENT.fullmatch(segment)
+    bound = contract._bound_field_set("DOC-02")
+    assert contract._canonical(f"nominees.{segment}.name", bound)
+
+
+@pytest.mark.parametrize("segment", [
+    "", "1234", ARABIC_ONE, FULLWIDTH_ONE, DEVANAGARI_ONE, "1" + ARABIC_ONE, "0\n", "\n0", "0\r", "0\r\n", " 0", "0 ", "0\t", "-1", "+1",
+    "0\x00", chr(0xB2), "0" + chr(0x200B), "x", "1a",
+])
+def test_anything_else_is_not_a_list_index_and_is_never_canonical(segment):
+    assert not contract._INDEX_SEGMENT.fullmatch(segment)
+    bound = contract._bound_field_set("DOC-02")
+    path = f"nominees.{segment}.name"
+    assert not contract._canonical(path, bound)
+    public = ExtractionResponse.from_envelope(_hostile_envelope(
+        document_type="DOC-02", schema_id="DOC-02", fields={path: ExtractedField(value="v")}, flag_refs=[path]))
+    assert list(public.fields) == ["field_1"] and public.flags[0].fields == ["field_1"]
+    assert "nominees" not in public.model_dump_json()
+
+
+def test_the_index_check_does_not_change_the_other_identifier_formats():
+    """Valid existing mappings are preserved: every canonical shape of the three bound schemas is still recognised."""
+    from doc_extractor.extractor import SCHEMA_MAP
+
+    for document_type, schema_cls in SCHEMA_MAP.items():
+        bound = contract._bound_field_set(document_type)
+        assert bound == contract.schema_field_paths(schema_cls) and bound
+        for path in sorted(bound):
+            assert contract._canonical(path, bound), (document_type, path)
+            if "." in path:
+                assert contract._canonical(path.replace(".", ".0.", 1), bound), (document_type, path)   # a position after the first segment
+    assert not contract._canonical("applicant.full_name\n", contract._bound_field_set("DOC-01"))
 
 
 def test_positional_ids_never_collide_with_a_canonical_identifier():
@@ -448,6 +491,73 @@ def test_hostile_model_output_through_the_real_route_never_reaches_the_response_
     meta = body["document_metadata"]                    # the real service sets these from its classifier: only constrained members survive
     assert meta["document_category"] in (None, "structured", "unstructured", "handwritten") and meta["language"] in (None, "en", "hi", "te", "ta", "ml")
     assert meta["document_subtype"] in (None, "brochure", "pamphlet", "menu card", "CASA leaflet", "invitation card", "other")
+
+
+VALID_IDS = ["DOC-01", "DOC-02", "DOC-03", "UNKNOWN", "generic"]
+INVALID_IDS = ["DOC-99", "doc-01", "DOC-01 ", "DOC-01\n", " DOC-01", "DOC-1", "casa_account_opening", "Generic", "unknown", "", "x" * 300,
+               HOSTILE_KEY, "DOC-0" + ARABIC_ONE, "DOC-01" + chr(0x200B), "loan.form-v2"]
+
+
+def _with_ids(document_type="DOC-01", schema_id="DOC-01"):
+    """An envelope whose two identifiers are set AFTER validation (``model_copy`` does not validate), as a faulty pipeline could."""
+    envelope = _hostile_envelope(document_type="DOC-01", fields={"applicant.full_name": ExtractedField(value="SECRET-V")}, flag_refs=[])
+    meta = envelope.document_metadata.model_copy(update={"document_type": document_type, "schema_id": schema_id})
+    return envelope.model_copy(update={"document_metadata": meta})
+
+
+@pytest.mark.parametrize("value", VALID_IDS)
+def test_every_code_defined_document_type_and_schema_id_is_exposed_unchanged(value):
+    public = ExtractionResponse.from_envelope(_with_ids(document_type=value, schema_id=value))
+    assert public.document_metadata.document_type == value and public.document_metadata.schema_id == value
+
+
+@pytest.mark.parametrize("document_type, schema_id", [("DOC-01", "DOC-01"), ("UNKNOWN", "UNKNOWN"), ("generic", "generic"), ("DOC-03", "DOC-03")])
+def test_the_values_the_pipeline_emits_are_all_accepted(document_type, schema_id):
+    ExtractionResponse.from_envelope(_with_ids(document_type=document_type, schema_id=schema_id))
+
+
+@pytest.mark.parametrize("value", INVALID_IDS)
+@pytest.mark.parametrize("which", ["document_type", "schema_id"])
+def test_an_unknown_document_type_or_schema_id_fails_the_serialization_and_is_never_exposed(which, value):
+    with pytest.raises(ValidationError) as caught:
+        ExtractionResponse.from_envelope(_with_ids(**{which: value}))
+    text = str(caught.value)
+    assert "not a code-defined identifier" in text
+    assert value.strip() == "" or value.strip() not in text.replace("DOC-01", "")      # the offending value is not echoed
+    assert "input_value" not in text
+
+
+def test_the_allowed_identifiers_are_the_ones_the_code_already_defines_not_a_second_registry():
+    from doc_extractor.contracts_b import MVPDocumentType
+    from doc_extractor.extractor import SCHEMA_MAP
+    from doc_extractor.pipeline_c import ModuleCPipeline
+
+    allowed = contract._allowed_ids()
+    assert allowed == {member.value for member in MVPDocumentType} | {"generic"}
+    assert set(SCHEMA_MAP) <= allowed
+    assert contract.GENERIC_DOCUMENT_TYPE == inspect.signature(ModuleCPipeline.process_routed_pages).parameters["document_type"].default
+    assert {"DOC-01", "DOC-02", "DOC-03", "UNKNOWN", "generic"} == allowed
+
+
+HOSTILE_ID = "Jane-Roe-SSN-987-65-4321-zq"       # distinctive: a short digit run such as "4111" also occurs in log timestamps
+
+
+@pytest.mark.parametrize("which, document_type, schema_id", [
+    ("document_type", HOSTILE_ID, "DOC-01"),
+    ("schema_id", "DOC-01", HOSTILE_ID),
+    ("schema_id", "DOC-01", "casa_account_opening"),
+])
+def test_an_unknown_document_type_or_schema_id_through_the_real_route_is_a_sanitized_generic_500(tmp_path, logs, which, document_type, schema_id):
+    api = _make_api(tmp_path)
+    document_id = _upload(api)
+    api["module_c"].process_routed_pages.side_effect = lambda payload_b, *a, **k: _hostile_envelope(
+        document_type="DOC-01", fields=None).model_copy(update={"document_id": payload_b.document_id, "document_metadata": _hostile_envelope(
+            document_type="DOC-01", fields=None).document_metadata.model_copy(update={"document_type": document_type, "schema_id": schema_id})})
+    response = _extract(api, document_id)
+    value = schema_id if which == "schema_id" else document_type
+    _assert_generic_500(response, value, "ValidationError", "code-defined", "document_type")
+    assert value not in logs.text and "code-defined" not in logs.text
+    assert any("reason=extract_unexpected_error" in record for record in logs.records)
 
 
 def test_the_route_is_in_the_openapi_contract_with_its_errors(api):

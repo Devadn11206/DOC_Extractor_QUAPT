@@ -16,6 +16,9 @@ PROVISIONAL privacy rule (no masking policy is approved yet, SEC-007 / the respo
   really bound (``document_type`` is a key of ``extractor.SCHEMA_MAP`` and the path belongs to that schema's own field set);
   every other field gets a positional public id (``field_1``, ``field_2``...), through ONE mapping that is also applied to
   ``flags[].fields`` (an unmappable reference is dropped, never copied);
+- DOCUMENT TYPE AND SCHEMA ID: both come from the pipeline but are exposed only when they are members of the code-defined set
+  (``MVPDocumentType`` plus the generic type). Unlike the free-text metadata below they are required, so any other value is not
+  omitted: it fails the serialization, which the extraction service answers as its generic, fixed-reason 500;
 - FREE-TEXT METADATA: ``document_category``, ``document_subtype`` and ``language`` come from a model. They are exposed only
   when they equal a member of the constrained set the code already defines (``DocumentCategory``, ``UNSTRUCTURED_SUBTYPES``,
   the ``LANGUAGES`` codes); anything else is omitted (``null``).
@@ -29,14 +32,18 @@ import re
 import typing
 from typing import Dict, FrozenSet, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from doc_extractor.contracts_c import CanonicalExtractionEnvelope, EvidenceSnippet, ExtractedField
 
 REDACTION_NOTICE = "redacted"
 
-# A list index inside a canonical path (``nominees.0.name``): a short run of digits, nothing else.
-_INDEX_SEGMENT = re.compile(r"^\d{1,3}$")
+# A list index inside a canonical path (``nominees.0.name``): one to three ASCII digits and nothing else. Matched with
+# ``fullmatch`` on an explicit ``[0-9]`` class: ``\d`` accepts other scripts' digits and ``$`` accepts a trailing newline.
+_INDEX_SEGMENT = re.compile(r"[0-9]{1,3}")
+
+# The generic (no bound schema) document type, as the extraction pipeline names it (``ModuleC.process_routed_pages`` default).
+GENERIC_DOCUMENT_TYPE = "generic"
 
 
 class PublicEvidence(BaseModel):
@@ -74,7 +81,9 @@ class PublicFlag(BaseModel):
 
 
 class PublicDocumentMetadata(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    """``document_type`` and ``schema_id`` are exposed only when they are members of the code-defined set (see ``_allowed_ids``)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     document_type: str
     schema_id: str
@@ -86,6 +95,14 @@ class PublicDocumentMetadata(BaseModel):
     document_subtype: Optional[str] = None
     language: Optional[str] = None
     pages_processed: Optional[int] = None
+
+    @field_validator("document_type", "schema_id")
+    @classmethod
+    def _code_defined(cls, value: str) -> str:
+        """Unlike the free-text metadata (omitted when unknown) these are required: an unknown value fails the whole response."""
+        if not isinstance(value, str) or value not in _allowed_ids():
+            raise ValueError("not a code-defined identifier")
+        return value
 
 
 class PublicRun(BaseModel):
@@ -155,6 +172,17 @@ class ExtractionResponse(BaseModel):
 
 # ---- constrained free-text metadata -----------------------------------------------------------------------------------------
 
+def _allowed_ids() -> FrozenSet[str]:
+    """
+    The identifiers the code defines for ``document_type`` AND ``schema_id``: the members of ``MVPDocumentType`` (the three
+    ``extractor.SCHEMA_MAP`` schemas, whose schema id is their document type, and ``UNKNOWN``) plus the generic type. Every
+    pipeline path that sets either field uses one of these (``pipeline_c``, ``processing_service``, the schema registry).
+    """
+    from doc_extractor.contracts_b import MVPDocumentType
+
+    return frozenset(member.value for member in MVPDocumentType) | {GENERIC_DOCUMENT_TYPE}
+
+
 def _allowed_categories() -> FrozenSet[str]:
     from doc_extractor.routing import DocumentCategory          # lazy: the routing module is heavy
 
@@ -221,7 +249,7 @@ def _canonical(path: object, bound: Optional[FrozenSet[str]]) -> bool:
     if bound is None or not isinstance(path, str) or not path:
         return False
     segments = path.split(".")
-    return all(segments) and ".".join(s for s in segments if not _INDEX_SEGMENT.match(s)) in bound
+    return all(segments) and ".".join(s for s in segments if not _INDEX_SEGMENT.fullmatch(s)) in bound
 
 
 class _FieldNames:
