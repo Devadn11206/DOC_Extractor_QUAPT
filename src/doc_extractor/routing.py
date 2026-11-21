@@ -46,11 +46,12 @@ DEFAULT_ROUTING_TABLE: Dict[str, Any] = {
     "version": "1.0.0",
     "default_model": DEFAULT_MODEL,
     "routes": {
-        # Until GLM-OCR returns boxes (FR-RTE-006) its values are all withheld, so every category runs on the
-        # Qwen3-VL default, which gives grounded boxes, checkboxes and character grids. GLM-OCR + text LLM stays
-        # selectable as the "ocr_text" alt engine for the FR-RTE-007 comparison.
-        "structured": {"default": DEFAULT_MODEL},
-        "unstructured": {"default": DEFAULT_MODEL},
+        # Digital printed pages: GLM-OCR reads the text, Qwen3-4B-Instruct-2507 (text only, non-thinking)
+        # formats it into JSON. No boxes on this route, so its values are withheld and flagged (GR-002).
+        "structured": {"default": {"adapter": "ocr_text", "ocr_model": "zai-org/GLM-OCR",
+                                   "text_model": "Qwen/Qwen3-4B-Instruct-2507"}},
+        "unstructured": {"default": {"adapter": "ocr_text", "ocr_model": "zai-org/GLM-OCR",
+                                     "text_model": "Qwen/Qwen3-4B-Instruct-2507"}},
         # Handwriting: the vision model reads the page image directly.
         "handwritten": {"default": DEFAULT_MODEL},
     },

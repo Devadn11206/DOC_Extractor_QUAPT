@@ -23,7 +23,15 @@ import threading
 from typing import Any, Dict, Optional, Tuple
 
 from doc_extractor.contracts_c import ExecutionMode, ExecutionProvenance
-from doc_extractor.extractor import gpu_dtype, load_capped_image, parse_json_tolerant
+from doc_extractor.extractor import (
+    attach_field_confidence,
+    free_gpu_memory,
+    gpu_dtype,
+    load_capped_image,
+    make_bnb_config,
+    parse_json_tolerant,
+    token_confidences,
+)
 from doc_extractor.vlm_runtime import resolve_trust_remote_code
 
 logger = logging.getLogger("doc_extractor.adapters")
@@ -122,23 +130,28 @@ class OCRTextAdapter(ModelAdapter):
         return self._ocr, self._ocr_proc
 
     def _load_text(self):
-        if self._txt is None:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+        if self._txt is not None and self._tok is not None:
+            return self._txt, self._tok
+        with self._txt_lock:
+            if self._txt is None or self._tok is None:
+                import torch
+                from transformers import AutoModelForCausalLM, AutoTokenizer
 
-            self._tok = AutoTokenizer.from_pretrained(
-                self.text_model, trust_remote_code=resolve_trust_remote_code(self.text_model)
-            )
-            kwargs: Dict[str, Any] = {
-                "device_map": _side_device(),
-                "trust_remote_code": resolve_trust_remote_code(self.text_model),  # False: native class
-            }
-            if self.load_in_4bit:
-                kwargs["quantization_config"] = make_bnb_config()
-            else:
-                kwargs["torch_dtype"] = gpu_dtype()
-            self._txt = AutoModelForCausalLM.from_pretrained(self.text_model, **kwargs)
-            self._txt.eval()
+                tok = AutoTokenizer.from_pretrained(
+                    self.text_model, trust_remote_code=resolve_trust_remote_code(self.text_model)
+                )
+                kwargs: Dict[str, Any] = {
+                    "device_map": _side_device(),
+                    "trust_remote_code": resolve_trust_remote_code(self.text_model),  # False: native class
+                }
+                if self.load_in_4bit:
+                    kwargs["quantization_config"] = make_bnb_config()  # NF4 + double quantization
+                else:
+                    kwargs["torch_dtype"] = gpu_dtype()
+                model = AutoModelForCausalLM.from_pretrained(self.text_model, **kwargs)
+                model.eval()
+                self._tok = tok     # published last, after eval(): a concurrent caller never sees a half-ready model
+                self._txt = model
         return self._txt, self._tok
 
     # -- steps -----------------------------------------------------------

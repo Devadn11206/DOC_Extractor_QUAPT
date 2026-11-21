@@ -121,7 +121,8 @@ class RoutedResultsExtractor:
                 box = None                                  # a route without boxes cannot carry evidence
             elif box is not None and result.rotation:
                 box = unrotate_bbox_norm(box, result.rotation)
-            out[path] = PageLeaf(value=leaf.value, bbox_norm=box, raw_value=leaf.raw_value, uncertain=leaf.uncertain)
+            out[path] = PageLeaf(value=leaf.value, bbox_norm=box, raw_value=leaf.raw_value, uncertain=leaf.uncertain,
+                                confidence=leaf.confidence)
         return out
 
     @staticmethod

@@ -7,7 +7,8 @@ Shared by both static ModuleCPipeline and dynamic DynamicExtractionAdapter.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Collection, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
+import os
 import re
 
 from doc_extractor.contracts_b import ConfidenceProvenance, PageLayoutOutput
@@ -25,6 +26,25 @@ from doc_extractor.validation_rules import calibrate_field_confidence
 
 # Existing default per-field review threshold (FR-CNF-002; overridable per schema field).
 DEFAULT_FIELD_CONFIDENCE_THRESHOLD = 0.75
+# FR-CNF-002 / FR-CNF-004 default review thresholds by field class. Per-field schema metadata overrides them.
+KEY_FIELD_CONFIDENCE_THRESHOLD = 0.95          # FR-CNF-004: schema-marked key fields
+HANDWRITTEN_FIELD_CONFIDENCE_THRESHOLD = 0.75  # FR-CNF-002: handwriting-derived fields
+# Standard printed fields keep the shared 0.75 default (existing tests lock it); set DOC_PRINTED_FIELD_THRESHOLD=0.85
+# to apply the stricter printed bar. Per-field schema metadata still overrides both.
+PRINTED_FIELD_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("DOC_PRINTED_FIELD_THRESHOLD", DEFAULT_FIELD_CONFIDENCE_THRESHOLD)
+)
+
+
+def resolve_field_threshold(
+    is_key_field: bool = False, is_handwritten: bool = False, explicit: Optional[float] = None
+) -> float:
+    """Review threshold for one field: an explicit per-field value wins; else key 0.95, handwritten 0.75, printed 0.85."""
+    if explicit is not None:
+        return explicit
+    if is_key_field:
+        return KEY_FIELD_CONFIDENCE_THRESHOLD
+    return HANDWRITTEN_FIELD_CONFIDENCE_THRESHOLD if is_handwritten else PRINTED_FIELD_CONFIDENCE_THRESHOLD
 
 # Flag code for a schema-required field that no page produced (forces needs_review).
 REQUIRED_FIELD_MISSING = "REQUIRED_FIELD_MISSING"
@@ -92,12 +112,14 @@ def assemble_field_entry(
     flags: List[FlagItem],
     error: Optional[str] = None,
     required: bool = False,
-    confidence_threshold: float = DEFAULT_FIELD_CONFIDENCE_THRESHOLD,
+    confidence_threshold: Optional[float] = None,
     evidence_required: bool = True,
     explicit_null_reason: Optional[Literal["absent", "illegible"]] = None,
     strict_boolean_evidence: bool = True,
     evidence_hint: Optional[Dict[str, Any]] = None,
     model_confidence: Optional[float] = None,
+    is_key_field: bool = False,
+    is_handwritten: bool = False,
 ) -> ExtractedField:
     """
     Assembles a validated ExtractedField envelope with evidence grounding (FR-EXT-004, GR-002),
@@ -185,6 +207,8 @@ def assemble_field_entry(
             evidence=None,
         )
 
+    threshold = resolve_field_threshold(is_key_field, is_handwritten, confidence_threshold)
+
     # 3. Validation Status
     has_validation_failed = (error is not None)
     validation_status = "failed" if has_validation_failed else "passed"
@@ -194,6 +218,7 @@ def assemble_field_entry(
         ocr_confidence=optical_conf,
         model_confidence=model_confidence,
         validation_passed=not has_validation_failed,
+        is_handwritten=is_handwritten,
         has_evidence=(evidence_model is not None),
     )
 
@@ -203,7 +228,7 @@ def assemble_field_entry(
     review_required = (
         has_validation_failed
         or confidence is None
-        or (confidence < confidence_threshold)
+        or (confidence < threshold)
         or (required and value is None)
         or evidence_uncertain
     )
@@ -234,6 +259,7 @@ class ReviewReason(str, Enum):
     FIELD_REVIEW_REQUIRED = "FIELD_REVIEW_REQUIRED"          # the field's own ``review_required`` indicator is set
     FIELD_VALIDATION_FAILED = "FIELD_VALIDATION_FAILED"      # the field's validation failed
     CONFIDENCE_NOT_AUTHORIZING = "CONFIDENCE_NOT_AUTHORIZING"  # a value whose confidence is unavailable or uncalibrated
+    KEY_FIELD_CONFIDENCE_LOW = "KEY_FIELD_CONFIDENCE_LOW"      # FR-CNF-004: a key field with confidence < 0.95 or none
 
 
 @dataclass(frozen=True)
@@ -256,6 +282,7 @@ def assess_review_requirement(
     fields: Mapping[str, ExtractedField],
     flags: Sequence[FlagItem],
     payload_status: str = "processing",
+    key_fields: Collection[str] = (),
 ) -> ReviewAssessment:
     """
     THE document-level review gate (FR-CNF-003, GR-027), the only implementation of it: ``assemble_canonical_envelope`` uses
@@ -292,6 +319,11 @@ def assess_review_requirement(
             reasons.append(ReviewReason.FIELD_VALIDATION_FAILED)
         if f.value is not None and (f.confidence is None or f.confidence_provenance in NON_AUTHORIZING_PROVENANCE):
             reasons.append(ReviewReason.CONFIDENCE_NOT_AUTHORIZING)
+        # FR-CNF-004: a key field with a value must reach the key bar (0.95), or the whole document is reviewed.
+        if key in key_fields and f.value is not None and (
+            f.confidence is None or f.confidence < KEY_FIELD_CONFIDENCE_THRESHOLD
+        ):
+            reasons.append(ReviewReason.KEY_FIELD_CONFIDENCE_LOW)
         if reasons:
             field_reasons.append((key, tuple(reasons)))
     return ReviewAssessment(tuple(document_reasons), tuple(field_reasons))
@@ -312,6 +344,7 @@ def assemble_canonical_envelope(
     prompt_version: str = "1.0.0",
     provenance: Optional[ExecutionProvenance] = None,
     payload_status: str = "processing",
+    key_fields: Collection[str] = (),
 ) -> CanonicalExtractionEnvelope:
     """
     Applies document-level status gating (FR-CNF-003, GR-027) and constructs
@@ -320,7 +353,7 @@ def assemble_canonical_envelope(
     A document is auto-approved only if none of the conditions of ``assess_review_requirement`` (the single implementation
     of the gate, SCH-012 ``needs_review``) holds.
     """
-    requires_review = assess_review_requirement(document_type, fields, flags, payload_status).requires_review
+    requires_review = assess_review_requirement(document_type, fields, flags, payload_status, key_fields).requires_review
 
     if payload_status == "failed":
         final_status: Literal["processing", "auto_approved", "needs_review", "reviewed", "rejected", "failed"] = "failed"
