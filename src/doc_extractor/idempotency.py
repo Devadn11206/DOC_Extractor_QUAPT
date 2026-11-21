@@ -15,8 +15,9 @@ from pathlib import Path
 import threading
 from typing import Dict, Optional, Tuple, Union
 
-from doc_extractor.exceptions import ConflictError, StorageError
+from doc_extractor.exceptions import ConflictError, StorageError, TenantStorageUnavailableError
 from doc_extractor.models import IdempotencyRecord
+from doc_extractor.tenancy import TenantDirectoryResolver, ensure_inside_tenant
 
 
 class IdempotencyStore(ABC):
@@ -54,23 +55,33 @@ class LocalIdempotencyStore(IdempotencyStore):
         self.base_dir = Path(base_dir).resolve()
         self.window_seconds = window_seconds
         self._lock = threading.Lock()
-        self._key_locks: Dict[str, threading.Lock] = {}
+        # keyed by the (tenant, key) PAIR: a joined string such as 'a:b' + 'c' vs 'a' + 'b:c' would alias
+        self._key_locks: Dict[Tuple[str, str], threading.RLock] = {}
+        self._resolver = TenantDirectoryResolver(self.base_dir)
 
-    def get_key_lock(self, tenant_id: str, idempotency_key: str) -> threading.Lock:
-        """Returns a thread lock specific to (tenant_id, idempotency_key)."""
-        composite = f"{tenant_id}:{idempotency_key}"
+    def get_key_lock(self, tenant_id: str, idempotency_key: str) -> threading.RLock:
+        """Returns a reentrant thread lock specific to (tenant_id, idempotency_key)."""
+        composite = (tenant_id, idempotency_key)
         with self._lock:
             if composite not in self._key_locks:
-                self._key_locks[composite] = threading.Lock()
+                self._key_locks[composite] = threading.RLock()
             return self._key_locks[composite]
 
-    def _get_record_path(self, tenant_id: str, idempotency_key: str) -> Path:
+    def _get_record_path(self, tenant_id: str, idempotency_key: str, *, create: bool = False) -> Path:
         import hashlib
-        safe_tenant = Path(tenant_id).name
+        # Same verified, collision-proof tenant directory as LocalDiskStorage (doc_extractor.tenancy): an unsafe
+        # identity is refused with a typed error (never "sanitized": Path(tenant_id).name used to collapse
+        # "tenant_a/../tenant_b" into "tenant_b"), colliding identities cannot share records, symlinks are refused.
+        # Reads (get/delete) never create anything: only save_record provisions the tenant and its idempotency directory.
+        tenant_dir = self._resolver.resolve(tenant_id, create=create)
+        idempotency_dir = ensure_inside_tenant(tenant_dir, tenant_dir / "idempotency")
+        if create:
+            try:
+                idempotency_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise TenantStorageUnavailableError("directory_not_creatable") from exc
         key_hash = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
-        tenant_dir = (self.base_dir / safe_tenant / "idempotency").resolve()
-        tenant_dir.mkdir(parents=True, exist_ok=True)
-        return tenant_dir / f"{key_hash}.json"
+        return ensure_inside_tenant(tenant_dir, idempotency_dir / f"{key_hash}.json")
 
     def get_record(self, tenant_id: str, idempotency_key: str) -> Optional[IdempotencyRecord]:
         file_path = self._get_record_path(tenant_id, idempotency_key)
@@ -81,35 +92,74 @@ class LocalIdempotencyStore(IdempotencyStore):
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             rec = IdempotencyRecord(**data)
-            # Check 24h expiration
+            # Check 24h expiration (pure read: never mutates or deletes backing storage)
             if rec.is_expired():
-                file_path.unlink(missing_ok=True)
                 return None
             return rec
         except Exception as exc:
             raise StorageError(
-                message=f"Failed to load idempotency record: {str(exc)}",
+                message="Failed to load idempotency record.",
                 details={"tenant_id": tenant_id, "idempotency_key": idempotency_key},
             ) from exc
 
     def save_record(self, record: IdempotencyRecord) -> None:
-        file_path = self._get_record_path(record.tenant_id, record.idempotency_key)
+        file_path = self._get_record_path(record.tenant_id, record.idempotency_key, create=True)
         temp_file = file_path.parent / f".tmp_{file_path.name}"
 
-        try:
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(record.to_dict(), f, indent=2)
-            temp_file.replace(file_path)
-        except Exception as exc:
-            if temp_file.exists():
-                temp_file.unlink(missing_ok=True)
-            raise StorageError(
-                message=f"Failed to persist idempotency record: {str(exc)}",
-                details={"tenant_id": record.tenant_id, "idempotency_key": record.idempotency_key},
-            ) from exc
+        with self.get_key_lock(record.tenant_id, record.idempotency_key):
+            try:
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(record.to_dict(), f, indent=2)
+                temp_file.replace(file_path)
+            except Exception as exc:
+                if temp_file.exists():
+                    temp_file.unlink(missing_ok=True)
+                raise StorageError(
+                    message="Failed to persist idempotency record.",
+                    details={"tenant_id": record.tenant_id, "idempotency_key": record.idempotency_key},
+                ) from exc
 
     def delete_record(self, tenant_id: str, idempotency_key: str) -> None:
         file_path = self._get_record_path(tenant_id, idempotency_key)
-        if file_path.exists():
-            file_path.unlink(missing_ok=True)
+        with self.get_key_lock(tenant_id, idempotency_key):
+            if file_path.exists():
+                try:
+                    file_path.unlink(missing_ok=True)
+                except Exception as exc:
+                    raise StorageError(
+                        message="Failed to delete idempotency record.",
+                        details={"tenant_id": tenant_id, "idempotency_key": idempotency_key},
+                    ) from exc
+
+    def cleanup_expired_record(self, tenant_id: str, idempotency_key: str) -> bool:
+        """
+        Explicitly removes an expired record file.
+        Returns True if an expired record was found and deleted, False otherwise.
+        Thread-safe: synchronizes on the per-key reentrant lock and re-verifies expiry under the lock.
+        """
+        file_path = self._get_record_path(tenant_id, idempotency_key)
+        if not file_path.exists():
+            return False
+
+        with self.get_key_lock(tenant_id, idempotency_key):
+            if not file_path.exists():
+                return False
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                rec = IdempotencyRecord(**data)
+                if rec.is_expired():
+                    self._on_cleanup_about_to_unlink(tenant_id, idempotency_key)
+                    file_path.unlink(missing_ok=True)
+                    return True
+                return False
+            except Exception as exc:
+                raise StorageError(
+                    message="Failed to cleanup expired idempotency record.",
+                    details={"tenant_id": tenant_id, "idempotency_key": idempotency_key},
+                ) from exc
+
+    def _on_cleanup_about_to_unlink(self, tenant_id: str, idempotency_key: str) -> None:
+        """Test hook: called under key lock immediately before unlinking an expired record."""
+        pass
 

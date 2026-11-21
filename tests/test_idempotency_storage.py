@@ -154,6 +154,102 @@ def test_idempotency_conflict_different_content(service, sample_pdf_bytes):
     assert exc_info.value.code == "IDEMPOTENCY_KEY_CONFLICT"
 
 
+def _orphan(service, key, pdf, name="first.pdf"):
+    """Ingest a document under ``key`` and then remove the document only: the idempotency record is left orphaned."""
+    first = service.ingest_document(file_path_or_stream=io.BytesIO(pdf), claimed_filename=name, idempotency_key=key)
+    assert first.is_accepted is True
+    service.storage.cleanup_document(first.document_id)
+    assert service.storage.get_document_record(first.document_id) is None
+    assert service.idempotency_store.get_record(service.tenant_id, key) is not None, "the record is orphaned, not removed"
+    return first
+
+
+def test_orphaned_idempotency_record_with_a_different_file_is_discarded_and_ingested_afresh(service, sample_pdf_bytes):
+    """R3: the orphan check runs BEFORE the fingerprint comparison, so a stale record cannot answer 409."""
+    key = "idem_key_orphan_r3"
+    first = _orphan(service, key, sample_pdf_bytes)
+    different = create_minimal_pdf(page_count=4)
+    res = service.ingest_document(file_path_or_stream=io.BytesIO(different), claimed_filename="other.pdf", idempotency_key=key)
+    assert res.is_accepted is True and res.idempotent_replay is False
+    assert res.document_id != first.document_id
+    record = service.idempotency_store.get_record(service.tenant_id, key)
+    assert record.document_id == res.document_id, "the key now belongs to the fresh document"
+    # and it is a normal key from here on: same request replays, a different one conflicts (its document exists)
+    replay = service.ingest_document(file_path_or_stream=io.BytesIO(different), claimed_filename="other.pdf", idempotency_key=key)
+    assert replay.idempotent_replay is True and replay.document_id == res.document_id
+    with pytest.raises(ConflictError):
+        service.ingest_document(file_path_or_stream=io.BytesIO(sample_pdf_bytes), claimed_filename="first.pdf", idempotency_key=key)
+
+
+def test_orphaned_idempotency_record_with_the_same_file_is_ingested_afresh_not_replayed(service, sample_pdf_bytes):
+    key = "idem_key_orphan_same"
+    first = _orphan(service, key, sample_pdf_bytes)
+    res = service.ingest_document(file_path_or_stream=io.BytesIO(sample_pdf_bytes), claimed_filename="first.pdf", idempotency_key=key)
+    assert res.is_accepted and res.idempotent_replay is False and res.document_id != first.document_id
+
+
+def test_a_record_whose_document_exists_still_conflicts_and_is_never_deleted(service, sample_pdf_bytes):
+    key = "idem_key_live_conflict"
+    first = service.ingest_document(file_path_or_stream=io.BytesIO(sample_pdf_bytes), claimed_filename="first.pdf", idempotency_key=key)
+    before = service.idempotency_store.get_record(service.tenant_id, key)
+    with pytest.raises(ConflictError):
+        service.ingest_document(
+            file_path_or_stream=io.BytesIO(create_minimal_pdf(page_count=4)), claimed_filename="other.pdf", idempotency_key=key
+        )
+    after = service.idempotency_store.get_record(service.tenant_id, key)
+    assert after is not None and after.document_id == first.document_id and after.to_dict() == before.to_dict()
+    assert service.storage.get_document_record(first.document_id) is not None
+
+
+def test_recovering_an_orphan_never_touches_another_tenants_record(base_dir, mock_scanner, sample_pdf_bytes):
+    store = LocalIdempotencyStore(base_dir=base_dir)
+
+    def make(tenant):
+        return IngestionService(
+            settings=Settings(storage_base_dir=base_dir), scanner=mock_scanner,
+            storage=LocalDiskStorage(base_dir=base_dir, tenant_id=tenant), idempotency_store=store, tenant_id=tenant,
+        )
+
+    alpha, beta = make("tenant_alpha"), make("tenant_beta")
+    key = "idem_key_shared_value"
+    beta_doc = beta.ingest_document(file_path_or_stream=io.BytesIO(sample_pdf_bytes), claimed_filename="b.pdf", idempotency_key=key)
+    beta_before = store.get_record("tenant_beta", key).to_dict()
+    _orphan(alpha, key, sample_pdf_bytes, "a.pdf")
+    res = alpha.ingest_document(
+        file_path_or_stream=io.BytesIO(create_minimal_pdf(page_count=5)), claimed_filename="a2.pdf", idempotency_key=key
+    )
+    assert res.is_accepted and res.document_id != beta_doc.document_id
+    assert store.get_record("tenant_beta", key).to_dict() == beta_before
+    assert beta.storage.get_document_record(beta_doc.document_id) is not None
+
+
+def test_concurrent_requests_after_an_orphan_stay_safe(service, sample_pdf_bytes):
+    key = "idem_key_orphan_concurrent"
+    different = create_minimal_pdf(page_count=4)
+    for payloads, expected_conflicts in (((sample_pdf_bytes, sample_pdf_bytes), 0), ((sample_pdf_bytes, different), 1)):
+        _orphan(service, key, sample_pdf_bytes if payloads[0] is sample_pdf_bytes else different)
+        outcomes, barrier = [], threading.Barrier(2)
+
+        def worker(content, name):
+            barrier.wait()
+            try:
+                outcomes.append(service.ingest_document(file_path_or_stream=io.BytesIO(content), claimed_filename=name, idempotency_key=key))
+            except ConflictError as exc:
+                outcomes.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(c, "x.pdf" if c is sample_pdf_bytes else "y.pdf")) for c in payloads]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        accepted = [o for o in outcomes if not isinstance(o, ConflictError)]
+        assert len(outcomes) == 2 and len(outcomes) - len(accepted) == expected_conflicts
+        assert len({o.document_id for o in accepted}) == 1, "exactly one document came out of the race"
+        record = service.idempotency_store.get_record(service.tenant_id, key)
+        assert record.document_id == accepted[0].document_id
+        assert service.storage.get_document_record(record.document_id) is not None
+        service.storage.cleanup_document(record.document_id)
+        service.idempotency_store.delete_record(service.tenant_id, key)
+
+
 @pytest.mark.security
 def test_idempotency_conflict_different_params(service, sample_pdf_bytes):
     """Reusing the same key with different request parameters fails with IDEMPOTENCY_KEY_CONFLICT."""

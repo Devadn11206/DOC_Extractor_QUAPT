@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
 import json
 import logging
 import re
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 from doc_extractor.contracts_c import ExecutionMode, ExecutionProvenance
@@ -91,6 +92,8 @@ class OCRTextAdapter(ModelAdapter):
         self._ocr_proc = None
         self._txt = None
         self._tok = None
+        self._ocr_lock = threading.Lock()
+        self._txt_lock = threading.Lock()
 
     @property
     def model_label(self) -> str:
@@ -98,19 +101,24 @@ class OCRTextAdapter(ModelAdapter):
 
     # -- loading ---------------------------------------------------------
     def _load_ocr(self):
-        if self._ocr is None:
-            import torch
-            from transformers import AutoModelForImageTextToText, AutoProcessor
+        if self._ocr is not None and self._ocr_proc is not None:
+            return self._ocr, self._ocr_proc
+        with self._ocr_lock:
+            if self._ocr is None or self._ocr_proc is None:
+                import torch
+                from transformers import AutoModelForImageTextToText, AutoProcessor
 
-            self._ocr_proc = AutoProcessor.from_pretrained(
-                self.ocr_model, trust_remote_code=resolve_trust_remote_code(self.ocr_model)
-            )
-            self._ocr = AutoModelForImageTextToText.from_pretrained(
-                self.ocr_model, torch_dtype=gpu_dtype(), device_map=_side_device(),
-                trust_remote_code=resolve_trust_remote_code(self.ocr_model),
-                attn_implementation="sdpa",
-            )
-            self._ocr.eval()
+                proc = AutoProcessor.from_pretrained(
+                    self.ocr_model, trust_remote_code=resolve_trust_remote_code(self.ocr_model)
+                )
+                model = AutoModelForImageTextToText.from_pretrained(
+                    self.ocr_model, torch_dtype=gpu_dtype(), device_map=_side_device(),
+                    trust_remote_code=resolve_trust_remote_code(self.ocr_model),
+                    attn_implementation="sdpa",
+                )
+                model.eval()
+                self._ocr_proc = proc
+                self._ocr = model
         return self._ocr, self._ocr_proc
 
     def _load_text(self):

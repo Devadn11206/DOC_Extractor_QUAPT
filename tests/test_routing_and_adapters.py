@@ -213,13 +213,19 @@ def test_the_app_keeps_the_v15_ui_features():
 
 
 def test_rotate_page_turns_a_page_clockwise(tmp_path):
+    from doc_extractor.processing_service import RequestTemporaryWorkspace
+
     path = tmp_path / "wide.png"
     img = Image.new("RGB", (60, 20), "white")
     img.putpixel((0, 0), (255, 0, 0))                                             # top-left marker
     img.save(path)
-    turned = Image.open(app._rotate_page(path, 90))
-    assert turned.size == (20, 60)
-    assert turned.getpixel((19, 0)) == (255, 0, 0)                                # top-left -> top-right when clockwise
+    with RequestTemporaryWorkspace() as workspace:
+        turned_path = app._rotate_page(path, 90, workspace=workspace)
+        assert turned_path.exists()
+        turned = Image.open(turned_path)
+        assert turned.size == (20, 60)
+        assert turned.getpixel((19, 0)) == (255, 0, 0)                            # top-left -> top-right when clockwise
+    assert not turned_path.exists()
 
 
 def test_the_streaming_steps_panel_tracks_state_and_timing():

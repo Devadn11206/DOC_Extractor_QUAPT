@@ -3,6 +3,8 @@
 
 pytest>=7.0.0
 pytest-cov>=4.0.0
+# HTTP test client for the FastAPI / Starlette test suite (dev only, never a runtime dependency)
+httpx>=0.24.0
 
 # Upstream reported a dataclass-slots problem with pytest 9.x on Python 3.10.0 exactly; this has
 # not been verified here (no Python 3.10 available). On 3.10.0 use 3.10.1+ or pin pytest<9.

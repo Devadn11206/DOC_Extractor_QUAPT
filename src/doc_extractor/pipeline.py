@@ -8,6 +8,7 @@ Validation -> Malware Scanning -> Content Hashing -> PDF Rendering (200 DPI)
 """
 
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 import time
 from typing import BinaryIO, Dict, List, Optional, Union
@@ -48,6 +49,7 @@ class ModuleAPipeline:
         idempotency_store: Optional[IdempotencyStore] = None,
         queue_adapter: Optional[QueueAdapter] = None,
         tenant_id: str = "default_tenant",
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self.settings = settings or Settings()
         self.tenant_id = tenant_id
@@ -62,11 +64,17 @@ class ModuleAPipeline:
         self.storage = storage or LocalDiskStorage(self.settings.storage_base_dir, tenant_id=self.tenant_id)
         self.idempotency_store = idempotency_store or LocalIdempotencyStore(self.settings.storage_base_dir)
         self.queue_adapter = queue_adapter
-        self.logger = setup_logging(
-            level=self.settings.log_level,
-            service_name=self.settings.service_name,
-            environment=self.settings.app_env,
-        )
+        if logger is not None:
+            self.logger = logger
+        elif logging.getLogger("doc_extractor").hasHandlers():
+            self.logger = logging.getLogger("doc_extractor")
+        else:
+            self.logger = setup_logging(
+                level=self.settings.log_level,
+                service_name=self.settings.service_name,
+                environment=self.settings.app_env,
+                clear_existing=False,
+            )
 
         self.ingestion_service = IngestionService(
             settings=self.settings,
@@ -74,9 +82,10 @@ class ModuleAPipeline:
             storage=self.storage,
             idempotency_store=self.idempotency_store,
             tenant_id=self.tenant_id,
+            logger=self.logger,
         )
-        self.renderer = PdfRenderer(settings=self.settings, storage=self.storage)
-        self.preprocessor = PagePreprocessor(settings=self.settings, storage=self.storage)
+        self.renderer = PdfRenderer(settings=self.settings, storage=self.storage, logger=self.logger)
+        self.preprocessor = PagePreprocessor(settings=self.settings, storage=self.storage, logger=self.logger)
 
     def process_document(
         self,
@@ -332,6 +341,20 @@ class ModuleAPipeline:
             )
             # Ensure failed status and rollback
             self.storage.cleanup_preprocessed(doc_id)
+            # Invalidate orphaned idempotency record if processing failed and document was rolled back
+            if idempotency_key and hasattr(self, "idempotency_store") and self.idempotency_store is not None:
+                try:
+                    if hasattr(self.idempotency_store, "get_key_lock"):
+                        with self.idempotency_store.get_key_lock(self.tenant_id, idempotency_key):
+                            rec = self.idempotency_store.get_record(self.tenant_id, idempotency_key)
+                            if rec and rec.document_id == doc_id and self.storage.get_document_record(doc_id) is None:
+                                self.idempotency_store.delete_record(self.tenant_id, idempotency_key)
+                    else:
+                        rec = self.idempotency_store.get_record(self.tenant_id, idempotency_key)
+                        if rec and rec.document_id == doc_id and self.storage.get_document_record(doc_id) is None:
+                            self.idempotency_store.delete_record(self.tenant_id, idempotency_key)
+                except Exception:
+                    pass
             completed_at = datetime.now(timezone.utc).isoformat()
             err_dict = (
                 exc.to_envelope()["error"]

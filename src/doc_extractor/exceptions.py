@@ -9,50 +9,8 @@ Adheres to:
 
 from typing import Any, Dict, Optional
 
-
-class DocumentExtractorError(Exception):
-    """
-    Base exception for all Document Extraction Engine errors.
-    
-    Ensures safe error formatting:
-    1. Holds machine-readable standard error codes.
-    2. Enforces that messages do not expose document content or PII.
-    3. Formats to the PRD standard error envelope.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        code: str = "INTERNAL_ERROR",
-        request_id: Optional[str] = None,
-        details: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.code = code
-        self.request_id = request_id
-        self.details = details or {}
-
-    def to_envelope(self) -> Dict[str, Any]:
-        """
-        Return the standardized error envelope required by PRD API-010:
-        {
-            "error": {
-                "code": "...",
-                "message": "...",
-                "request_id": "...",
-                "details": { ... }
-            }
-        }
-        """
-        return {
-            "error": {
-                "code": self.code,
-                "message": self.message,
-                "request_id": self.request_id,
-                "details": self.details,
-            }
-        }
+# One shared base for Module A and M4 (see engine_errors): a re-export, not a copy.
+from engine_errors import DocumentExtractorError  # noqa: F401
 
 
 class ConfigurationError(DocumentExtractorError):
@@ -67,6 +25,30 @@ class ConfigurationError(DocumentExtractorError):
         super().__init__(
             message=message,
             code="CONFIGURATION_FAILED",
+            request_id=request_id,
+            details=details,
+        )
+
+
+class ComponentConfigurationError(ConfigurationError, ValueError):
+    """
+    Raised when server-side components, storage backends, or pipeline dependencies
+    are misconfigured, missing required tenant context, or exhibit internal wiring faults.
+    Mapped to generic HTTP 500 INTERNAL_ERROR (never concealed as 404).
+    Internal diagnostic details are logged server-side and never exposed to clients.
+    """
+
+    def __init__(
+        self,
+        message: str = "Component configuration error.",
+        code: str = "CONFIGURATION_FAILED",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        DocumentExtractorError.__init__(
+            self,
+            message=message,
+            code=code,
             request_id=request_id,
             details=details,
         )
@@ -206,6 +188,92 @@ class StorageError(DocumentExtractorError):
             code=code,
             request_id=request_id,
             details=details,
+        )
+
+
+class CrossTenantStorageAccessError(StorageError):
+    """
+    A storage reference names another tenant's data or escapes the caller's tenant directory. Distinct from
+    ``TenantStorageIsolationError`` (an integrity fault in the tenant's own location): the REST API answers this one
+    exactly like a missing resource (404, SEC-006) so another tenant's data cannot be probed.
+    """
+
+    def __init__(self, details: Optional[Dict[str, Any]] = None, request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="Cross-tenant access or path escape forbidden.",
+            code="CROSS_TENANT_ACCESS_FORBIDDEN",
+            request_id=request_id,
+            details=details,
+        )
+
+
+class InvalidTenantIdentifierError(StorageError, ValueError):
+    """
+    A tenant identifier is not usable as an isolation boundary (empty, oversized, or able to leave its own
+    directory). It is a ``ValueError`` too, so model validators turn it into a typed validation error, and a
+    ``StorageError`` so storage callers can catch it. The offending value is never echoed.
+    """
+
+    def __init__(self, reason: str, request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="Invalid tenant identifier.",
+            code="INVALID_TENANT_IDENTIFIER",
+            request_id=request_id,
+            details={"reason": reason},
+        )
+
+
+class TenantMismatchError(DocumentExtractorError, ValueError):
+    """
+    Raised when an incoming request tenant conflicts with a tenant-bound service or workspace context.
+    Inherits from ValueError for model/validator compatibility and DocumentExtractorError.
+    Mapped to HTTP 404 concealed as DOCUMENT_NOT_FOUND per SEC-006 so tenant existence cannot be probed.
+    The offending tenant identifier(s) must NEVER be disclosed in the message.
+    Server-side component configuration errors use ComponentConfigurationError (HTTP 500), not this class.
+    """
+
+    def __init__(
+        self,
+        message: str = "Tenant boundary mismatch: request tenant does not match service context.",
+        request_id: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(
+            message=message,
+            code="TENANT_MISMATCH",
+            request_id=request_id,
+            details=details,
+        )
+
+
+class TenantStorageIsolationError(StorageError):
+    """
+    A tenant's storage location failed an isolation check: it would collide with another identity on this
+    filesystem, is a symlink or leaves the tenant boundary, or carries another tenant's identity marker.
+    """
+
+    def __init__(self, reason: str, request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="Tenant storage isolation check failed.",
+            code="TENANT_STORAGE_ISOLATION_FAILED",
+            request_id=request_id,
+            details={"reason": reason},
+        )
+
+
+class TenantStorageUnavailableError(StorageError):
+    """
+    A tenant's storage location could not be read or provisioned (permissions, read-only or missing root, disk full).
+    Typed so callers never see a bare ``OSError``; ``details`` carry a short machine-readable reason only, never a
+    filesystem path (which would disclose the server layout).
+    """
+
+    def __init__(self, reason: str, request_id: Optional[str] = None) -> None:
+        super().__init__(
+            message="Tenant storage is unavailable.",
+            code="TENANT_STORAGE_UNAVAILABLE",
+            request_id=request_id,
+            details={"reason": reason},
         )
 
 

@@ -18,6 +18,7 @@ Order of operations:
 
 from dataclasses import asdict, dataclass, field
 import io
+import logging
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -86,6 +87,7 @@ class PagePreprocessor:
         skew_threshold_deg: float = 0.5,
         max_skew_detect_deg: float = 45.0,
         orientation_confidence_threshold: float = 2.0,
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self.settings = settings or Settings()
         self.storage = storage or LocalDiskStorage(self.settings.storage_base_dir)
@@ -94,11 +96,17 @@ class PagePreprocessor:
         self.skew_threshold_deg = skew_threshold_deg
         self.max_skew_detect_deg = max_skew_detect_deg
         self.orientation_confidence_threshold = orientation_confidence_threshold
-        self.logger = setup_logging(
-            level=self.settings.log_level,
-            service_name=self.settings.service_name,
-            environment=self.settings.app_env,
-        )
+        if logger is not None:
+            self.logger = logger
+        elif logging.getLogger("doc_extractor").hasHandlers():
+            self.logger = logging.getLogger("doc_extractor")
+        else:
+            self.logger = setup_logging(
+                level=self.settings.log_level,
+                service_name=self.settings.service_name,
+                environment=self.settings.app_env,
+                clear_existing=False,
+            )
 
     def load_image(self, image_input: Union[str, Path, bytes]) -> np.ndarray:
         """

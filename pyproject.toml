@@ -47,6 +47,17 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "httpx>=0.24.0",
+]
+# REST API foundation (doc_extractor.api). Not needed by the engine or the demo UI. Starlette is listed
+# directly because the API imports it; httpx (the TestClient transport) lives in 'dev', not here.
+# The floors are the M5 author's and are untested at their minimum (see README).
+api = [
+    "fastapi>=0.100.0,<1.0.0",
+    "starlette>=0.27.0",
+    "anyio>=3.4.0",           # imported directly by the upload guard (already required by every supported starlette)
+    "uvicorn>=0.22.0,<1.0.0",
+    "python-multipart>=0.0.9",
 ]
 # Interactive demo UI (doc_extractor.app). Not needed by the engine.
 ui = [

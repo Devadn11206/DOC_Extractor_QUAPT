@@ -44,7 +44,7 @@ from tests.test_dynamic_module_c_adapter import (  # noqa: F401
     sample_payload,
 )
 
-TENANT = "tenant-canon"
+TENANT = app.TENANT_ID
 VLM_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 
 CASA_VLM_OUTPUT: Dict[str, Any] = {
@@ -781,3 +781,339 @@ def test_dynamic_adapter_delegates_to_module_c_and_uses_vlm_grounding(
     assert env.fields["nominees.0.name"].value == "ROHIT SHARMA"
     assert env.run.provenance.details["pages_processed"] == [1]
     assert env.document_metadata.schema_version == 1
+
+
+def test_module_c_scope_generic_and_schema_bound_scenarios():
+    """
+    Directly test Module C coverage scope handling for both generic and schema-bound paths.
+    Scenarios:
+      - Scenario A: Intentional single-page processing with single-page payload (scope=[2], total=3) -> page_count=3, no flag
+      - Scenario A2: Intentional single-page processing with full-document payload (payload=[1, 2, 3], scope=[2], total=3) -> page_count=3, no flag
+      - Scenario B: Genuine incomplete processing (scope=[1, 2], p2 fails) -> PARTIAL_PAGE_COVERAGE with explanation
+      - Scenario C: Missing page within scope (scope=[1, 2], p2 not supplied) -> PARTIAL_PAGE_COVERAGE (not supplied)
+      - Scenario D: Whole-document processing (scope=[1, 2, 3], p3 fails) -> PARTIAL_PAGE_COVERAGE
+    """
+    from datetime import datetime, timezone
+    from doc_extractor.contracts_b import (
+        ClassificationOutput,
+        MVPClassificationDomain,
+        MVPDocumentType,
+        ModuleBOutputPayload,
+        PageLayoutOutput,
+    )
+    from doc_extractor.contracts_c import (
+        ExecutionMode,
+        ExecutionProvenance,
+        ModuleAPageRef,
+        PageImageRef,
+    )
+    from doc_extractor.routed_pages import RoutedPageResult
+
+    payload = ModuleBOutputPayload(
+        contract_version="1.0.0",
+        run_id="run_scope_test",
+        document_id="doc_scope_test",
+        tenant_id="tenant_scope",
+        status="processing",
+        classification=ClassificationOutput(
+            domain=MVPClassificationDomain.BFSI,
+            document_type=MVPDocumentType.DOC_01_CASA,
+            classification_confidence=0.95,
+            confidence_provenance="heuristic",
+        ),
+        pages=[
+            PageLayoutOutput(page_number=1, markdown_content="p1"),
+            PageLayoutOutput(page_number=2, markdown_content="p2"),
+            PageLayoutOutput(page_number=3, markdown_content="p3"),
+        ],
+        combined_markdown="p1\n\np2\n\np3",
+        parser_model_name="test_parser",
+        classifier_model_name="test_classifier",
+        processing_time_ms=10.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    # Scenario A uses a single-page payload (only page 2) to verify that
+    # Module C uses total_document_pages rather than len(payload.pages).
+    payload_single_page = ModuleBOutputPayload(
+        contract_version="1.0.0",
+        run_id="run_scope_test_single",
+        document_id="doc_scope_test_single",
+        tenant_id="tenant_scope",
+        status="processing",
+        classification=ClassificationOutput(
+            domain=MVPClassificationDomain.BFSI,
+            document_type=MVPDocumentType.DOC_01_CASA,
+            classification_confidence=0.95,
+            confidence_provenance="heuristic",
+        ),
+        pages=[
+            PageLayoutOutput(page_number=2, markdown_content="p2"),
+        ],
+        combined_markdown="p2",
+        parser_model_name="test_parser",
+        classifier_model_name="test_classifier",
+        processing_time_ms=10.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    def _make_ref(p_no: int) -> PageImageRef:
+        pr = ModuleAPageRef(
+            page_number=p_no,
+            original_artifact_id=f"art_orig_{p_no}",
+            preprocessed_artifact_id=f"art_prep_{p_no}",
+            original_storage_uri=f"uri_orig_{p_no}",
+            preprocessed_storage_uri=f"uri_prep_{p_no}",
+            original_width_px=100,
+            original_height_px=100,
+            preprocessed_width_px=100,
+            preprocessed_height_px=100,
+            metadata_storage_uri=f"uri_meta_{p_no}",
+        )
+        return PageImageRef(page_number=p_no, image_path=Path(f"/tmp/p{p_no}.png"), page_ref=pr)
+
+    img1 = _make_ref(1)
+    img2 = _make_ref(2)
+    img3 = _make_ref(3)
+
+    pipeline = ModuleCPipeline()
+
+    for is_schema_bound in (False, True):
+        mode_label = "schema_bound" if is_schema_bound else "generic"
+
+        # Scenario A: Intentional single-page processing with a single-page payload.
+        # The payload contains ONLY page 2 (len(payload_single_page.pages) == 1).
+        # Module C must use total_document_pages=3, NOT len(payload.pages)==1.
+        prov_a = ExecutionProvenance(
+            mode=ExecutionMode.GENUINE_LLM,
+            model_name="vlm",
+            provider="test",
+            details={"pages_processed": [2], "pages_failed": []},
+        )
+        res_a = RoutedPageResult(
+            page_number=2,
+            raw={"applicant.full_name": {"value": "Alice", "bbox": [10, 10, 50, 20]}},
+            provenance=prov_a,
+        )
+        env_a = pipeline.process_routed_pages(
+            payload_single_page,
+            [res_a],
+            [img2],
+            schema_bound=is_schema_bound,
+            expected_page_numbers=[2],
+            total_document_pages=3,
+        )
+        assert env_a.document_metadata.page_count == 3, (
+            f"[{mode_label}] Expected total page count 3 from total_document_pages, "
+            f"got {env_a.document_metadata.page_count} (must not use len(payload.pages)==1)"
+        )
+        coverage_flags_a = [f for f in env_a.flags if f.code == "PARTIAL_PAGE_COVERAGE"]
+        assert len(coverage_flags_a) == 0, f"[{mode_label}] Scenario A should not trigger PARTIAL_PAGE_COVERAGE"
+
+        # Scenario A2: Intentional single-page processing with a whole-document payload.
+        # The payload contains all three pages [1, 2, 3], but only page 2 was routed and processed.
+        # expected_page_numbers=[2] explicitly scopes expectations to page 2 only.
+        # If Module C ignores expected_page_numbers and defaults to [p.page_number for p in payload.pages],
+        # it would treat pages 1 and 3 as unsupplied/missing and trigger PARTIAL_PAGE_COVERAGE.
+        env_a2 = pipeline.process_routed_pages(
+            payload,
+            [res_a],
+            [img2],
+            schema_bound=is_schema_bound,
+            expected_page_numbers=[2],
+            total_document_pages=3,
+        )
+        assert env_a2.document_metadata.page_count == 3, (
+            f"[{mode_label}] Expected total page count 3 from total_document_pages, "
+            f"got {env_a2.document_metadata.page_count}"
+        )
+        coverage_flags_a2 = [f for f in env_a2.flags if f.code == "PARTIAL_PAGE_COVERAGE"]
+        assert len(coverage_flags_a2) == 0, (
+            f"[{mode_label}] Scenario A2 must not trigger PARTIAL_PAGE_COVERAGE when "
+            f"expected_page_numbers=[2] scopes the evaluation, got: {coverage_flags_a2}"
+        )
+
+        # Scenario B: Genuine incomplete processing (p1 succeeds, p2 fails)
+        prov_b = ExecutionProvenance(
+            mode=ExecutionMode.GENUINE_LLM,
+            model_name="vlm",
+            provider="test",
+            details={"pages_processed": [1], "pages_failed": [{"page": 2, "reason": "model timeout"}]},
+        )
+        r1_b = RoutedPageResult(
+            page_number=1,
+            raw={"applicant.full_name": {"value": "Alice", "bbox": [10, 10, 50, 20]}},
+            provenance=prov_b,
+        )
+        r2_b = RoutedPageResult(page_number=2, error="model timeout")
+        env_b = pipeline.process_routed_pages(
+            payload,
+            [r1_b, r2_b],
+            [img1, img2],
+            schema_bound=is_schema_bound,
+            expected_page_numbers=[1, 2],
+            total_document_pages=3,
+        )
+        flags_b = [f for f in env_b.flags if f.code == "PARTIAL_PAGE_COVERAGE"]
+        assert len(flags_b) == 1, f"[{mode_label}] Scenario B must trigger PARTIAL_PAGE_COVERAGE"
+        assert "page 2 (model timeout)" in flags_b[0].message
+
+        # Scenario C: Missing page within selected scope (scope=[1, 2], only img1 supplied)
+        prov_c = ExecutionProvenance(
+            mode=ExecutionMode.GENUINE_LLM,
+            model_name="vlm",
+            provider="test",
+            details={"pages_processed": [1], "pages_failed": []},
+        )
+        r1_c = RoutedPageResult(
+            page_number=1,
+            raw={"applicant.full_name": {"value": "Alice", "bbox": [10, 10, 50, 20]}},
+            provenance=prov_c,
+        )
+        env_c = pipeline.process_routed_pages(
+            payload,
+            [r1_c],
+            [img1],
+            schema_bound=is_schema_bound,
+            expected_page_numbers=[1, 2],
+            total_document_pages=3,
+        )
+        flags_c = [f for f in env_c.flags if f.code == "PARTIAL_PAGE_COVERAGE"]
+        assert len(flags_c) == 1, f"[{mode_label}] Scenario C must trigger PARTIAL_PAGE_COVERAGE"
+        assert "page 2 (no page image reference supplied)" in flags_c[0].message
+
+        # Scenario D: Whole-document processing (scope=[1, 2, 3], p3 fails)
+        prov_d = ExecutionProvenance(
+            mode=ExecutionMode.GENUINE_LLM,
+            model_name="vlm",
+            provider="test",
+            details={"pages_processed": [1, 2], "pages_failed": [{"page": 3, "reason": "out of memory"}]},
+        )
+        r1_d = RoutedPageResult(
+            page_number=1,
+            raw={"applicant.full_name": {"value": "Alice", "bbox": [10, 10, 50, 20]}},
+            provenance=prov_d,
+        )
+        r2_d = RoutedPageResult(
+            page_number=2,
+            raw={"applicant.pan_card_number": {"value": "ABCDE1234F", "bbox": [10, 10, 50, 20]}},
+            provenance=prov_d,
+        )
+        r3_d = RoutedPageResult(page_number=3, error="out of memory")
+        env_d = pipeline.process_routed_pages(
+            payload,
+            [r1_d, r2_d, r3_d],
+            [img1, img2, img3],
+            schema_bound=is_schema_bound,
+            expected_page_numbers=[1, 2, 3],
+            total_document_pages=3,
+        )
+        flags_d = [f for f in env_d.flags if f.code == "PARTIAL_PAGE_COVERAGE"]
+        assert len(flags_d) == 1, f"[{mode_label}] Scenario D must trigger PARTIAL_PAGE_COVERAGE"
+        assert "page 3 (out of memory)" in flags_d[0].message
+
+
+def test_module_c_early_return_paths_respect_total_document_pages():
+    """
+    Verify that CLASSIFICATION_UNCERTAIN and NO_SCHEMA_BOUND early-return paths in
+    ModuleCPipeline.process() use total_document_pages rather than len(payload.pages).
+
+    Both paths construct document_metadata.page_count from total_document_pages when
+    provided.  A single-page payload with total_document_pages=5 must report page_count=5.
+    """
+    from datetime import datetime, timezone
+    from doc_extractor.contracts_b import (
+        ClassificationOutput,
+        MVPClassificationDomain,
+        MVPDocumentType,
+        ModuleBOutputPayload,
+        PageLayoutOutput,
+    )
+
+    pipeline = ModuleCPipeline()
+
+    # -- CLASSIFICATION_UNCERTAIN path --
+    # Triggered by payload.status == "needs_review" or document_type == UNKNOWN.
+    # Use UNKNOWN to exercise both conditions.
+    payload_uncertain = ModuleBOutputPayload(
+        contract_version="1.0.0",
+        run_id="run_uncertain",
+        document_id="doc_uncertain",
+        tenant_id="tenant_early",
+        status="needs_review",
+        classification=ClassificationOutput(
+            domain=MVPClassificationDomain.BFSI,
+            document_type=MVPDocumentType.UNKNOWN,
+            classification_confidence=0.3,
+            confidence_provenance="heuristic",
+        ),
+        pages=[PageLayoutOutput(page_number=2, markdown_content="p2")],
+        combined_markdown="p2",
+        parser_model_name="test_parser",
+        classifier_model_name="test_classifier",
+        processing_time_ms=5.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    env_uncertain = pipeline.process(payload_uncertain, total_document_pages=5)
+    assert env_uncertain.document_metadata.page_count == 5, (
+        f"CLASSIFICATION_UNCERTAIN path: expected page_count=5 from total_document_pages, "
+        f"got {env_uncertain.document_metadata.page_count}"
+    )
+    uncertain_flags = [f for f in env_uncertain.flags if f.code == "CLASSIFICATION_UNCERTAIN"]
+    assert len(uncertain_flags) == 1
+
+    # Without total_document_pages, should fall back to len(payload.pages) == 1.
+    env_uncertain_no_total = pipeline.process(payload_uncertain)
+    assert env_uncertain_no_total.document_metadata.page_count == 1, (
+        f"CLASSIFICATION_UNCERTAIN path without total_document_pages: expected page_count=1 "
+        f"(from len(payload.pages)), got {env_uncertain_no_total.document_metadata.page_count}"
+    )
+
+    # -- NO_SCHEMA_BOUND path --
+    # Triggered when SCHEMA_MAP has no entry for the document_type.
+    # Use a valid non-UNKNOWN type with status="processing" but a type not in SCHEMA_MAP.
+    # We need a document_type whose .value is not in SCHEMA_MAP (DOC-01, DOC-02, DOC-03).
+    # Construct a payload with document_type=DOC_01_CASA but monkeypatch SCHEMA_MAP to miss it.
+    # Instead, construct a custom payload with an ad-hoc classification that bypasses the
+    # needs_review/UNKNOWN guard but whose schema_id won't match SCHEMA_MAP.
+    # The simplest way: use DOC_01_CASA with status="processing" and patch the SCHEMA_MAP.
+    from unittest.mock import patch
+    payload_no_schema = ModuleBOutputPayload(
+        contract_version="1.0.0",
+        run_id="run_no_schema",
+        document_id="doc_no_schema",
+        tenant_id="tenant_early",
+        status="processing",
+        classification=ClassificationOutput(
+            domain=MVPClassificationDomain.BFSI,
+            document_type=MVPDocumentType.DOC_01_CASA,
+            classification_confidence=0.92,
+            confidence_provenance="heuristic",
+        ),
+        pages=[PageLayoutOutput(page_number=3, markdown_content="p3")],
+        combined_markdown="p3",
+        parser_model_name="test_parser",
+        classifier_model_name="test_classifier",
+        processing_time_ms=5.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    with patch("doc_extractor.pipeline_c.SCHEMA_MAP", {}):
+        env_no_schema = pipeline.process(payload_no_schema, total_document_pages=7)
+    assert env_no_schema.document_metadata.page_count == 7, (
+        f"NO_SCHEMA_BOUND path: expected page_count=7 from total_document_pages, "
+        f"got {env_no_schema.document_metadata.page_count}"
+    )
+    no_schema_flags = [f for f in env_no_schema.flags if f.code == "NO_SCHEMA_BOUND"]
+    assert len(no_schema_flags) == 1
+
+    # Without total_document_pages, should fall back to len(payload.pages) == 1.
+    with patch("doc_extractor.pipeline_c.SCHEMA_MAP", {}):
+        env_no_schema_no_total = pipeline.process(payload_no_schema)
+    assert env_no_schema_no_total.document_metadata.page_count == 1, (
+        f"NO_SCHEMA_BOUND path without total_document_pages: expected page_count=1 "
+        f"(from len(payload.pages)), got {env_no_schema_no_total.document_metadata.page_count}"
+    )

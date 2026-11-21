@@ -10,6 +10,7 @@ Implements:
 
 from dataclasses import dataclass, field
 import io
+import logging
 import math
 from pathlib import Path
 from typing import BinaryIO, List, Optional, Tuple, Union
@@ -57,15 +58,22 @@ class PdfRenderer:
         self,
         settings: Optional[Settings] = None,
         storage: Optional[StorageBackend] = None,
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self.settings = settings or Settings()
         self.target_dpi = self.settings.target_render_dpi  # Strict PRD standard: 200
         self.storage = storage or LocalDiskStorage(self.settings.storage_base_dir)
-        self.logger = setup_logging(
-            level=self.settings.log_level,
-            service_name=self.settings.service_name,
-            environment=self.settings.app_env,
-        )
+        if logger is not None:
+            self.logger = logger
+        elif logging.getLogger("doc_extractor").hasHandlers():
+            self.logger = logging.getLogger("doc_extractor")
+        else:
+            self.logger = setup_logging(
+                level=self.settings.log_level,
+                service_name=self.settings.service_name,
+                environment=self.settings.app_env,
+                clear_existing=False,
+            )
 
     def calculate_scale(self, target_dpi: int) -> float:
         """

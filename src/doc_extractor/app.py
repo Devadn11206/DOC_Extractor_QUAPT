@@ -47,6 +47,14 @@ from doc_extractor.extractor import SchemaGuidedExtractor, SCHEMA_MAP
 from doc_extractor.pipeline import ModuleAPipeline
 from doc_extractor.pipeline_b import ModuleBPipeline, ReviewerOverrideRequest
 from doc_extractor.pipeline_c import ModuleCPipeline
+from doc_extractor.processing_service import (
+    DocumentProcessingRequest,
+    DocumentProcessingResult,
+    DocumentProcessingService,
+    ProcessingProgressEvent,
+    RequestTemporaryWorkspace,
+    _rotate_page as service_rotate_page,
+)
 from doc_extractor.routed_pages import RoutedPageResult
 from doc_extractor.routing import (
     DEFAULT_MODEL,
@@ -238,50 +246,8 @@ def _resolve_page(
     dynamic fields by default). A filename never binds a type or supplies a confidence, and the VLM
     router's self-reported type is advisory only (``suggested_document_type``).
     """
-    user_cat = bool(choices["category"]) and choices["category"] != AUTO
-    user_type = bool(choices["doc_type"]) and choices["doc_type"] != AUTO
-    user_lang = bool(choices["language"]) and choices["language"] != AUTO
-    user_sub = bool(choices["subtype"]) and choices["subtype"] != AUTO
-
-    auto: Dict[str, Any] = {}
-    if not (user_cat and user_type and user_lang):
-        hint_type = rule_type if page_no == 1 else None
-        hint_conf = rule_confidence if page_no == 1 else None
-        if img_path and img_path.exists():
-            auto = get_routed_extractor().classify(str(img_path), filename, hint_type, hint_conf)
-        else:
-            auto = heuristic_classify(filename, hint_type, hint_conf)
-
-    category = DocumentCategory(choices["category"].lower() if user_cat else auto.get("category", "structured"))
-    suggested = auto.get("document_type") or (rule_type if page_no == 1 else None)
-    doc_type = choices["doc_type"] if user_type else None
-    if doc_type not in SCHEMA_MAP or category != DocumentCategory.STRUCTURED:
-        doc_type = None          # a fixed schema applies to the structured category only
-    if suggested == doc_type:
-        suggested = None
-    language = LANGUAGES[choices["language"]] if user_lang else str(auto.get("language") or "en")
-    subtype = choices["subtype"] if user_sub else auto.get("subtype")
-    if category != DocumentCategory.UNSTRUCTURED or subtype in (None, "null"):
-        subtype = None
-
-    return {
-        "page": page_no,
-        "category": category.value,
-        "category_source": "user" if user_cat else "auto",
-        "document_type": doc_type or "generic",
-        "schema_id": doc_type,
-        "suggested_document_type": suggested,
-        "type_source": "user" if doc_type else "auto",
-        "subtype": subtype,
-        "language": language,
-        "language_source": "user" if user_lang else "auto",
-        # as measured, or None (unavailable): a user's choice carries no model confidence
-        "confidence": None if user_cat else auto.get("confidence"),
-        "method": "user" if user_cat else auto.get("method", "-"),
-        "rotation": _safe_rotation(auto.get("rotation")),
-        "router_model": auto.get("router_model"),
-        "filled_by": auto.get("filled_by"),
-    }
+    service = DocumentProcessingService(routed_extractor=get_routed_extractor())
+    return service.resolve_page(img_path, filename, rule_type, rule_confidence, choices, page_no)
 
 
 _STEP_ICONS = {"pending": "⬜", "running": "⏳", "done": "✅", "failed": "❌"}
@@ -324,12 +290,20 @@ def _safe_rotation(value: Any) -> int:
     return r if r in (90, 180, 270) else 0
 
 
-def _rotate_page(path: Path, clockwise_deg: int) -> Path:
-    """Turn a page image upright (clockwise degrees) and save a copy next to the system temp dir."""
-    out = Path(tempfile.gettempdir()) / f"upright_{clockwise_deg}_{path.name}"
-    with Image.open(path) as im:
-        im.rotate(-clockwise_deg, expand=True).save(out)
-    return out
+def _rotate_page(
+    path: Path,
+    clockwise_deg: int,
+    workspace: RequestTemporaryWorkspace,
+    page_no: int = 1,
+) -> Path:
+    """
+    Rotation helper delegating to the processing service's secure RequestTemporaryWorkspace.
+    Requires an explicit RequestTemporaryWorkspace to prevent unmanaged temporary file creation.
+    Maintained for backward compatibility and test verification.
+    """
+    if not isinstance(workspace, RequestTemporaryWorkspace):
+        raise TypeError("A valid RequestTemporaryWorkspace instance is required to rotate pages.")
+    return service_rotate_page(path, clockwise_deg, workspace=workspace, page_no=page_no)
 
 
 def _thumb(path: Path) -> Image.Image:
@@ -375,193 +349,158 @@ def _process_core(
 
     file_path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
     claimed_name = Path(file_path).name
-    choices = {"category": category_choice, "doc_type": doc_type_choice,
-               "subtype": subtype_choice, "language": language_choice}
+
     split_gallery: List[Tuple[Image.Image, str]] = []
 
     try:
         settings = settings if settings is not None else get_settings()
         pipe_a, pipe_b = get_pipelines(settings)
-
-        _step(steps, "upload", "Upload received", "done", claimed_name)
-        _step(steps, "split", "Split into page images (200 DPI) and clean up", "running")
-        yield None, "Splitting into page images...", "", "", None
-
-        # 1. Ingestion & preprocessing (Module A): every page rendered at 200 DPI
-        payload_a = pipe_a.process_document(file_path, claimed_filename=claimed_name)
-        if payload_a.status == "rejected":
-            err = json.dumps(payload_a.to_dict(), indent=2)
-            yield None, f"Rejected: {payload_a.error}", err, "", None
-            return
-
-        # (page number, image the model reads, original 200-DPI image evidence boxes refer to)
-        page_items: List[Tuple[int, Path, Optional[Path]]] = []
-        for n, rec in enumerate(payload_a.pages, start=1):
-            prep = pipe_a.storage.resolve_uri_to_path(rec.preprocessed_storage_uri)
-            orig = pipe_a.storage.resolve_uri_to_path(rec.original_storage_uri)
-            page_items.append((getattr(rec, "page_number", n), prep if prep.exists() else orig, orig))
-        if not page_items:
-            page_items = [(1, Path(file_path), None)]
-        total_pages = len(page_items)
-        if MAX_PAGES > 0:
-            page_items = page_items[:MAX_PAGES]
-        _step(steps, "split", state="done", detail=f"{total_pages} page image(s)" + (
-            f", reading the first {len(page_items)}" if total_pages > len(page_items) else ""))
-        split_gallery = [(_thumb(p), f"Page {n} (split)") for n, p, _ in page_items if p and Path(p).exists()]
-        if split_gallery:
-            pw, ph = split_gallery[0][0].size
-            _step(steps, "split", detail=steps[1]["detail"] + f" · page 1 is {pw}×{ph} px ({pw * ph / 1e6:.1f} MP)")
-        _step(steps, "cls", "Classify document from page 1 (router model, once)")
-        for n, _, _ in page_items:
-            _step(steps, f"ext{n}", f"Page {n}: extract fields")
-        _step(steps, "merge", "Validate and build JSON")
-        yield split_gallery or None, f"Split into {total_pages} page image(s).", "", "", None
-
-        # 2. Module B hand-off: explicit page-image references (authoritative geometry) and the
-        #    configured parser's classification hint (UNKNOWN / needs_review under the pass-through default)
-        page_refs = {ref.page_number: ref for ref in pipe_b.load_page_images(payload_a)}
-        payload_b = pipe_b.process_handoff(payload_a)
-        if payload_b.status == "failed":
-            err = payload_b.error or {}
-            msg = f"Module B failed: {err.get('code', 'UNKNOWN')}: {err.get('message', 'no detail')}"
-            yield split_gallery or None, msg, json.dumps({"error": err}, indent=2, default=str), "", None
-            return
-        module_b_type = payload_b.classification.document_type.value
-        rule_type = module_b_type if module_b_type != "UNKNOWN" else None
-        rule_confidence = payload_b.classification.classification_confidence if rule_type else None
-
-        engine = ENGINE_CHOICES.get(engine_choice)
+        pipe_c = get_module_c()
         routed = get_routed_extractor()
 
-        # Classify ONCE from page 1 and apply to every page (mixed-category PDFs are rare)
-        _step(steps, "cls", state="running", detail="detecting category, type and language")
-        yield (split_gallery or None, "Classifying the document from page 1...", "", "", None)
-        doc_info = _resolve_page(page_items[0][1], claimed_name, rule_type, rule_confidence, choices, 1)
-        _step(steps, "cls", state="done",
-              detail=f"{doc_info['category']} · {doc_info['document_type']} · {doc_info['language']} · {doc_info['category_source']}"
-                     + (f" · filled by {doc_info['filled_by']}" if doc_info.get("filled_by") else "")
-                     + (f" · {doc_info['router_model'].split('/')[-1]}" if doc_info.get("router_model") else ""))
-
-        rotation = doc_info.get("rotation", 0)
-        read_items = page_items
-        if rotation:
-            # Orientation fix: the router saw the page sideways/upside down, so the model reads an upright
-            # copy. Boxes are mapped back to the stored page by ModuleCPipeline (RoutedPageResult.rotation).
-            read_items = [(n, _rotate_page(p, rotation), o) for n, p, o in page_items]
-            _step(steps, "cls", detail=steps[[r["key"] for r in steps].index("cls")]["detail"] + f" · rotated {rotation}°")
-
-        category = DocumentCategory(doc_info["category"])
-        schema_cls = SCHEMA_MAP.get(doc_info["schema_id"]) if doc_info["schema_id"] else None
-        doc_type = doc_info["schema_id"]
-        if doc_type and payload_b.classification.document_type.value != doc_type:
-            # Explicit user choice: Module B's audited override path (FR-CLS-004) records who set the
-            # type and why, and binds the approved schema Module C will read.
-            payload_b = pipe_b.apply_reviewer_override(
-                payload_b,
-                ReviewerOverrideRequest(
-                    document_id=payload_b.document_id,
-                    tenant_id=payload_b.tenant_id,
-                    reviewer_id=OVERRIDE_REVIEWER_ID,
-                    new_document_type=MVPDocumentType(doc_type),
-                    override_reason="Document type explicitly selected in the extraction UI",
-                ),
-            )
-
-        pages_info: List[Dict[str, Any]] = []
-        page_results: List[RoutedPageResult] = []
-        routes: List[Dict[str, Any]] = []
-
-        for page_no, img_path, _orig in read_items:
-            info = dict(doc_info, page=page_no)
-            pages_info.append(info)
-            _step(steps, f"ext{page_no}", state="running", detail=f"routing to the {category.value} model")
-            yield (split_gallery or None,
-                   f"Page {page_no}/{len(read_items)}: classified as {category.value} ({info['language']}). Extracting...",
-                   "", _classification_markdown(pages_info), None)
-            try:
-                if not (img_path and img_path.exists()):
-                    raise FileNotFoundError(f"Page {page_no} image not found: {img_path}")
-                # 3. Extraction with the model routed for this page's category (the only inference)
-                raw_dict, prov, route = routed.extract(
-                    str(img_path), category, info["language"], schema_cls, info["subtype"], engine=engine
-                )
-            except Exception as exc:  # one failing page must not discard the others (PARTIAL_PAGE_COVERAGE)
-                page_results.append(RoutedPageResult(
-                    page_number=page_no, rotation=rotation, error=f"{type(exc).__name__}: {exc}"))
-                info["model_used"] = "-"
-                _step(steps, f"ext{page_no}", state="failed", detail=str(exc)[:120])
-                continue
-            info["model_used"] = route["model_used"]
-            info["fallback_occurred"] = route["fallback_occurred"]
-            routes.append({"page": page_no, **route})
-            page_results.append(RoutedPageResult(
-                page_number=page_no, raw=raw_dict, provenance=prov, route=route, rotation=rotation))
-            _step(steps, f"ext{page_no}", state="done",
-                  detail=f"{route['model_used']}{' (fallback)' if route['fallback_occurred'] else ''} · {len(raw_dict)} fields")
-
-        # 4. Canonical processing: normalization, evidence mapping, validation, gating, envelope
-        _step(steps, "merge", state="running")
-        refs = [page_refs[n] for n, _, _ in page_items if n in page_refs]
-        env: CanonicalExtractionEnvelope = get_module_c().process_routed_pages(
-            payload_b,
-            page_results,
-            refs,
-            system_prompt=build_generic_prompt(category, doc_info["subtype"], doc_info["language"]),
-            document_type=doc_type or "generic",
-            schema_bound=schema_cls is not None,
-            force_review=category == DocumentCategory.HANDWRITTEN,
+        # Shared processing service coordinates pipelines and invokes ModuleCPipeline.process_routed_pages
+        service = DocumentProcessingService(
+            module_a=pipe_a,
+            module_b=pipe_b,
+            module_c=pipe_c,
+            routed_extractor=routed,
+            tenant_id=TENANT_ID,
+            actor_id=OVERRIDE_REVIEWER_ID,
+            settings=settings,
         )
-        if total_pages > len(page_items):
-            env.flags.append(FlagItem(
-                code="PAGES_NOT_PROCESSED",
-                message=f"Read pages 1-{len(page_items)} of {total_pages} (demo cap DOC_MAX_PAGES={MAX_PAGES}).",
-                fields=[],
-            ))
 
-        first = pages_info[0]
-        specialists = sorted({p.get("model_used") for p in pages_info if p.get("model_used") not in (None, "-")})
-        md = env.document_metadata
-        md.document_category = first["category"]
-        md.document_subtype = first["subtype"]
-        md.language = first["language"]
-        md.pages_processed = len(page_items)
-        md.pages = [
-            {k: p.get(k) for k in ("page", "category", "document_type", "subtype", "language", "model_used")}
-            for p in pages_info
-        ]
-        env.run.routing = routes
-        env.run.confidence_calibrated = False
-        env.run.model_versions.update({
-            k: v for k, v in {
-                "router": first.get("router_model") or first.get("method"),
-                "specialist": ", ".join(specialists),
-                "normalizer": "deterministic-v1",
-            }.items() if v
-        })
-        _step(steps, "merge", state="done", detail=f"{len(env.fields)} fields · {len(env.flags)} flag(s)")
-
-        # Gallery: every page with the evidence located on it, drawn on the 200-DPI original (the frame
-        # the evidence boxes are expressed in) and then turned upright like the page the model read.
-        gallery: List[Tuple[Image.Image, str]] = []
-        for page_no, img_path, orig_path in page_items:
-            canvas_path = orig_path if orig_path and orig_path.exists() else img_path
-            with Image.open(canvas_path) as pil_img:
-                annotated = draw_bounding_boxes(pil_img, env.fields, page=page_no)
-            if rotation:
-                annotated = annotated.rotate(-rotation, expand=True)
-            gallery.append((annotated, f"Page {page_no}: {category.value}"))
-
-        json_text = json.dumps(env.model_dump(mode="json"), indent=2, default=str)
-        withheld = any(not r.route.get("grounded", True) for r in page_results)
-        status_msg = (
-            f"Status: {env.document_metadata.status.upper()} | Pages read: {len(page_items)}/{total_pages} | "
-            f"Fields: {len(env.fields)} | Flags: {len(env.flags)} | Model(s): {', '.join(specialists) or '-'}"
-            + (" | No boxes on this route: values withheld (EVIDENCE_MISSING); unverified readings are in "
-               "run.provenance.details" if withheld else "")
+        request = DocumentProcessingRequest(
+            file_path_or_stream=file_path,
+            claimed_filename=claimed_name,
+            tenant_id=TENANT_ID,
+            actor_id=OVERRIDE_REVIEWER_ID,
+            category_choice=category_choice,
+            doc_type_choice=doc_type_choice,
+            subtype_choice=subtype_choice,
+            language_choice=language_choice,
+            engine_choice=engine_choice,
+            max_pages=MAX_PAGES,
         )
-        yield (gallery, status_msg, json_text, _classification_markdown(pages_info),
-               _write_json_download(payload_a.document_id, json_text))
-        return
+
+        gradio_diagnostics: Dict[str, str] = {}
+
+        def _gradio_diagnostic_sink(stage: str, msg: str) -> None:
+            gradio_diagnostics[stage] = msg
+
+        for event in service.process_document_stream(request, diagnostic_sink=_gradio_diagnostic_sink):
+            step_detail = event.detail
+            if event.step_key.startswith("ext") and event.state == "failed":
+                diag = gradio_diagnostics.get(event.step_key)
+                if diag:
+                    step_detail = str(diag)[:120]
+            _step(steps, event.step_key, event.label, event.state, step_detail)
+
+            if event.step_key == "upload":
+                pass
+            elif event.step_key == "split":
+                if event.state == "running":
+                    yield None, "Splitting into page images...", "", "", None
+                elif event.state == "failed":
+                    result = event.result
+                    if result and result.is_rejected:
+                        err_payload = result.payload_a.to_dict() if result.payload_a else (result.error or {})
+                        rejected_detail = result.payload_a.error if result.payload_a else event.detail
+                        _step(steps, "split", state="failed", detail=str(rejected_detail)[:120])
+                        yield None, f"Rejected: {rejected_detail}", json.dumps(err_payload, indent=2), "", None
+                        return
+                    else:
+                        diag = gradio_diagnostics.get("split") or event.detail
+                        _step(steps, "split", state="failed", detail=str(diag)[:120])
+                        yield None, f"Error: {diag}", json.dumps({"error": str(diag)}, indent=2), "", None
+                        return
+                elif event.state == "done":
+                    page_items = event.data.get("page_items", []) if event.data else []
+                    total_pages = event.data.get("total_pages", len(page_items)) if event.data else len(page_items)
+                    split_gallery = [(_thumb(p), f"Page {n} (split)") for n, p, _ in page_items if p and Path(p).exists()]
+                    if split_gallery:
+                        pw, ph = split_gallery[0][0].size
+                        _step(steps, "split", detail=steps[1]["detail"] + f" · page 1 is {pw}×{ph} px ({pw * ph / 1e6:.1f} MP)")
+                    _step(steps, "cls", "Classify document from page 1 (router model, once)")
+                    for n, _, _ in page_items:
+                        _step(steps, f"ext{n}", f"Page {n}: extract fields")
+                    _step(steps, "merge", "Validate and build JSON")
+                    yield split_gallery or None, f"Split into {total_pages} page image(s).", "", "", None
+            elif event.step_key == "cls":
+                if event.state == "running":
+                    yield (split_gallery or None, "Classifying the document from page 1...", "", "", None)
+                elif event.state == "failed":
+                    result = event.result
+                    diag = gradio_diagnostics.get("cls") or event.detail
+                    if result and result.payload_b and result.payload_b.status == "failed":
+                        msg = str(diag)
+                        err_out = result.payload_b.error or (result.error or {})
+                        _step(steps, "cls", state="failed", detail=msg[:120])
+                        yield split_gallery or None, msg, json.dumps({"error": err_out}, indent=2, default=str), "", None
+                        return
+                    else:
+                        _step(steps, "cls", state="failed", detail=str(diag)[:120])
+                        yield split_gallery or None, f"Error: {diag}", json.dumps({"error": str(diag)}, indent=2), "", None
+                        return
+            elif event.step_key.startswith("ext"):
+                if event.state == "running":
+                    pages_info = event.data.get("pages_info", []) if event.data else []
+                    category_val = event.data.get("category", "") if event.data else ""
+                    lang_val = event.data.get("language", "") if event.data else ""
+                    page_no = event.data.get("page_no", 1) if event.data else 1
+                    read_count = event.data.get("read_count", 1) if event.data else 1
+                    yield (
+                        split_gallery or None,
+                        f"Page {page_no}/{read_count}: classified as {category_val} ({lang_val}). Extracting...",
+                        "",
+                        _classification_markdown(pages_info),
+                        None,
+                    )
+                elif event.state == "failed":
+                    diag = gradio_diagnostics.get(event.step_key) or event.detail
+                    _step(steps, event.step_key, state="failed", detail=str(diag)[:120])
+            elif event.step_key == "merge":
+                if event.state == "failed":
+                    result = event.result
+                    diag = gradio_diagnostics.get("merge") or event.detail
+                    _step(steps, "merge", state="failed", detail=str(diag)[:120])
+                    yield split_gallery or None, f"Error: {diag}", json.dumps({"error": str(diag)}, indent=2), "", None
+                    return
+                elif event.state == "done" and event.result is not None:
+                    result = event.result
+                    env = result.envelope
+                    page_items = result.page_items
+                    rotation = event.data.get("rotation", 0) if event.data else 0
+                    category = DocumentCategory(env.document_metadata.document_category)
+
+                    gallery: List[Tuple[Image.Image, str]] = []
+                    for page_no, img_path, orig_path in page_items:
+                        canvas_path = orig_path if orig_path and orig_path.exists() else img_path
+                        with Image.open(canvas_path) as pil_img:
+                            annotated = draw_bounding_boxes(pil_img, env.fields, page=page_no)
+                        if rotation:
+                            annotated = annotated.rotate(-rotation, expand=True)
+                        gallery.append((annotated, f"Page {page_no}: {category.value}"))
+
+                    json_text = json.dumps(env.model_dump(mode="json"), indent=2, default=str)
+                    withheld = any(not r.route.get("grounded", True) for r in result.page_results)
+                    specialists = sorted(
+                        {p.get("model_used") for p in result.pages_info if p.get("model_used") not in (None, "-")}
+                    )
+                    total_pages = event.data.get("total_pages", len(page_items)) if event.data else len(page_items)
+                    status_msg = (
+                        f"Status: {env.document_metadata.status.upper()} | Pages read: {len(page_items)}/{total_pages} | "
+                        f"Fields: {len(env.fields)} | Flags: {len(env.flags)} | Model(s): {', '.join(specialists) or '-'}"
+                        + (" | No boxes on this route: values withheld (EVIDENCE_MISSING); unverified readings are in "
+                           "run.provenance.details" if withheld else "")
+                    )
+                    yield (
+                        gallery,
+                        status_msg,
+                        json_text,
+                        _classification_markdown(result.pages_info),
+                        _write_json_download(result.document_id, json_text),
+                    )
+                    return
 
     except Exception as e:
         for r in steps:

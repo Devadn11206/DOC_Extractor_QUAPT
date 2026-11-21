@@ -22,6 +22,9 @@ tomllib = pytest.importorskip("tomllib" if sys.version_info >= (3, 11) else "tom
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
+# Packages shipped by this distribution (src/): never third-party. engine_errors is the shared error-base leaf.
+FIRST_PARTY = ("doc_extractor", "schema_lifecycle", "engine_errors")
+
 # import name -> distribution name (only where they differ)
 DIST_OF_MODULE = {
     "PIL": "pillow",
@@ -67,7 +70,7 @@ def _third_party_imports():
                 mods = [node.module]
             for mod in mods:
                 top = mod.split(".")[0]
-                if top not in std and top not in ("doc_extractor", "schema_lifecycle"):
+                if top not in std and top not in FIRST_PARTY:
                     found.setdefault(top, str(path.relative_to(ROOT)))
     return found
 
@@ -79,7 +82,10 @@ def test_core_dependencies_match_between_pyproject_and_requirements_txt():
 
 def test_extras_are_mirrored_by_their_requirements_files():
     extras = PYPROJECT["optional-dependencies"]
-    for extra, filename in (("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"), ("ocr", "requirements-ocr.txt")):
+    for extra, filename in (
+        ("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"),
+        ("ocr", "requirements-ocr.txt"), ("api", "requirements-api.txt"),
+    ):
         declared = {_name(d): d.replace(" ", "") for d in extras[extra]}
         listed = {k: v for k, v in _requirements(filename).items() if k not in _requirements("requirements.txt")}
         assert listed == declared, f"{filename} differs from the '{extra}' extra"
@@ -137,3 +143,50 @@ def test_qwen3_vl_transformers_floor_is_not_below_4_57():
 def test_core_matches_the_reproducible_gpu_baseline():
     core = {_name(d): d.replace(" ", "") for d in PYPROJECT["dependencies"]}
     assert core["qwen-vl-utils"] == "qwen-vl-utils==0.0.14"          # exact baseline pin
+
+
+# -- REST API foundation: a dedicated optional group, nothing added to core ------------------------
+
+API_STACK = {"fastapi", "starlette", "anyio", "uvicorn", "python-multipart"}
+
+
+def test_api_stack_is_a_dedicated_optional_extra_and_never_core():
+    api_extra = {_name(d) for d in PYPROJECT["optional-dependencies"]["api"]}
+    assert api_extra == API_STACK
+    core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
+    assert not core & (API_STACK | {"httpx"})
+
+
+def test_httpx_is_a_development_dependency_only():
+    assert "httpx" in {_name(d) for d in PYPROJECT["optional-dependencies"]["dev"]}
+    assert "httpx" in _requirements("requirements-dev.txt")
+    assert "httpx" not in {_name(d) for d in PYPROJECT["optional-dependencies"]["api"]}
+    assert "httpx" not in _requirements("requirements-api.txt")
+
+
+def test_requirements_api_installs_core_first_and_lists_only_the_api_extra():
+    text = (ROOT / "requirements-api.txt").read_text(encoding="utf-8")
+    assert "-r requirements.txt" in text
+    assert set(_requirements("requirements-api.txt")) - set(_requirements("requirements.txt")) == API_STACK
+
+
+def test_the_api_extra_leaves_the_existing_groups_unchanged():
+    extras = PYPROJECT["optional-dependencies"]
+    assert {_name(d) for d in extras["ui"]} == {"gradio"}
+    assert {_name(d) for d in extras["ocr"]} == {"pytesseract"}
+    assert {_name(d) for d in extras["dev"]} == {"pytest", "pytest-cov", "httpx"}
+
+
+def test_every_first_party_package_in_src_is_declared_as_first_party_and_vice_versa():
+    """A new top-level package under src/ must be listed in FIRST_PARTY, or its imports would count as third-party."""
+    packages = {p.name for p in (ROOT / "src").iterdir() if p.is_dir() and (p / "__init__.py").exists()}
+    assert packages == set(FIRST_PARTY)
+
+
+def test_package_discovery_ships_every_first_party_package():
+    """setuptools finds packages under src/ (``where = ["src"]``) with no include/exclude filter, so the new leaf package
+    ``engine_errors`` is installed with the others. (Checked from the metadata: it must not need setuptools to run.)"""
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["setuptools"]["packages"]["find"]
+    assert config == {"where": ["src"]}
+    discovered = {p.name for p in (ROOT / "src").iterdir() if p.is_dir() and (p / "__init__.py").exists()}
+    assert discovered == set(FIRST_PARTY) and "engine_errors" in discovered

@@ -138,3 +138,7 @@ def sample_eicar_bytes():
     """EICAR test file disguised as a PDF."""
     return b"%PDF-1.4\n" + EICAR_SIGNATURE + b"\n%%EOF"
 
+
+
+# Skip policy: with DOC_FAIL_ON_SKIP=1 (the mandatory API/security CI job) any skip fails. See tests/skip_policy.py.
+from tests.skip_policy import pytest_make_collect_report, pytest_runtest_makereport  # noqa: E402,F401

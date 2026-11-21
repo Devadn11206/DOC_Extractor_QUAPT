@@ -18,6 +18,7 @@ Guarantees:
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -114,6 +115,7 @@ class IngestionService:
         idempotency_store: Optional[IdempotencyStore] = None,
         downstream_callback: Optional[Callable[[IngestionResult, BinaryIO], None]] = None,
         tenant_id: str = "default_tenant",
+        logger: Optional[logging.Logger] = None,
     ) -> None:
         self.settings = settings or Settings()
         self.tenant_id = tenant_id
@@ -122,11 +124,17 @@ class IngestionService:
         self.storage = storage or LocalDiskStorage(self.settings.storage_base_dir, tenant_id=self.tenant_id)
         self.idempotency_store = idempotency_store or LocalIdempotencyStore(self.settings.storage_base_dir)
         self.downstream_callback = downstream_callback
-        self.logger = setup_logging(
-            level=self.settings.log_level,
-            service_name=self.settings.service_name,
-            environment=self.settings.app_env,
-        )
+        if logger is not None:
+            self.logger = logger
+        elif logging.getLogger("doc_extractor").hasHandlers():
+            self.logger = logging.getLogger("doc_extractor")
+        else:
+            self.logger = setup_logging(
+                level=self.settings.log_level,
+                service_name=self.settings.service_name,
+                environment=self.settings.app_env,
+                clear_existing=False,
+            )
 
     def ingest_document(
         self,
@@ -154,7 +162,8 @@ class IngestionService:
             extra={
                 "request_id": req_id,
                 "tenant_id": self.tenant_id,
-                "extra_data": {"claimed_filename": safe_filename, "has_idempotency_key": bool(idempotency_key)},
+                # The claimed filename is client-controlled and may identify a person: it is deliberately NOT logged.
+                "extra_data": {"has_idempotency_key": bool(idempotency_key)},
             },
         )
 
@@ -206,8 +215,16 @@ class IngestionService:
             )
 
             # 3. Idempotency Check (API-013, FR-ING-006)
+            # The per-key lock is held (acquired above), so the record cannot change under this evaluation. The record is
+            # first checked against the document it names: if that document no longer exists, the record is orphaned (left by
+            # a rolled-back or failed run) and says nothing about this request, so it is discarded BEFORE any fingerprint
+            # comparison and the request is ingested afresh. Only a record whose document still exists can replay (same
+            # fingerprint) or conflict (different fingerprint, 409).
             if idempotency_key:
                 existing_record = self.idempotency_store.get_record(self.tenant_id, idempotency_key)
+                if existing_record and self.storage.get_document_record(existing_record.document_id) is None:
+                    self.idempotency_store.delete_record(self.tenant_id, idempotency_key)
+                    existing_record = None
                 if existing_record:
                     # Check for fingerprint match
                     if existing_record.request_fingerprint != request_fingerprint:

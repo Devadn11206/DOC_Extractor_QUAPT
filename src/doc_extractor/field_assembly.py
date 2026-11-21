@@ -5,7 +5,9 @@ Strictly adheres to PRD §6.3 (SCH-011, SCH-012, SCH-013), §5.4 (FR-EXT-003, FR
 Shared by both static ModuleCPipeline and dynamic DynamicExtractionAdapter.
 """
 
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 import re
 
 from doc_extractor.contracts_b import ConfidenceProvenance, PageLayoutOutput
@@ -218,6 +220,83 @@ def assemble_field_entry(
     )
 
 
+class ReviewReason(str, Enum):
+    """
+    Fixed, content-free codes naming WHY a document is not auto-approved (FR-CNF-003). Each member is one clause of the
+    single gating rule below; none is a new policy. Document-level reasons concern the document as a whole, field-level
+    reasons concern one extracted field.
+    """
+
+    DOCUMENT_TYPE_UNKNOWN = "DOCUMENT_TYPE_UNKNOWN"          # the document type is UNKNOWN
+    NOTHING_EXTRACTED = "NOTHING_EXTRACTED"                  # no field carries a value
+    UPSTREAM_NEEDS_REVIEW = "UPSTREAM_NEEDS_REVIEW"          # the upstream payload already requires review
+    FLAGS_RAISED = "FLAGS_RAISED"                            # at least one flag was raised
+    FIELD_REVIEW_REQUIRED = "FIELD_REVIEW_REQUIRED"          # the field's own ``review_required`` indicator is set
+    FIELD_VALIDATION_FAILED = "FIELD_VALIDATION_FAILED"      # the field's validation failed
+    CONFIDENCE_NOT_AUTHORIZING = "CONFIDENCE_NOT_AUTHORIZING"  # a value whose confidence is unavailable or uncalibrated
+
+
+@dataclass(frozen=True)
+class ReviewAssessment:
+    """
+    The outcome of the gating rule: the document-level reasons and, per field KEY, the field-level reasons (in the order of
+    ``fields``). Codes only: it holds no value, evidence or message. ``requires_review`` is exactly the rule's verdict.
+    """
+
+    document_reasons: Tuple[ReviewReason, ...] = ()
+    field_reasons: Tuple[Tuple[str, Tuple[ReviewReason, ...]], ...] = ()
+
+    @property
+    def requires_review(self) -> bool:
+        return bool(self.document_reasons) or bool(self.field_reasons)
+
+
+def assess_review_requirement(
+    document_type: str,
+    fields: Mapping[str, ExtractedField],
+    flags: Sequence[FlagItem],
+    payload_status: str = "processing",
+) -> ReviewAssessment:
+    """
+    THE document-level review gate (FR-CNF-003, GR-027), the only implementation of it: ``assemble_canonical_envelope`` uses
+    it to set ``needs_review`` versus ``auto_approved``, and any other caller that must reproduce the decision uses it too.
+    Pure and side-effect free: it reads ``fields`` and ``flags`` and never modifies them.
+
+    A document is NOT auto-approved (SCH-012 ``needs_review``) when any of the following holds:
+    - the document type is UNKNOWN, or the upstream payload already requires review;
+    - no field carries a value at all (nothing was extracted);
+    - any flag was raised (EVIDENCE_MISSING, PARTIAL_PAGE_COVERAGE, rule failures, ...);
+    - any field requires review or failed validation (missing required value, failed business rule, uncertain extraction
+      state, confidence below the field threshold: the threshold is applied when the field is assembled and recorded in
+      ``review_required``, so it is not re-applied here);
+    - any extracted value lacks an authorizing confidence: unavailable (None) or merely uncalibrated/nominal scores cannot
+      authorize automatic approval.
+    """
+    document_reasons: List[ReviewReason] = []
+    if document_type == "UNKNOWN":
+        document_reasons.append(ReviewReason.DOCUMENT_TYPE_UNKNOWN)
+    # A document from which nothing was extracted has nothing to approve.
+    if not any(f.value is not None for f in fields.values()):
+        document_reasons.append(ReviewReason.NOTHING_EXTRACTED)
+    if payload_status == "needs_review":
+        document_reasons.append(ReviewReason.UPSTREAM_NEEDS_REVIEW)
+    if len(flags) > 0:
+        document_reasons.append(ReviewReason.FLAGS_RAISED)
+
+    field_reasons: List[Tuple[str, Tuple[ReviewReason, ...]]] = []
+    for key, f in fields.items():
+        reasons: List[ReviewReason] = []
+        if f.review_required:
+            reasons.append(ReviewReason.FIELD_REVIEW_REQUIRED)
+        if f.validation == "failed":
+            reasons.append(ReviewReason.FIELD_VALIDATION_FAILED)
+        if f.value is not None and (f.confidence is None or f.confidence_provenance in NON_AUTHORIZING_PROVENANCE):
+            reasons.append(ReviewReason.CONFIDENCE_NOT_AUTHORIZING)
+        if reasons:
+            field_reasons.append((key, tuple(reasons)))
+    return ReviewAssessment(tuple(document_reasons), tuple(field_reasons))
+
+
 def assemble_canonical_envelope(
     document_id: str,
     document_type: str,
@@ -238,31 +317,10 @@ def assemble_canonical_envelope(
     Applies document-level status gating (FR-CNF-003, GR-027) and constructs
     the CanonicalExtractionEnvelope adhering strictly to PRD §6.3 (SCH-011..013).
 
-    A document is auto-approved only if none of the following holds (SCH-012 ``needs_review``):
-    - the document type is UNKNOWN, or the upstream payload already requires review;
-    - no field carries a value at all (nothing was extracted);
-    - any flag was raised (EVIDENCE_MISSING, PARTIAL_PAGE_COVERAGE, rule failures, ...);
-    - any field requires review or failed validation (missing required value, failed business
-      rule, uncertain extraction state, confidence below the field threshold);
-    - any extracted value lacks an authorizing confidence: unavailable (None) or merely
-      uncalibrated/nominal scores cannot authorize automatic approval.
+    A document is auto-approved only if none of the conditions of ``assess_review_requirement`` (the single implementation
+    of the gate, SCH-012 ``needs_review``) holds.
     """
-    unidentified = document_type == "UNKNOWN"
-    # A document from which nothing was extracted has nothing to approve.
-    nothing_extracted = not any(f.value is not None for f in fields.values())
-    confidence_unavailable = any(
-        f.value is not None
-        and (f.confidence is None or f.confidence_provenance in NON_AUTHORIZING_PROVENANCE)
-        for f in fields.values()
-    )
-    requires_review = (
-        unidentified
-        or nothing_extracted
-        or payload_status == "needs_review"
-        or len(flags) > 0
-        or confidence_unavailable
-        or any(f.review_required or f.validation == "failed" for f in fields.values())
-    )
+    requires_review = assess_review_requirement(document_type, fields, flags, payload_status).requires_review
 
     if payload_status == "failed":
         final_status: Literal["processing", "auto_approved", "needs_review", "reviewed", "rejected", "failed"] = "failed"

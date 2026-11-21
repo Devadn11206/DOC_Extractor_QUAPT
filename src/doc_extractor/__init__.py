@@ -14,6 +14,7 @@ __version__ = "0.1.0"
 
 from doc_extractor.config import Settings, load_settings
 from doc_extractor.exceptions import (
+    ComponentConfigurationError,
     ConfigurationError,
     ConflictError,
     DocumentExtractorError,
@@ -22,6 +23,7 @@ from doc_extractor.exceptions import (
     ScannerUnavailableError,
     SecurityCheckFailedError,
     StorageError,
+    TenantMismatchError,
     UnsupportedFileError,
     LLMExecutionError,
 )
@@ -88,6 +90,12 @@ from doc_extractor.field_assembly import (
 )
 from doc_extractor.rule_evaluator import evaluate_dynamic_rules
 from doc_extractor.dynamic_adapter import DynamicExtractionAdapter
+from doc_extractor.processing_service import (
+    DocumentProcessingRequest,
+    DocumentProcessingResult,
+    DocumentProcessingService,
+    ProcessingProgressEvent,
+)
 
 __all__ = [
     "__version__",
@@ -159,5 +167,11 @@ __all__ = [
     "assemble_field_entry",
     "assemble_canonical_envelope",
     "evaluate_dynamic_rules",
+    "DocumentProcessingService",
+    "DocumentProcessingRequest",
+    "DocumentProcessingResult",
+    "ProcessingProgressEvent",
+    "TenantMismatchError",
+    "ComponentConfigurationError",
 ]
 
