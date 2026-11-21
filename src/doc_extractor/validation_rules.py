@@ -5,7 +5,7 @@ Strictly adheres to PRD §5.5 (FR-VAL-001 through FR-VAL-004), §5.6 (FR-CNF-001
 
 from datetime import datetime
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from doc_extractor.contracts_b import ConfidenceProvenance
 

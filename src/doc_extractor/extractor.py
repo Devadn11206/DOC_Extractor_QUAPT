@@ -136,6 +136,70 @@ def load_capped_image(image_input, max_pixels: int = MAX_IMAGE_PIXELS):
         img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), _Image.LANCZOS)
     return img
 
+
+def make_bnb_config(compute_dtype=None):
+    """4-bit NF4 with double quantisation (PRD 12.1/12.2): keeps a 4B/7B VLM inside a 16 GB T4."""
+    from transformers import BitsAndBytesConfig
+
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=compute_dtype or gpu_dtype(),
+    )
+
+
+def free_gpu_memory() -> None:
+    """Release cached CUDA blocks after a generation so multi-page sweeps do not fragment VRAM."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # torch missing or CUDA in a bad state must not break extraction
+        pass
+
+
+def token_confidences(model, generated, input_len: int, decode) -> Tuple[str, List[Tuple[int, int, float]]]:
+    """From model.generate(..., return_dict_in_generate=True, output_scores=True) output, return the text
+    and one (char_start, char_end, probability) per generated token (FR-CNF-001)."""
+    import torch
+
+    seq = generated.sequences[0][input_len:]
+    scores = model.compute_transition_scores(generated.sequences, generated.scores, normalize_logits=True)[0]
+    probs = torch.exp(scores.float()).clamp(0.0, 1.0).tolist()
+    spans: List[Tuple[int, int, float]] = []
+    pos = 0
+    for tok_id, p in zip(seq.tolist(), probs):
+        piece = decode([tok_id])
+        spans.append((pos, pos + len(piece), float(p)))
+        pos += len(piece)
+    return "".join(decode([t]) for t in seq.tolist()), spans
+
+
+def attach_field_confidence(raw: Dict[str, Any], text: str, spans: List[Tuple[int, int, float]]) -> None:
+    """Set raw[key]["confidence"] to the geometric-mean token probability of that field's "value" text.
+    Fields whose value text cannot be located keep no confidence (None), never a made-up number."""
+    import math
+
+    for key, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        m = re.search(r'"%s"\s*:\s*\{\s*"value"\s*:\s*(.*?)\s*(?:,\s*"(?:bbox|uncertain|confidence)"|\})' % re.escape(key),
+                      text, flags=re.DOTALL)
+        if not m:
+            continue
+        lo, hi = m.start(1), m.end(1)
+        ps = [p for a, b, p in spans if a < hi and b > lo and p > 0.0]
+        covered = [p for a, b, p in spans if a < hi and b > lo]
+        if ps and len(ps) == len(covered):
+            item["confidence"] = round(math.exp(sum(math.log(p) for p in ps) / len(ps)), 4)
+        elif covered:
+            item["confidence"] = 0.0
+
 SCHEMA_MAP: Dict[str, Type[BaseModel]] = {
     "DOC-01": CASASchema,
     "DOC-02": InsuranceApplicationSchema,
@@ -1056,8 +1120,13 @@ class SchemaGuidedExtractor:
         if vllm_api_base:
             return self._extract_via_vllm_api(image_input, schema_cls, vllm_api_base, system_prompt=system_prompt)
 
-        output_text = self._generate_from_image(image_input, system_prompt, user_text, self.max_new_tokens)
+        output_text = self._generate_from_image(
+            image_input, system_prompt, user_text, self.max_new_tokens, score_fields=True
+        )
         raw_dict = self._parse_json_output(output_text)
+        _, spans = self._last_token_spans
+        attach_field_confidence(raw_dict, output_text, spans)
+        free_gpu_memory()
 
         prov = ExecutionProvenance(
             mode=ExecutionMode.GENUINE_LLM,
@@ -1100,6 +1169,7 @@ class SchemaGuidedExtractor:
         user_text: str,
         max_new_tokens: int,
         max_pixels: Optional[int] = None,
+        score_fields: bool = False,
     ) -> str:
         """
         One Qwen-VL generation over one page image, following the official Qwen3-VL flow:
@@ -1169,17 +1239,23 @@ class SchemaGuidedExtractor:
         else:
             gen_kwargs["do_sample"] = False
 
+        want_conf = score_fields
         with torch.no_grad():
-            generated_ids = model.generate(**inputs, **gen_kwargs)
-        generated_ids_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-        ]
-        text_out = processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            generated = model.generate(
+                **inputs, **gen_kwargs, return_dict_in_generate=True, output_scores=want_conf
+            )
+        input_len = inputs.input_ids.shape[1]
+        decode = lambda ids: processor.batch_decode(  # noqa: E731
+            [ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
-        del inputs, generated_ids, generated_ids_trimmed
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        spans: List[Tuple[int, int, float]] = []
+        if want_conf:
+            text_out, spans = token_confidences(model, generated, input_len, decode)
+        else:
+            text_out = decode(generated.sequences[0][input_len:].tolist())
+        del inputs, generated
+        free_gpu_memory()
+        self._last_token_spans = (text_out, spans)
         return text_out
 
     def _extract_via_vllm_api(
@@ -1211,6 +1287,7 @@ class SchemaGuidedExtractor:
             ],
             "temperature": self.temperature,
             "max_tokens": self.max_new_tokens,
+            "logprobs": True,
         }
 
         url = f"{api_base.rstrip('/')}/chat/completions"
@@ -1222,6 +1299,7 @@ class SchemaGuidedExtractor:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             content = data["choices"][0]["message"]["content"]
+            lp_content = ((data["choices"][0].get("logprobs") or {}).get("content")) or []
 
         cleaned = re.sub(r"^```json\s*", "", content.strip(), flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned.strip())

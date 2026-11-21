@@ -3,7 +3,7 @@ Local OCR Adapter and Reference Parser Engine PoC.
 
 Implements ParserEngine interface (ARC-002) using pluggable backend:
 - Supports mock/synthetic backends for deterministic testing.
-- Supports pluggable local engines when installed (e.g. Tesseract, PaddleOCR).
+- Supports pluggable local engines when installed (none are bundled; PRD §12.1 uses pypdfium2 text, GLM-OCR and Qwen3-VL).
 - Inverts bounding boxes via CoordinateTransform (SCH-013).
 - Generates layout-faithful Markdown and records optical confidence (FR-PRS-001, FR-PRS-005).
 """

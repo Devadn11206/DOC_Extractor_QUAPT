@@ -199,6 +199,9 @@ def get_routed_extractor() -> RoutedExtractor:
 
 # Every page is read by default. DOC_MAX_PAGES=N is only an optional limit for quick test runs (0 = no limit).
 MAX_PAGES = int(os.environ.get("DOC_MAX_PAGES", "0"))
+# FR-CNF-001: p**alpha recalibration of token probabilities; fit with validation_rules.fit_calibration_alpha
+CONFIDENCE_ALPHA = float(os.environ.get("DOC_CONFIDENCE_ALPHA", "1.0"))
+REVIEW_THRESHOLD = float(os.environ.get("DOC_REVIEW_THRESHOLD", "0.75"))  # FR-CNF-002
 
 
 def _fmt_confidence(value: Any) -> str:
