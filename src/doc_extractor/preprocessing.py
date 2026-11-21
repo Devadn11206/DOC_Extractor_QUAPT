@@ -81,7 +81,7 @@ class PagePreprocessor:
         self,
         settings: Optional[Settings] = None,
         storage: Optional[StorageBackend] = None,
-        clahe_clip_limit: float = 2.0,
+        clahe_clip_limit: float = 1.5,
         clahe_tile_grid_size: Tuple[int, int] = (8, 8),
         skew_threshold_deg: float = 0.5,
         max_skew_detect_deg: float = 45.0,

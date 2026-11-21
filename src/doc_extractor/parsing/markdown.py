@@ -66,30 +66,60 @@ def sort_blocks_reading_order(
     return reordered
 
 
-def generate_page_markdown(blocks: List[LayoutBlock]) -> str:
+def generate_page_markdown(blocks: List[LayoutBlock], line_y_tolerance_px: float = 14.0) -> str:
     """
     Generates layout-aware Markdown from ordered layout blocks (FR-PRS-001).
-    Preserves heading levels, paragraphs, and list indicators.
+    Merges horizontal blocks belonging to the same visual line (e.g. character grids, key-values).
     """
     if not blocks:
         return ""
 
-    lines: List[str] = []
-    for b in blocks:
-        text = b.text.strip()
-        if not text:
+    sorted_by_y = sorted(blocks, key=lambda b: (b.bbox_preprocessed.y0, b.bbox_preprocessed.x0))
+    lines: List[List[LayoutBlock]] = []
+    curr_line: List[LayoutBlock] = []
+    curr_y = -1.0
+
+    for b in sorted_by_y:
+        y0 = b.bbox_preprocessed.y0
+        if curr_y < 0 or abs(y0 - curr_y) <= line_y_tolerance_px:
+            curr_line.append(b)
+            curr_y = y0
+        else:
+            curr_line.sort(key=lambda item: item.bbox_preprocessed.x0)
+            lines.append(curr_line)
+            curr_line = [b]
+            curr_y = y0
+
+    if curr_line:
+        curr_line.sort(key=lambda item: item.bbox_preprocessed.x0)
+        lines.append(curr_line)
+
+    out_paragraphs: List[str] = []
+    for line in lines:
+        parts: List[str] = []
+        is_header = False
+        for idx, b in enumerate(line):
+            t = b.text.strip()
+            if not t:
+                continue
+            if b.element_type == LayoutElementType.HEADER:
+                is_header = True
+            if idx > 0:
+                prev_b = line[idx - 1]
+                gap = b.bbox_preprocessed.x0 - prev_b.bbox_preprocessed.x1
+                if gap > 20:
+                    parts.append(" ")
+                elif gap > 6 and (len(prev_b.text) > 1 or len(t) > 1):
+                    parts.append(" ")
+            parts.append(t)
+
+        line_str = "".join(parts).strip()
+        if not line_str:
             continue
 
-        if b.element_type == LayoutElementType.HEADER:
-            # If text looks like main title, use H1 or H2
-            if not text.startswith("#"):
-                lines.append(f"## {text}\n")
-            else:
-                lines.append(f"{text}\n")
-        elif b.element_type == LayoutElementType.FOOTER:
-            lines.append(f"_{text}_\n")
+        if is_header and not line_str.startswith("#"):
+            out_paragraphs.append(f"## {line_str}")
         else:
-            lines.append(f"{text}\n")
+            out_paragraphs.append(line_str)
 
-    return "\n".join(lines).strip()
-
+    return "\n\n".join(out_paragraphs).strip()

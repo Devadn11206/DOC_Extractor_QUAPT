@@ -29,6 +29,7 @@ class SupportedFormat(str, Enum):
     JPEG = "image/jpeg"
     PNG = "image/png"
     TIFF = "image/tiff"
+    WEBP = "image/webp"
 
 
 # Magic byte definitions according to binary specifications
@@ -43,6 +44,8 @@ MAGIC_SIGNATURES = {
     b"II*\x00": SupportedFormat.TIFF,
     # TIFF: Big-Endian (4D 4D 00 2A)
     b"MM\x00*": SupportedFormat.TIFF,
+    # WEBP: RIFF....WEBP
+    b"RIFF": SupportedFormat.WEBP,
 }
 
 EXTENSION_TO_FORMAT = {
@@ -52,6 +55,7 @@ EXTENSION_TO_FORMAT = {
     ".png": SupportedFormat.PNG,
     ".tif": SupportedFormat.TIFF,
     ".tiff": SupportedFormat.TIFF,
+    ".webp": SupportedFormat.WEBP,
 }
 
 
@@ -79,6 +83,8 @@ def detect_magic_format(header_bytes: bytes) -> Optional[SupportedFormat]:
         return SupportedFormat.PNG
     if header_bytes.startswith(b"II*\x00") or header_bytes.startswith(b"MM\x00*"):
         return SupportedFormat.TIFF
+    if header_bytes.startswith(b"RIFF") and len(header_bytes) >= 12 and header_bytes[8:12] == b"WEBP":
+        return SupportedFormat.WEBP
 
     return None
 

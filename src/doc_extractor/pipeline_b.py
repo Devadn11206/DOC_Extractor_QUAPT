@@ -29,6 +29,8 @@ from doc_extractor.classification.base import (
     SchemaResolutionError,
 )
 from doc_extractor.classification.rules import RuleBasedClassifierAdapter
+from doc_extractor.parsing.box_grid_detector import BoxGridDetector
+from doc_extractor.parsing.character_grids import CharacterGridError
 from doc_extractor.contracts_b import (
     MODULE_B_CONTRACT_VERSION,
     ClassificationOutput,
@@ -84,6 +86,7 @@ class ModuleBPipeline:
         schema_registry: Optional[SchemaRegistry] = None,
         idempotency_store: Optional[IdempotencyStore] = None,
         tenant_id: str = "default_tenant",
+        grid_detector: Optional[BoxGridDetector] = None,
     ) -> None:
         self.storage = storage
         self.tenant_id = tenant_id
@@ -104,6 +107,8 @@ class ModuleBPipeline:
         self.table_reconstructor = TableReconstructor()
         self.checkbox_detector = CheckboxDetector()
         self.grid_reconstructor = CharacterGridReconstructor()
+        # Image-driven box detection: runs on every page when no candidate grids are supplied.
+        self.grid_detector = grid_detector if grid_detector is not None else BoxGridDetector()
 
     # ------------------------------------------------------------------------
     # Pipeline Execution
@@ -197,9 +202,19 @@ class ModuleBPipeline:
                 # Optional Character Grid Reconstruction (Stage 3C)
                 if candidate_grids_by_page and loaded_page.page_number in candidate_grids_by_page:
                     cand_grids = candidate_grids_by_page[loaded_page.page_number]
+                elif candidate_grids_by_page is None and self.grid_detector is not None:
+                    cand_grids = self.grid_detector.detect(loaded_page)
+                else:
+                    cand_grids = []
+                if cand_grids:
                     reconstructed_grids = []
                     for cand_grid in cand_grids:
-                        grid_mark = self.grid_reconstructor.reconstruct_grid(cand_grid, loaded_page)
+                        try:
+                            grid_mark = self.grid_reconstructor.reconstruct_grid(cand_grid, loaded_page)
+                        except CharacterGridError as grid_err:
+                            # One degenerate grid must not fail the whole page.
+                            logger.warning("Skipping character grid %s: %s", cand_grid.grid_id, grid_err)
+                            continue
                         reconstructed_grids.append(grid_mark)
                     page_layout.character_grids.extend(reconstructed_grids)
 

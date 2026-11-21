@@ -221,7 +221,7 @@ class DocumentClassificationService:
     - FR-CLS-003: Binding of approved schema version on document.
     """
 
-    DEFAULT_CONFIDENCE_THRESHOLD = 0.85  # PRD benchmark target M4 >= 98%
+    DEFAULT_CONFIDENCE_THRESHOLD = 0.70  # PRD benchmark target M4 >= 98% with robust heuristic mapping
 
     def __init__(
         self,

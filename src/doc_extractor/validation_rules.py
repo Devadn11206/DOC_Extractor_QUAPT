@@ -90,15 +90,67 @@ def validate_aadhaar(aadhaar_val: Optional[str]) -> Tuple[Optional[str], Optiona
     return clean, None
 
 
+def normalize_statutory_id_ocr(raw_val: str, expected_type: str = "PAN") -> str:
+    """
+    Applies optical substitution mappings for structured statutory IDs
+    to repair common OCR confusions on boxed/printed characters:
+    - In alpha positions: '0' -> 'O', '1' -> 'I', '2' -> 'Z', '8' -> 'B', '>' -> 'T'
+    - In digit positions: 'O' -> '0', 'I' -> '1', 'Z' -> '2', 'B' -> '8', '>' -> '7'
+    """
+    cleaned = re.sub(r"[\s\-_]+", "", raw_val).upper()
+    if expected_type == "PAN" and len(cleaned) == 10:
+        chars = list(cleaned)
+        # Positions 0-4: Alpha
+        for i in range(5):
+            if chars[i] == "0":
+                chars[i] = "O"
+            elif chars[i] == "1":
+                chars[i] = "I"
+            elif chars[i] == "2":
+                chars[i] = "Z"
+            elif chars[i] == "8":
+                chars[i] = "B"
+            elif chars[i] == ">":
+                chars[i] = "T"
+        # Positions 5-8: Digits
+        for i in range(5, 9):
+            if chars[i] == "O":
+                chars[i] = "0"
+            elif chars[i] in ("I", "L"):
+                chars[i] = "1"
+            elif chars[i] == "Z":
+                chars[i] = "2"
+            elif chars[i] == "B":
+                chars[i] = "8"
+            elif chars[i] in (">", "/"):
+                chars[i] = "7"
+        # Position 9: Alpha
+        if chars[9] == "0":
+            chars[9] = "O"
+        elif chars[9] == "1":
+            chars[9] = "I"
+        elif chars[9] == "2":
+            chars[9] = "Z"
+        elif chars[9] == "8":
+            chars[9] = "B"
+        return "".join(chars)
+    return cleaned
+
+
 def validate_pan(pan_value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
     FR-VAL-002: Indian PAN format validation: ^[A-Z]{5}[0-9]{4}[A-Z]$.
+    Includes optical confusion tolerance for segmented character forms.
     """
     if not pan_value or not isinstance(pan_value, str):
         return None, None
     val = pan_value.strip().upper()
     if PAN_REGEX.match(val):
         return val, None
+    # Try safe optical normalization
+    norm_val = normalize_statutory_id_ocr(val, "PAN")
+    if PAN_REGEX.match(norm_val):
+        return norm_val, None
     return val, "INVALID_PAN_FORMAT"
 
 
@@ -288,3 +340,58 @@ def calculate_calibrated_confidence(
         score *= 0.50
 
     return max(0.0, min(1.0, round(score, 2)))
+
+
+def normalize_clinical_frequency(freq_str: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    FR-VAL-005: Standardizes Latin clinical shorthand codes:
+    OD -> Once daily (OD)
+    BD / BID -> Twice daily (BD)
+    TDS / TID -> Thrice daily (TDS)
+    QID -> Four times daily (QID)
+    SOS -> As needed (SOS)
+    """
+    if not freq_str or not isinstance(freq_str, str):
+        return None, None
+    raw = freq_str.strip().upper()
+    mapping = {
+        "OD": "Once daily (OD)",
+        "BD": "Twice daily (BD)",
+        "BID": "Twice daily (BD)",
+        "TDS": "Thrice daily (TDS)",
+        "TID": "Thrice daily (TDS)",
+        "QID": "Four times daily (QID)",
+        "SOS": "As needed (SOS)",
+    }
+    if raw in mapping:
+        return mapping[raw], None
+    return freq_str, "UNRECOGNIZED_FREQUENCY"
+
+
+def validate_adult_age(
+    dob_iso: Optional[str],
+    reference_date_iso: Optional[str] = None,
+    min_age_years: int = 18,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validates applicant is at least min_age_years old.
+    """
+    if not dob_iso or not isinstance(dob_iso, str):
+        return True, None
+    from datetime import date
+    try:
+        parts = dob_iso.strip().split("-")
+        if len(parts) != 3:
+            return True, None
+        dob = date(int(parts[0]), int(parts[1]), int(parts[2]))
+        if reference_date_iso:
+            rparts = reference_date_iso.strip().split("-")
+            ref = date(int(rparts[0]), int(rparts[1]), int(rparts[2]))
+        else:
+            ref = date.today()
+        age = ref.year - dob.year - ((ref.month, ref.day) < (dob.month, dob.day))
+        if age < min_age_years:
+            return False, "UNDERAGE_APPLICANT"
+        return True, None
+    except Exception:
+        return True, None

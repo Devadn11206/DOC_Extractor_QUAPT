@@ -61,8 +61,9 @@ class Settings(BaseModel):
             "image/jpeg",
             "image/png",
             "image/tiff",
+            "image/webp",
         ],
-        description="Supported MIME types for MVP (PDF, JPG, PNG, TIFF)",
+        description="Supported MIME types for MVP (PDF, JPG, PNG, TIFF, WEBP)",
     )
 
     # Rendering standard (FR-ING-004, SCH-013)

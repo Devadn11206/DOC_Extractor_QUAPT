@@ -103,12 +103,13 @@ class RuleBasedClassifierAdapter(ClassifierEngine):
         """Weighted signals for DOC-01 (CASA Account Opening Form)."""
         return [
             # High-weight primary titles & headings
-            RuleSignal(re.compile(r"\baccount\s+opening\s+(?:form|application)\b", re.I), 35.0, "Title: Account Opening Form"),
+            RuleSignal(re.compile(r"account\s*opening\s*(?:form|application)", re.I), 35.0, "Title: Account Opening Form"),
             RuleSignal(re.compile(r"\bcasa\s+(?:account|application|opening)\b", re.I), 35.0, "Title: CASA Application"),
-            RuleSignal(re.compile(r"\b(?:savings|current)\s+account\s+opening\b", re.I), 30.0, "Title: Savings/Current Account Opening"),
+            RuleSignal(re.compile(r"(?:savings|current)\s*(?:bank)?\s*(?:account|a/c)?\s*opening", re.I), 30.0, "Title: Savings/Current Account Opening"),
             RuleSignal(re.compile(r"\bcustomer\s+information\s+form\b", re.I), 25.0, "Title: Customer Information Form (CIF)"),
             
             # Strong banking/CASA structural field labels
+            RuleSignal(re.compile(r"(?:savings|current)\s*(?:bank)?\s*a/c", re.I), 15.0, "Field: Savings/Current Bank A/c"),
             RuleSignal(re.compile(r"\b(?:cif|customer\s*id)\s*(?:no|number)?\b", re.I), 15.0, "Field: CIF / Customer ID"),
             RuleSignal(re.compile(r"\b(?:initial\s+deposit|minimum\s+balance|mode\s+of\s+operation)\b", re.I), 15.0, "Field: Initial deposit / Mode of operation"),
             RuleSignal(re.compile(r"\b(?:debit\s+card|cheque\s+book|atm\s+card|internet\s+banking)\b", re.I), 12.0, "Service: Debit card / Cheque book / Net banking"),

@@ -19,7 +19,7 @@ from doc_extractor.contracts_c import (
     FlagItem,
     RunMetadata,
 )
-from doc_extractor.extractor import SchemaGuidedExtractor, find_evidence_for_value
+from doc_extractor.extractor import SchemaGuidedExtractor, SCHEMA_MAP, find_evidence_for_value
 from doc_extractor.field_assembly import (
     assemble_canonical_envelope,
     assemble_field_entry,
@@ -49,13 +49,15 @@ class ModuleCPipeline:
     def __init__(self, extractor: Optional[SchemaGuidedExtractor] = None):
         self.extractor = extractor or SchemaGuidedExtractor()
 
-    def process(self, payload: ModuleBOutputPayload) -> CanonicalExtractionEnvelope:
+    def process(self, payload: ModuleBOutputPayload, force_schema_id: Optional[str] = None) -> CanonicalExtractionEnvelope:
         # Route UNKNOWN or low-confidence classification directly to needs_review (FR-CLS-002)
-        if payload.status == "needs_review" or payload.classification.document_type.value == "UNKNOWN":
+        doc_type = force_schema_id or payload.classification.document_type.value
+        effective_doc_type = doc_type
+        if not force_schema_id and (payload.status == "needs_review" or payload.classification.document_type.value == "UNKNOWN"):
             return CanonicalExtractionEnvelope(
                 document_id=payload.document_id,
                 document_metadata=DocumentMetadata(
-                    document_type=payload.classification.document_type.value,
+                    document_type=doc_type,
                     schema_id=payload.classification.schema_id or "UNKNOWN",
                     schema_version=payload.classification.schema_version or "1.0.0",
                     classification_confidence=payload.classification.classification_confidence,
@@ -71,16 +73,18 @@ class ModuleCPipeline:
                 ),
             )
 
+        target_schema_cls = SCHEMA_MAP.get(effective_doc_type)
+
         # Run schema-constrained extraction (FR-EXT-001, FR-EXT-002, SCH-007)
         if hasattr(self.extractor, "extract_with_provenance"):
-            extraction_result = self.extractor.extract_with_provenance(payload)
+            extraction_result = self.extractor.extract_with_provenance(payload, schema_cls=target_schema_cls)
             extracted_data = extraction_result.payload
             execution_provenance = extraction_result.provenance
         else:
-            extracted_data = self.extractor.extract(payload)
+            extracted_data = self.extractor.extract(payload, schema_cls=target_schema_cls)
             execution_provenance = getattr(self.extractor, "last_provenance", None)
 
-        doc_type = payload.classification.document_type.value
+        doc_type = effective_doc_type
 
         fields_envelope: Dict[str, ExtractedField] = {}
         flags: List[FlagItem] = []
@@ -94,7 +98,7 @@ class ModuleCPipeline:
 
         return assemble_canonical_envelope(
             document_id=payload.document_id,
-            document_type=payload.classification.document_type.value,
+            document_type=doc_type,
             schema_id=payload.classification.schema_id or doc_type,
             schema_version=payload.classification.schema_version or "1.0.0",
             classification_confidence=payload.classification.classification_confidence,

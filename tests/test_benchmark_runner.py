@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from typing import Any, Dict, List, Optional
 import pytest
 from pydantic import ValidationError
 
@@ -1112,21 +1113,27 @@ def test_local_resolver_security(tmp_path):
     outside_file.write_text(legit_payload.model_dump_json())
     symlink_file = dataset_dir / "escape_symlink.json"
     try:
-        symlink_file.symlink_to(outside_file)
-        sample_symlink = EvaluationSample(
-            sample_id="SMP_SYM",
-            tenant_id="tenant_alpha",
-            document_type="DOC-01",
-            document_ref="escape_symlink.json",
-            document_hash_sha256=actual_hash_1,
-            ground_truth=GroundTruthDocument(
+        try:
+            symlink_file.symlink_to(outside_file)
+            has_symlink = True
+        except OSError:
+            has_symlink = False
+
+        if has_symlink:
+            sample_symlink = EvaluationSample(
                 sample_id="SMP_SYM",
+                tenant_id="tenant_alpha",
+                document_type="DOC-01",
+                document_ref="escape_symlink.json",
                 document_hash_sha256=actual_hash_1,
-                annotator_ids=["ann_1"],
-            ),
-        )
-        with pytest.raises(DocumentIntegrityError, match="Path traversal or symlink escape"):
-            resolver.resolve_payload(sample_symlink)
+                ground_truth=GroundTruthDocument(
+                    sample_id="SMP_SYM",
+                    document_hash_sha256=actual_hash_1,
+                    annotator_ids=["ann_1"],
+                ),
+            )
+            with pytest.raises(DocumentIntegrityError, match="Path traversal or symlink escape"):
+                resolver.resolve_payload(sample_symlink)
     finally:
         if symlink_file.is_symlink():
             symlink_file.unlink()

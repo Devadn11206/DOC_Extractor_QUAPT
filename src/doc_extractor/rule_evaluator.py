@@ -22,7 +22,7 @@ from schema_lifecycle.metamodel import RuleDefinition
 def _resolve_field_values(
     field_spec: str,
     flat_dict: Dict[str, Any],
-) -> List[Tuple_or_Value]:
+) -> List[Any]:
     """Resolves single dot-path or wildcard/repeating-group paths against flat_dict."""
     pass
 

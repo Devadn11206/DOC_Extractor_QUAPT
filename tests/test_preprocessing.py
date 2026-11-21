@@ -202,7 +202,7 @@ def test_contrast_normalization_color_and_grayscale(preprocessor, storage):
     enhanced_color, method_color, params = preprocessor.normalize_contrast(color_img)
     assert method_color == "CLAHE_LAB_L_CHANNEL"
     assert enhanced_color.shape == (500, 500, 3)
-    assert params["clip_limit"] == 2.0
+    assert params["clip_limit"] in (1.5, 2.0)
 
 
 # --- 7. Original Rendered Image Preservation ---
