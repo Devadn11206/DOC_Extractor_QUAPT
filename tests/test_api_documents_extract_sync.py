@@ -153,6 +153,7 @@ class _Capture(logging.Handler):
     def __init__(self):
         super().__init__(logging.DEBUG)
         self.records = []
+        self._raw = []                                      # (logger name, text, record id); the id de-duplicates repeated emissions
 
     def emit(self, record):
         try:
@@ -160,12 +161,29 @@ class _Capture(logging.Handler):
         except Exception:                                   # noqa: BLE001
             message = str(record.msg)
         self.records.append(message + " " + json.dumps(record.__dict__, default=str))
+        self._raw.append((record.name, self.records[-1], id(record)))
 
     @property
     def text(self) -> str:
         return "\n".join(self.records)
 
+    @property
+    def app_records(self):
+        """The records of the APPLICATION's loggers only (``doc_extractor`` and below), each once: third-party records (the HTTP test
+        client, PIL, asyncio) are excluded. The handler sits on several loggers, so one record can be emitted more than once."""
+        seen, found = set(), []
+        for name, text, key in self._raw:
+            if (name == APPLICATION_LOGGER or name.startswith(APPLICATION_LOGGER + ".")) and key not in seen:
+                seen.add(key)
+                found.append(text)
+        return found
 
+    @property
+    def app_text(self) -> str:
+        return "\n".join(self.app_records)
+
+
+APPLICATION_LOGGER = "doc_extractor"
 _LOGGER_NAMES = ("", "doc_extractor", "doc_extractor.api.errors", "doc_extractor.api.extraction")
 
 
@@ -289,11 +307,15 @@ def test_the_public_serializer_is_explicit_and_forbids_extra_fields():
 # M1: model-generated names and free-text metadata never reach the response
 # ============================================================================
 
-HOSTILE_KEY = "John Doe 4111"
+# Synthetic PII markers. They are deliberately distinctive: a short generic marker (the former ``4111``) also occurs by chance in
+# the random digits of log timestamps, which made the log-leak assertions fail intermittently.
+PII_NAME = "Zephyrine Quillfeather"
+PII_NUMBER = "731-90-5284"
+HOSTILE_KEY = f"{PII_NAME} {PII_NUMBER}"
 HOSTILE_KEY_2 = "ssn 123-45-6789 holder"
-HOSTILE_META = {"category": "John Doe 4111 category", "subtype": "SECRET subtype Jane Roe", "language": "xx-SECRET-LANG"}
-_HOSTILE_STRINGS = (HOSTILE_KEY, HOSTILE_KEY_2, "John", "Doe", "4111", "123-45-6789", "Jane Roe", "SECRET subtype", "xx-SECRET-LANG",
-                    "ssn")
+HOSTILE_META = {"category": f"{HOSTILE_KEY} category", "subtype": "SECRET subtype Jane Roe", "language": "xx-SECRET-LANG"}
+_HOSTILE_STRINGS = (HOSTILE_KEY, HOSTILE_KEY_2, "Zephyrine", "Quillfeather", PII_NUMBER, "123-45-6789", "Jane Roe", "SECRET subtype",
+                    "xx-SECRET-LANG", "ssn")
 
 
 def _hostile_envelope(document_type="generic", fields=None, flag_refs=None, meta=None, schema_id=None):
@@ -310,7 +332,7 @@ def _hostile_envelope(document_type="generic", fields=None, flag_refs=None, meta
             HOSTILE_KEY_2: ExtractedField(value=None, null_reason="absent"),
         },
         flags=[FlagItem(code="EVIDENCE_MISSING", message=f"no evidence for '{HOSTILE_KEY}'",
-                        fields=flag_refs if flag_refs is not None else [HOSTILE_KEY, HOSTILE_KEY_2, "never.seen John Doe 4111"])],
+                        fields=flag_refs if flag_refs is not None else [HOSTILE_KEY, HOSTILE_KEY_2, f"never.seen {HOSTILE_KEY}"])],
         run=RunMetadata(run_id="run_x"),
     )
 
@@ -359,10 +381,10 @@ def test_a_bound_schema_exposes_only_its_own_canonical_identifiers_and_remaps_th
             "nominees.0.name": ExtractedField(value="SECRET-V"),
             HOSTILE_KEY: ExtractedField(value="SECRET-V2"),
             "medical_declaration.has_hypertension": ExtractedField(value=None, null_reason="absent"),
-            "nominees.John Doe 4111": ExtractedField(value="x"),                  # a schema-looking prefix is not enough
+            f"nominees.{HOSTILE_KEY}": ExtractedField(value="x"),                  # a schema-looking prefix is not enough
             "medical_declaration.has_diabetes": ExtractedField(value=True),
         },
-        flag_refs=["nominees.0.name", HOSTILE_KEY, "nominees.John Doe 4111", "nominees.share_percentage", "nope"],
+        flag_refs=["nominees.0.name", HOSTILE_KEY, f"nominees.{HOSTILE_KEY}", "nominees.share_percentage", "nope"],
     )
     public = ExtractionResponse.from_envelope(envelope)
     assert list(public.fields) == [
@@ -445,10 +467,10 @@ def test_positional_ids_never_collide_with_a_canonical_identifier():
 
 def test_a_positional_id_is_never_the_name_of_a_canonical_identifier():
     from doc_extractor.api.contracts.extraction import _FieldNames
-    names = _FieldNames(frozenset({"field_1"}), ["John Doe 4111", "field_1", "other"])      # a schema that owns the name field_1
+    names = _FieldNames(frozenset({"field_1"}), [HOSTILE_KEY, "field_1", "other"])      # a schema that owns the name field_1
     assert names.public("field_1") == "field_1"
-    assert names.public("John Doe 4111") == "field_2" and names.public("other") == "field_3"
-    assert len({names.public(k) for k in ("John Doe 4111", "field_1", "other")}) == 3
+    assert names.public(HOSTILE_KEY) == "field_2" and names.public("other") == "field_3"
+    assert len({names.public(k) for k in (HOSTILE_KEY, "field_1", "other")}) == 3
 
 
 @pytest.mark.parametrize("meta, expected", [
@@ -485,12 +507,27 @@ def test_hostile_model_output_through_the_real_route_never_reaches_the_response_
     response = _extract(api, document_id)
     assert response.status_code == 200, response.text
     _assert_no_hostile_text(response.text)
-    _assert_no_hostile_text(logs.text)
+    # the application's own records, captured and separated from third-party ones; an empty capture must not pass vacuously
+    assert any(document_id in record for record in logs.app_records), "no application log record about this document was captured"
+    _assert_no_hostile_text(logs.app_text)
+    _assert_no_hostile_text(logs.text)              # and no captured record at all (third-party ones included) carries the markers
     body = response.json()
     assert sorted(body["fields"]) == ["field_1", "field_2"] and body["flags"][0]["fields"] == ["field_1", "field_2"]
     meta = body["document_metadata"]                    # the real service sets these from its classifier: only constrained members survive
     assert meta["document_category"] in (None, "structured", "unstructured", "handwritten") and meta["language"] in (None, "en", "hi", "te", "ta", "ml")
     assert meta["document_subtype"] in (None, "brochure", "pamphlet", "menu card", "CASA leaflet", "invitation card", "other")
+
+
+
+def test_the_log_capture_separates_application_records_and_the_leak_check_detects_a_leak(logs):
+    """Pins the capture the leak assertions rely on: application records are seen, client records are not mixed in, a leak is caught."""
+    logging.getLogger("doc_extractor.api.extraction").warning("canary application record %s", HOSTILE_KEY)
+    logging.getLogger("httpx").info("canary client record %s", PII_NUMBER)
+    assert any("canary application record" in record for record in logs.app_records)
+    assert not any("canary client record" in record for record in logs.app_records)
+    assert any("canary client record" in record for record in logs.records)
+    with pytest.raises(AssertionError):
+        _assert_no_hostile_text(logs.app_text)
 
 
 VALID_IDS = ["DOC-01", "DOC-02", "DOC-03", "UNKNOWN", "generic"]
@@ -539,7 +576,7 @@ def test_the_allowed_identifiers_are_the_ones_the_code_already_defines_not_a_sec
     assert {"DOC-01", "DOC-02", "DOC-03", "UNKNOWN", "generic"} == allowed
 
 
-HOSTILE_ID = "Jane-Roe-SSN-987-65-4321-zq"       # distinctive: a short digit run such as "4111" also occurs in log timestamps
+HOSTILE_ID = "Jane-Roe-SSN-987-65-4321-zq"       # distinctive, like the markers above
 
 
 @pytest.mark.parametrize("which, document_type, schema_id", [
