@@ -1120,13 +1120,14 @@ class SchemaGuidedExtractor:
         if vllm_api_base:
             return self._extract_via_vllm_api(image_input, schema_cls, vllm_api_base, system_prompt=system_prompt)
 
-        output_text = self._generate_from_image(
-            image_input, system_prompt, user_text, self.max_new_tokens, score_fields=True
-        )
+        self._local.score_fields = True        # FR-CNF-001: ask _generate_from_image for token probabilities
+        try:
+            output_text = self._generate_from_image(image_input, system_prompt, user_text, self.max_new_tokens)
+        finally:
+            self._local.score_fields = False
         raw_dict = self._parse_json_output(output_text)
-        _, spans = self._last_token_spans
+        _, spans = getattr(self._local, "last_token_spans", ("", []))
         attach_field_confidence(raw_dict, output_text, spans)
-        free_gpu_memory()
 
         prov = ExecutionProvenance(
             mode=ExecutionMode.GENUINE_LLM,
@@ -1169,7 +1170,6 @@ class SchemaGuidedExtractor:
         user_text: str,
         max_new_tokens: int,
         max_pixels: Optional[int] = None,
-        score_fields: bool = False,
     ) -> str:
         """
         One Qwen-VL generation over one page image, following the official Qwen3-VL flow:
@@ -1239,23 +1239,30 @@ class SchemaGuidedExtractor:
         else:
             gen_kwargs["do_sample"] = False
 
-        want_conf = score_fields
-        with torch.no_grad():
-            generated = model.generate(
-                **inputs, **gen_kwargs, return_dict_in_generate=True, output_scores=want_conf
-            )
-        input_len = inputs.input_ids.shape[1]
-        decode = lambda ids: processor.batch_decode(  # noqa: E731
-            [ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0]
-        spans: List[Tuple[int, int, float]] = []
-        if want_conf:
-            text_out, spans = token_confidences(model, generated, input_len, decode)
+        # Token probabilities only when extract_page_image asked for them and the model supports them;
+        # every other call (classification, fakes in tests) keeps the plain generate path.
+        score_fields = bool(getattr(self._local, "score_fields", False)) and hasattr(model, "compute_transition_scores")
+        self._local.last_token_spans = ("", [])
+        if score_fields:
+            with torch.no_grad():
+                generated = model.generate(**inputs, **gen_kwargs, return_dict_in_generate=True, output_scores=True)
+            decode = lambda ids: processor.batch_decode(  # noqa: E731
+                [ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0]
+            text_out, spans = token_confidences(model, generated, inputs.input_ids.shape[1], decode)
+            self._local.last_token_spans = (text_out, spans)
+            del inputs, generated
         else:
-            text_out = decode(generated.sequences[0][input_len:].tolist())
-        del inputs, generated
-        free_gpu_memory()
-        self._last_token_spans = (text_out, spans)
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, **gen_kwargs)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            text_out = processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0]
+            del inputs, generated_ids, generated_ids_trimmed
+        free_gpu_memory()  # gc + torch.cuda.empty_cache() once after every generation
         return text_out
 
     def _extract_via_vllm_api(

@@ -65,6 +65,7 @@ def flatten_vlm_output(raw: Any) -> Dict[str, Dict[str, Any]]:
                     "value": node.get("value"),
                     "bbox": node.get("bbox"),
                     "uncertain": bool(node.get("uncertain", False)),
+                    "confidence": node.get("confidence"),
                 }
                 return
             for key, child in node.items():
@@ -242,6 +243,14 @@ class PageLeaf:
     bbox_norm: Optional[Tuple[float, float, float, float]]
     raw_value: Any
     uncertain: bool
+    confidence: Optional[float] = None   # measured token probability of the value text (FR-CNF-001)
+
+
+def _valid_probability(x: Any) -> Optional[float]:
+    """A model probability in [0, 1]; anything else (missing, bool, NaN, out of range) is no signal."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or x != x or not 0.0 <= float(x) <= 1.0:
+        return None
+    return float(x)
 
 
 def collect_schema_leaves(raw: Dict[str, Any], schema_cls: Type[BaseModel]) -> Dict[str, PageLeaf]:
@@ -265,6 +274,7 @@ def collect_schema_leaves(raw: Dict[str, Any], schema_cls: Type[BaseModel]) -> D
             bbox_norm=_valid_bbox(leaf.get("bbox")),
             raw_value=leaf.get("value"),
             uncertain=bool(leaf.get("uncertain", False)),
+            confidence=_valid_probability(leaf.get("confidence")),
         )
     return leaves
 
@@ -289,6 +299,7 @@ def collect_generic_leaves(raw: Dict[str, Any]) -> Dict[str, PageLeaf]:
             bbox_norm=_valid_bbox(leaf.get("bbox")),
             raw_value=leaf.get("value"),
             uncertain=bool(leaf.get("uncertain", False)),
+            confidence=_valid_probability(leaf.get("confidence")),
         )
     return leaves
 
@@ -407,12 +418,12 @@ def _grounding_from(occurrences: List[Tuple[int, PageLeaf]]) -> FieldGrounding:
     first_page, first = occurrences[0]
     primary = FieldGrounding(
         page_number=first_page, bbox_norm=first.bbox_norm,
-        raw_value=first.raw_value, uncertain=first.uncertain,
+        raw_value=first.raw_value, uncertain=first.uncertain, model_confidence=first.confidence,
     )
     for page, leaf in occurrences[1:]:
         other = FieldGrounding(
             page_number=page, bbox_norm=leaf.bbox_norm,
-            raw_value=leaf.raw_value, uncertain=leaf.uncertain,
+            raw_value=leaf.raw_value, uncertain=leaf.uncertain, model_confidence=leaf.confidence,
         )
         (primary.also_seen if leaf.value == first.value else primary.conflicts).append(other)
     return primary
@@ -568,6 +579,7 @@ def _hint_for(item: FieldGrounding, by_page: Dict[int, PageImageRef]) -> Optiona
         "text": str(item.raw_value)[:120] if item.raw_value is not None else "",
         "ocr_confidence": None,  # no optical OCR confidence exists for model-read text
         "uncertain": item.uncertain,
+        "model_confidence": getattr(item, "model_confidence", None),
     }
 
 

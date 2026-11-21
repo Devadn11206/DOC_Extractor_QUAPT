@@ -23,12 +23,11 @@ from doc_extractor.contracts_c import (
 from doc_extractor.exceptions import LLMExecutionError
 from doc_extractor.extractor import SchemaGuidedExtractor
 from doc_extractor.field_assembly import (
-    DEFAULT_FIELD_CONFIDENCE_THRESHOLD,
     assemble_canonical_envelope,
     assemble_field_entry,
     find_null_reason_signal,
 )
-from doc_extractor.pipeline_c import ModuleCPipeline
+from doc_extractor.pipeline_c import ModuleCPipeline, _model_probability
 from doc_extractor.rule_evaluator import evaluate_dynamic_rules
 from doc_extractor.vlm_grounding import conflict_flags, grounding_to_evidence_hints
 from doc_extractor.validation_rules import (
@@ -172,14 +171,14 @@ class DynamicExtractionAdapter:
                 error=err,
                 required=meta.required if meta else False,
                 confidence_threshold=(
-                    meta.confidence_threshold
-                    if (meta and meta.confidence_threshold is not None)
-                    else DEFAULT_FIELD_CONFIDENCE_THRESHOLD
+                    meta.confidence_threshold if (meta and meta.confidence_threshold is not None) else None
                 ),
                 evidence_required=meta.evidence_required if meta else True,
                 explicit_null_reason=null_reason,
                 strict_boolean_evidence=True,
                 evidence_hint=evidence_hints.get(field_path),
+                model_confidence=_model_probability(evidence_hints.get(field_path)),
+                is_key_field=bool(getattr(meta, "is_key_field", False)),
             )
             fields_envelope[field_path] = field_entry
 
@@ -198,11 +197,8 @@ class DynamicExtractionAdapter:
                     pages=payload.pages,
                     flags=flags,
                     required=meta.required,
-                    confidence_threshold=(
-                        meta.confidence_threshold
-                        if meta.confidence_threshold is not None
-                        else DEFAULT_FIELD_CONFIDENCE_THRESHOLD
-                    ),
+                    confidence_threshold=meta.confidence_threshold,
+                    is_key_field=bool(getattr(meta, "is_key_field", False)),
                     evidence_required=meta.evidence_required,
                     explicit_null_reason=null_reason,
                     strict_boolean_evidence=True,
@@ -241,6 +237,7 @@ class DynamicExtractionAdapter:
             prompt_version=getattr(self.extractor, "prompt_version", "1.0.0"),
             provenance=provenance,
             payload_status=payload.status,
+            key_fields={p for p, m in meta_dict.items() if getattr(m, "is_key_field", False)},
         )
 
     def _validate_and_normalize_field(

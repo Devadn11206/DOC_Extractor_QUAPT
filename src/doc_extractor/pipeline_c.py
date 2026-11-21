@@ -45,7 +45,15 @@ from doc_extractor.validation_rules import (
     validate_chronology,
     validate_arithmetic,
     calculate_calibrated_confidence,
+    calibrate_probability,
+    confidence_alpha,
 )
+
+
+def _model_probability(hint: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Measured token probability of the model's reading (recalibrated with DOC_CONFIDENCE_ALPHA), or None."""
+    raw = (hint or {}).get("model_confidence")
+    return calibrate_probability(raw, confidence_alpha()) if isinstance(raw, (int, float)) else None
 
 
 class ModuleCPipeline:
@@ -235,6 +243,8 @@ class ModuleCPipeline:
                 pages=payload.pages,
                 flags=flags,
                 evidence_hint=hint,
+                model_confidence=_model_probability(hint),
+                is_handwritten=force_review,   # routed handwritten pages: FR-CNF-002 handwriting threshold
             )
             if force_review:
                 fields[path].review_required = True
@@ -794,4 +804,5 @@ class ModuleCPipeline:
             required=required,
             strict_boolean_evidence=False,  # preserve existing static pipeline compatibility
             evidence_hint=hints.get(field_name),
+            model_confidence=_model_probability(hints.get(field_name)),
         )
