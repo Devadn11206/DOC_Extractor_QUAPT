@@ -444,12 +444,12 @@ def _process_core(
                     # FR-RTE-006 / GR-002: an OCR-text reading with no box from the OCR model is withheld
                     withheld = True
                     no_evidence.append(key)
-                    v, null_reason, validation = None, "EVIDENCE_MISSING", "not_applicable"
+                    v, null_reason, validation = None, "absent", "not_applicable"  # FR-EXT-003: only absent|illegible; EVIDENCE_MISSING goes in flags
                 elif v is not None:
                     no_evidence.append(key)  # GR-002: VLM value without a box is kept but flagged for review
                 token_p = item.get("confidence")
-                if withheld:
-                    confidence = 0.0
+                if withheld or v is None:
+                    confidence = 0.0  # PRD 6.3 example: null values carry confidence 0.0
                 elif isinstance(token_p, (int, float)):
                     # FR-CNF-001: token-logprob probability, recalibrated, halved on a failed validation rule
                     confidence = calculate_calibrated_confidence(
