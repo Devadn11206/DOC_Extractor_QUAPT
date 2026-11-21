@@ -930,3 +930,104 @@ endpoint or webhook and no production adapter.
   flagged path although it is not itself a correctable path (corrections need a position); a flag reference that cannot be mapped
   (for example a dynamic rule's `items[].amount`) is dropped while its code is kept. Per-field thresholds exist only in the schema,
   not in the envelope, so the gate cannot and does not re-evaluate them.
+
+### M5 Phase 4 Webhook Dispatcher Foundation Provisional Behavior and Limitations (events, signing, retry arithmetic)
+
+Everything in this section is a provisional implementation assumption. It is not owner-approved, and it does not resolve M5-D09
+(webhook secret storage, which blocks stage S8), M5-D04 (status vocabulary), M5-D12 (auto-approval policy), M5-D15 (audit sink) or
+any other open decision; all of them stay **Open**. The PRD (7.1) gives the four event names with their trigger conditions and one
+sentence: "signed (HMAC-SHA256 with a per-subscription secret), retried with exponential back-off for 24 hours, and delivered at
+least once, so consumers de-duplicate by `event_id`". It defines no payload field, header, encoding, interval or attempt count, so
+each of those below is a provisional choice, named as one. Nothing here sends a request, stores anything, reads a clock, starts a
+scheduler, adds an endpoint or registers a subscription.
+
+- **What exists.** `api/contracts/webhook_events.py` (the four typed events, canonical serialization, strict parsing),
+  `api/contracts/webhook_delivery.py` (`DeliveryOutcome`, `DeliveryAttempt`), `api/services/webhook_signing.py` (sign and verify) and
+  `api/services/webhook_retry.py` (back-off arithmetic and the 24-hour window). The existing `WebhookSubscriptionRepository` and
+  `WebhookDeliveryRepository` ports and the two records were reused and NOT changed; no new port was added.
+- **Events.** `document.completed` (`document_id`, `status` of `auto_approved` or `reviewed`), `document.needs_review`
+  (`document_id`, `task_id`), `document.failed` (`document_id`, a fixed upper-case `reason_code`), `schema.approved` (`schema_id`,
+  `schema_version`). Each has a unique `event_id` (`evt_` plus a `uuid4`'s 32 hex digits: 122 random bits, since six of its 128 bits are fixed), an `event_type` and a timezone-aware `occurred_at`
+  that the caller supplies. No payload holds an extracted value, evidence text, document content, filename, prompt, diagnostic,
+  free-text message, person (the approver and author of a schema are not included) or the tenant; every string is an identifier or a
+  fixed token validated against a strict ASCII pattern and unknown fields are refused. Building an event from a live document, review
+  task or lifecycle event, and deciding WHEN it fires, is the dispatcher slice (PRD triggers: status becomes `auto_approved` or
+  `reviewed`; a review task is created; a stage fails after retries; a schema version is approved).
+- **Wire format (provisional).** The request body is one JSON object with exactly `event_id`, `event_type`, `occurred_at` and `data`,
+  serialized canonically (sorted keys, no whitespace, ASCII, no NaN, `occurred_at` as UTC ISO 8601 with six fractional digits and a
+  `Z`). The signature covers exactly these bytes. There is no version field; adding one is a decision for the owner.
+- **Signature (provisional).** `X-Webhook-Signature: sha256=<64 lowercase hex>` where the hex is `HMAC-SHA256(key = the secret's
+  UTF-8 bytes, message = the exact body bytes)`; verified with `hmac.compare_digest`; a header that is not exactly that shape is
+  reported malformed without a comparison. NO compatibility with any external implementation is assumed: the header name, the
+  `sha256=` prefix and the encoding are this repository's own provisional contract and must be followed explicitly by consumers.
+  The component takes the secret from the caller on every call, stores and logs nothing, and refuses an unusable secret (not
+  `bytes` or `str`, empty, over 1,024 bytes, or blank: whitespace-only text, judged the same way for a `str` and for `bytes` that
+  decode as UTF-8, so a `str` and its UTF-8 bytes are always accepted or refused together; arbitrary binary secrets, NUL bytes
+  included, are valid); it cannot judge a secret's strength, and how a secret is generated, stored and rotated is M5-D09. **Known limitation:** the signature binds only the body, so a captured delivery can be replayed with a valid
+  signature; consumers de-duplicate by `event_id`, but a freshness check would need a signed delivery timestamp, which changes the
+  signed content and is a wire-format decision.
+- **Retry arithmetic.** `schedule_retry` is a pure function of caller-supplied instants. The base delay and the maximum delay are
+  REQUIRED arguments (no default interval) and there is NO maximum attempt count: only the PRD's 24 hours ends the retries. Two
+  provisional assumptions: the delay after failed attempt `n` is `min(max_delay, base_delay * 2**(n-1))` (doubling, no jitter), and
+  the window starts at the FIRST attempt of the (subscription, event) pair and includes its end instant. Every instant is converted
+  to UTC before any arithmetic, so the 24 hours and the delays are real elapsed time even across a daylight-saving change in the
+  caller's zone (and an instant that UTC cannot represent is `INVALID_TIME`). A retry beyond the window,
+  or a failure observed after it, gives an explicit `WINDOW_EXPIRED` (recorded as `DeliveryOutcome.EXPIRED`). Which transport
+  results are retryable (the status classes, 429 and `Retry-After`, timeouts, TLS and DNS errors, refused destinations) is a policy
+  the PRD does not state and is not implemented.
+- **Delivery attempt record.** `DeliveryAttempt` carries what the PRD's delivery log lists (event ID, event, attempt count, HTTP
+  status, next retry, no payload content) plus the subscription, the outcome and the attempt time, with consistent outcomes and a
+  fixed `error_code` token as the only diagnostic. It is a contract, not storage. The existing `WebhookDeliveryRecord` still has a
+  free-text `status` and `error_message`, which the persistence slice must constrain before an adapter stores diagnostics; that
+  record was not changed. **Mapping onto that record (provisional).** The record documents the statuses `pending`, `delivered`,
+  `failed` and `dead_letter`, which are not the four attempt outcomes. What is stated, and nothing beyond it: (a) `delivered` maps
+  to `delivered`; (b) `failed_retryable` maps to `failed`, and a `failed` record whose `next_retry_at` is NOT null is a
+  NON-TERMINAL retryable failure (a retry is due at that instant); (c) an `expired` attempt (the 24-hour window is exhausted,
+  delivery has stopped) maps to `dead_letter`; (d) the TERMINAL statuses are `delivered` and `dead_letter`, so `pending`, and
+  `failed` with a non-null `next_retry_at`, are not terminal; (e) `failed_permanent` remains UNMAPPED until an approved decision
+  exists (whether a failure that is not retried is `failed` or `dead_letter`, and what a `failed` record without a
+  `next_retry_at` means, are not decided); (f) `pending` has NO corresponding outcome: an attempt record exists only for a
+  completed attempt, so a `pending` record is a delivery that is scheduled or in flight with no completed attempt yet; (g) a
+  `DeliveryAttempt` has no `tenant_id` and no `delivery_id`: the DISPATCHER supplies both (the tenant from the subscription, the
+  delivery identifier from its own assignment) when it constructs the persisted record; (h) `response_status_code` comes from
+  `http_status` and `next_retry_at` from `next_attempt_at`; (i) `error_code` is a fixed upper-case token, never arbitrary free
+  text, and where it is stored on the record it is carried in `error_message`, which remains a free-text field on the record that
+  the persistence slice must constrain. **Left open:** whether `DeliveryAttempt.attempted_at` maps to the record's `created_at`
+  (described there as the dispatch trigger timestamp) or to its `completed_at` (the dispatch resolution timestamp) is NOT decided
+  here, and neither mapping is implemented or assumed.
+- **Destination policy: REQUIREMENTS, NOT IMPLEMENTED.** No code validates a destination or sends a request, and
+  `WebhookSubscriptionRecord.target_url` is only a non-empty string today (it accepts `http://127.0.0.1/...`), so the registration
+  slice must not store a URL that has not passed a policy. An incomplete check is worse than none, so none was invented. The policy
+  has to cover at least: (1) URL syntax: an absolute URL with the `https` scheme only (PRD SEC-004: TLS 1.2 or higher), no
+  credentials in the authority, a bounded length, a port policy, no fragment, IDN handled in one canonical form; (2) the host:
+  refuse IP literals in every notation (decimal, octal, hex, IPv4-mapped IPv6), `localhost` and internal names; (3) the ADDRESS, not
+  the name: resolve the name, check EVERY resolved address against the refused ranges (loopback, private, link-local including the
+  cloud metadata address, carrier-grade NAT, multicast, unspecified, reserved and the IPv6 equivalents), and connect to the address
+  that was checked (pin it) so that a DNS rebinding between check and connect cannot change the destination; repeat the check on
+  every delivery attempt, not only at registration, because DNS changes; (4) redirects: do not follow them by default; if ever
+  allowed, re-run the whole policy on every hop and bound the number of hops; (5) the deployment egress policy (PRD SEC-011: all
+  outbound traffic denied by default, named destinations only; the on-premise profile denies it entirely), so a delivery is an
+  egress decision and an allow-list may be required in addition to the checks above; (6) a connect and response timeout, a response
+  size limit, and the response body never stored or logged; (7) the URL treated as sensitive (it can carry a token): never logged,
+  never returned in a delivery log; (8) TLS verification: verify the server's certificate chain and that the certificate matches
+  the host name that was checked, on every connection; verification is never disabled, not even per subscription or for a test
+  endpoint; (9) no ambient proxy: proxy settings in the environment or the system (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY`, a proxy auto-configuration file) must not be able to redirect a delivery around the destination and egress checks,
+  so the dispatcher's client ignores them, or sends traffic only through an explicit proxy that itself enforces the same policy.
+  The same policy applies to the optional `callback_url` of API-001.
+- **Persistence boundary and delivery guarantee.** Nothing here is durable. At-least-once delivery with retries that survive a restart
+  needs, at least: persistent subscriptions with a stored secret or secret reference (M5-D09), a persistent EVENT record written in
+  the same atomic step as the state change that fires it (so an event is neither lost nor invented), persistent delivery attempts
+  and a worker that claims due deliveries with a lease, so that one attempt is made at a time per delivery. A `WebhookEventRepository`
+  port does not exist and was not added; the existing delivery port's `update_delivery_status` takes a free-text status and error and
+  is not atomic, so its production contract needs the same review.
+- **Known test-environment limitation (not fixed here).** The retry tests that exercise daylight-saving behavior use
+  `zoneinfo.ZoneInfo("America/New_York")`, which needs a time-zone database: the operating system's, or the `tzdata` package (absent
+  on Windows and on some slim Linux images). `tzdata` is NOT a declared dependency and was deliberately not added by this change.
+  Where the database is missing those tests skip with a visible reason; in the mandatory job (`DOC_FAIL_ON_SKIP=1`) a skip fails the
+  job, so the coverage cannot disappear silently there. Declaring `tzdata` for the test environment, or building those tests on a
+  self-contained `tzinfo`, is future CI hardening.
+- **Remaining dependencies.** The destination policy and an HTTP dispatcher honouring it; subscription registration endpoints and the
+  secret lifecycle (M5-D09); an event store and its transactional outbox with the document, review-task and schema state changes
+  (Team Member 3); a delivery queue, lease and worker; the transport-result classification and the final retry numbers; the
+  signature and wire-format decisions above; the delivery log's privacy constraints; and tenant-scoped rate and size limits.
