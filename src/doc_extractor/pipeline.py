@@ -145,6 +145,32 @@ class ModuleAPipeline:
 
         # Step 3: Page Rendering / Ingestion to 200 DPI
         try:
+            # Persist the accepted original PDF for secure downstream text extraction.
+            original_document_storage_uri = None
+            if ingest_res.mime_type == "application/pdf":
+                if isinstance(file_path_or_stream, (str, Path)):
+                    with open(file_path_or_stream, "rb") as source_stream:
+                        source_artifact = self.storage.store_original_document(
+                            document_id=doc_id,
+                            document_data=source_stream,
+                        )
+                else:
+                    file_path_or_stream.seek(0)
+                    try:
+                        source_artifact = self.storage.store_original_document(
+                            document_id=doc_id,
+                            document_data=file_path_or_stream,
+                        )
+                    finally:
+                        file_path_or_stream.seek(0)
+
+                if not source_artifact.storage_uri:
+                    raise DocumentProcessingError(
+                        message="Storage backend did not return an original-document URI.",
+                        details={"document_id": doc_id},
+                    )
+                original_document_storage_uri = source_artifact.storage_uri
+
             # Re-open stream or pass path
             if isinstance(file_path_or_stream, (str, Path)):
                 render_input = file_path_or_stream
@@ -283,6 +309,7 @@ class ModuleAPipeline:
                 pages=page_records,
                 created_at=created_at,
                 completed_at=completed_at,
+                original_document_storage_uri=original_document_storage_uri,
             )
 
             # Persist handoff payload for idempotency replay and downstream audit

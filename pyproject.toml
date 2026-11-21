@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "doc-extractor-ingestion"
 version = "0.1.0"
-description = "Module A: Document Ingestion & Preprocessing for Document Extraction Engine"
+description = "Document Extraction Engine: ingestion (Module A), layout parsing and classification (Module B), schema-guided extraction (Module C), and schema lifecycle"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
@@ -15,6 +15,8 @@ authors = [
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
     "Private :: Do Not Upload",
 ]
@@ -27,12 +29,33 @@ dependencies = [
     "instructor>=1.0.0",
     "litellm>=1.40.0",
     "PyYAML>=6.0.0",
+    "jsonschema>=4.0.0",
+    # PRD v1.5 section 12.1 classifies the multimodal stack as CORE dependencies (1-stage Qwen3-VL).
+    # PyTorch and torchvision stay out of this list on purpose: they are platform/CUDA specific and
+    # must be installed first (Kaggle/Colab already ship a matching pair - never reinstall it). See README.
+    # - transformers>=4.57.1: Qwen3VLForConditionalGeneration ships from 4.57.0 (itself yanked).
+    # - qwen-vl-utils==0.0.14: process_vision_info(image_patch_size=16) is required for Qwen3-VL.
+    # - accelerate>=0.26.0 / bitsandbytes>=0.43.1: floors Transformers enforces for 4-bit loading;
+    #   bitsandbytes (NF4) needs CUDA, so it is skipped on macOS where no GPU path exists.
+    "transformers>=4.57.1",
+    "accelerate>=0.26.0",
+    "bitsandbytes>=0.43.1; sys_platform != 'darwin'",
+    "qwen-vl-utils==0.0.14",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0,<9.0.0",
+    "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+]
+# Interactive demo UI (doc_extractor.app). Not needed by the engine.
+ui = [
+    "gradio>=4.0.0",
+]
+# Optional OCR backends for Module B (ocr_backend='tesseract' | 'pdfium_hybrid'). Also needs the Tesseract
+# binary (macOS: brew install tesseract | Debian/Ubuntu/Kaggle: apt-get install tesseract-ocr).
+ocr = [
+    "pytesseract>=0.3.10",
 ]
 
 [tool.setuptools.packages.find]
@@ -46,5 +69,6 @@ pythonpath = ["src"]
 markers = [
     "unit: Unit tests for foundational components",
     "security: Security and guardrail compliance tests",
+    "live_ollama: Live integration test against a real Ollama server; opt-in via RUN_OLLAMA_TESTS=1",
 ]
 

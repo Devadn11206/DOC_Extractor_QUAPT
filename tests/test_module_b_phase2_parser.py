@@ -70,7 +70,9 @@ def dummy_loaded_page(dummy_page_ref):
 # --- Unit Tests ---
 
 def test_parser_engine_metadata_and_interface_conformance():
-    adapter = LocalOCRParserAdapter(engine_name="TestOCR", engine_version="0.1.0")
+    adapter = LocalOCRParserAdapter(
+        engine_name="TestOCR", engine_version="0.1.0", raw_extractor=lambda img: []
+    )
     meta = adapter.get_metadata()
     assert meta.engine_name == "TestOCR"
     assert meta.engine_version == "0.1.0"
@@ -94,7 +96,8 @@ def test_parser_empty_page_returns_valid_layout(dummy_loaded_page):
     assert result.page_number == 1
     assert result.markdown_content == ""
     assert len(result.blocks) == 0
-    assert result.mean_ocr_confidence == 1.0
+    # Mean must be None when no measurable confidence values exist (no artificial 1.0)
+    assert result.mean_ocr_confidence is None
 
 
 def test_parser_single_page_doc01_casa_mock(dummy_loaded_page):

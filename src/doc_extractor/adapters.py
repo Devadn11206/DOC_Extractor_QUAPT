@@ -22,15 +22,8 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 from doc_extractor.contracts_c import ExecutionMode, ExecutionProvenance
-from doc_extractor.extractor import (
-    attach_field_confidence,
-    free_gpu_memory,
-    gpu_dtype,
-    load_capped_image,
-    make_bnb_config,
-    parse_json_tolerant,
-    token_confidences,
-)
+from doc_extractor.extractor import gpu_dtype, load_capped_image, parse_json_tolerant
+from doc_extractor.vlm_runtime import resolve_trust_remote_code
 
 logger = logging.getLogger("doc_extractor.adapters")
 
@@ -109,9 +102,12 @@ class OCRTextAdapter(ModelAdapter):
             import torch
             from transformers import AutoModelForImageTextToText, AutoProcessor
 
-            self._ocr_proc = AutoProcessor.from_pretrained(self.ocr_model, trust_remote_code=True)
+            self._ocr_proc = AutoProcessor.from_pretrained(
+                self.ocr_model, trust_remote_code=resolve_trust_remote_code(self.ocr_model)
+            )
             self._ocr = AutoModelForImageTextToText.from_pretrained(
-                self.ocr_model, torch_dtype=gpu_dtype(), device_map=_side_device(), trust_remote_code=True,
+                self.ocr_model, torch_dtype=gpu_dtype(), device_map=_side_device(),
+                trust_remote_code=resolve_trust_remote_code(self.ocr_model),
                 attn_implementation="sdpa",
             )
             self._ocr.eval()
@@ -122,8 +118,13 @@ class OCRTextAdapter(ModelAdapter):
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
-            self._tok = AutoTokenizer.from_pretrained(self.text_model, trust_remote_code=True)
-            kwargs: Dict[str, Any] = {"device_map": _side_device(), "trust_remote_code": True}
+            self._tok = AutoTokenizer.from_pretrained(
+                self.text_model, trust_remote_code=resolve_trust_remote_code(self.text_model)
+            )
+            kwargs: Dict[str, Any] = {
+                "device_map": _side_device(),
+                "trust_remote_code": resolve_trust_remote_code(self.text_model),  # False: native class
+            }
             if self.load_in_4bit:
                 kwargs["quantization_config"] = make_bnb_config()
             else:

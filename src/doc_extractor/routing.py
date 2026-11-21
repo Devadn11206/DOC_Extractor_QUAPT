@@ -115,30 +115,48 @@ If the document is none of the listed DOC types, set "document_type" to a short 
 "language" is the dominant language of the text. Use null for subtype unless the category is unstructured.
 "rotation" is how many degrees CLOCKWISE the page must be turned so the text reads upright (0 if already upright, 180 if upside down)."""
 
-_FILENAME_HINTS: List[Tuple[Tuple[str, ...], DocumentCategory, Optional[str]]] = [
-    (("prescription", "rx"), DocumentCategory.HANDWRITTEN, "DOC-07"),
-    (("brochure", "pamphlet", "menu", "invitation", "leaflet"), DocumentCategory.UNSTRUCTURED, None),
-    (("discharge", "hospital", "patient", "summary", "medical"), DocumentCategory.UNSTRUCTURED, "DOC-03"),
-    (("insurance", "policy", "nominee", "proposal"), DocumentCategory.STRUCTURED, "DOC-02"),
-    (("bank", "casa", "account", "saving", "canara", "kyc", "form"), DocumentCategory.STRUCTURED, "DOC-01"),
+# A filename is not evidence of document identity: it may hint at the broad *category* (which
+# only selects a prompt/model) but never binds a document-specific schema.
+_FILENAME_HINTS: List[Tuple[Tuple[str, ...], DocumentCategory]] = [
+    (("prescription", "rx"), DocumentCategory.HANDWRITTEN),
+    (("brochure", "pamphlet", "menu", "invitation", "leaflet"), DocumentCategory.UNSTRUCTURED),
+    (("discharge", "hospital", "patient", "summary", "medical"), DocumentCategory.UNSTRUCTURED),
+    (("insurance", "policy", "nominee", "proposal"), DocumentCategory.STRUCTURED),
+    (("bank", "casa", "account", "saving", "canara", "kyc", "form"), DocumentCategory.STRUCTURED),
 ]
 
+# Categories of the schema-bound types Module B can identify from page content.
+_RULE_TYPE_CATEGORY: Dict[str, DocumentCategory] = {
+    "DOC-01": DocumentCategory.STRUCTURED,
+    "DOC-02": DocumentCategory.STRUCTURED,
+    "DOC-03": DocumentCategory.UNSTRUCTURED,
+}
 
-def heuristic_classify(filename: str, rule_type: Optional[str] = None) -> Dict[str, Any]:
-    """Offline fallback used when no VLM is available or classification fails."""
+
+def heuristic_classify(
+    filename: str,
+    rule_type: Optional[str] = None,
+    rule_confidence: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Offline fallback used when no VLM is available or classification fails.
+
+    ``document_type`` is only ever set from ``rule_type`` - Module B's content-based
+    classification, already subject to its confidence threshold - and carries Module B's real
+    ``rule_confidence``. Filename hints and the default produce no document type and no
+    confidence (None), so an unidentified document stays unidentified (never DOC-01).
+    """
+    if rule_type in _RULE_TYPE_CATEGORY:
+        return {"category": _RULE_TYPE_CATEGORY[rule_type].value, "document_type": rule_type,
+                "subtype": None, "language": "en", "confidence": rule_confidence,
+                "method": "rule_classifier"}
     name = filename.lower()
-    for keys, cat, doc_type in _FILENAME_HINTS:
+    for keys, cat in _FILENAME_HINTS:
         if any(k in name for k in keys):
-            return {"category": cat.value, "document_type": doc_type, "subtype": None,
-                    "language": "en", "confidence": 0.5, "method": "filename_heuristic"}
-    if rule_type in ("DOC-01", "DOC-02"):
-        return {"category": "structured", "document_type": rule_type, "subtype": None,
-                "language": "en", "confidence": 0.6, "method": "rule_classifier"}
-    if rule_type == "DOC-03":
-        return {"category": "unstructured", "document_type": rule_type, "subtype": None,
-                "language": "en", "confidence": 0.6, "method": "rule_classifier"}
+            return {"category": cat.value, "document_type": None, "subtype": None,
+                    "language": "en", "confidence": None, "method": "filename_hint"}
     return {"category": "structured", "document_type": None, "subtype": None,
-            "language": "en", "confidence": 0.3, "method": "default"}
+            "language": "en", "confidence": None, "method": "default"}
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +252,13 @@ class RoutedExtractor:
             pass
         return self.get_extractor(self.router_model, device=device)
 
-    def classify(self, image_path: str, filename: str, rule_type: Optional[str] = None) -> Dict[str, Any]:
+    def classify(
+        self,
+        image_path: str,
+        filename: str,
+        rule_type: Optional[str] = None,
+        rule_confidence: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """VLM classification with heuristic fallback. Always returns a dict with a valid category."""
         try:
             result = self.get_router().classify_page_image(image_path)
@@ -254,7 +278,7 @@ class RoutedExtractor:
             return result
         except Exception as exc:  # classification must never block the demo
             logger.warning("VLM classification failed, using heuristic: %s", exc)
-            result = heuristic_classify(filename, rule_type)
+            result = heuristic_classify(filename, rule_type, rule_confidence)
             result["fallback_reason"] = str(exc)
             return result
 

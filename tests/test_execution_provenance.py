@@ -16,7 +16,7 @@ Validates:
 """
 
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -145,7 +145,7 @@ def test_genuine_llm_via_instructor_mocking(doc_01_payload, valid_casa_model, mo
     mock_client.chat.completions.create_with_completion.return_value = (valid_casa_model, mock_raw_completion)
 
     import instructor
-    monkeypatch.setattr(instructor, "from_litellm", lambda completion_fn: mock_client)
+    monkeypatch.setattr(instructor, "from_litellm", lambda completion_fn, *args, **kwargs: mock_client)
 
     extractor = SchemaGuidedExtractor(
         model_name="Qwen2.5-7B-Instruct",
@@ -216,13 +216,15 @@ def test_llm_failure_with_fallback_disabled(doc_01_payload):
         llm_caller=failing_caller,
     )
 
-    with pytest.raises(LLMExecutionError) as exc_info:
-        extractor.extract_with_provenance(doc_01_payload)
+    with patch.object(extractor, "_extract_heuristic") as mock_heur:
+        with pytest.raises(LLMExecutionError) as exc_info:
+            extractor.extract_with_provenance(doc_01_payload)
+        mock_heur.assert_not_called()
 
     assert exc_info.value.model_name == "Qwen2.5-7B-Instruct"
     assert "Network unreachable" in str(exc_info.value)
     assert extractor.last_provenance is not None
-    assert extractor.last_provenance.fallback_occurred is True
+    assert extractor.last_provenance.fallback_occurred is False
     assert "Network unreachable" in extractor.last_provenance.fallback_reason
     assert extractor.last_provenance.is_genuine_llm() is False
 
@@ -245,7 +247,7 @@ def test_response_validation_failure_with_fallback_disabled(doc_01_payload):
 
     assert exc_info.value.model_name == "Qwen2.5-7B-Instruct"
     assert extractor.last_provenance is not None
-    assert extractor.last_provenance.fallback_occurred is True
+    assert extractor.last_provenance.fallback_occurred is False
 
 
 # 5B. Response validation failure with fallback enabled
@@ -578,7 +580,7 @@ def test_stale_provenance_prevention(doc_01_payload, valid_casa_model):
 
     # Provenance is updated to the failed execution, not stale
     assert extractor.last_provenance is not None
-    assert extractor.last_provenance.fallback_occurred is True
+    assert extractor.last_provenance.fallback_occurred is False
     assert "Connection dropped by peer" in extractor.last_provenance.fallback_reason
     assert extractor.last_provenance.request_id is None
 
