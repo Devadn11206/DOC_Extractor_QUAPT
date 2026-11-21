@@ -81,6 +81,10 @@ class FieldGrounding(BaseModel):
     bbox_norm: Optional[Tuple[float, float, float, float]] = None
     raw_value: Any = Field(default=None, description="Value exactly as returned by the model")
     uncertain: bool = Field(default=False, description="Model flagged the reading as uncertain")
+    model_confidence: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Token probability of the value text from the generating model (FR-CNF-001); None if unavailable",
+    )
     also_seen: List["FieldGrounding"] = Field(
         default_factory=list,
         description="Identical value found on other pages (deduplicated, evidence preserved), in page order",
