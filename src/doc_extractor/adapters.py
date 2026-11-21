@@ -116,7 +116,7 @@ class OCRTextAdapter(ModelAdapter):
     def _load_text(self):
         if self._txt is None:
             import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            from transformers import AutoModelForCausalLM, AutoTokenizer
 
             self._tok = AutoTokenizer.from_pretrained(
                 self.text_model, trust_remote_code=resolve_trust_remote_code(self.text_model)
@@ -126,9 +126,7 @@ class OCRTextAdapter(ModelAdapter):
                 "trust_remote_code": resolve_trust_remote_code(self.text_model),  # False: native class
             }
             if self.load_in_4bit:
-                kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True, bnb_4bit_compute_dtype=gpu_dtype()
-                )
+                kwargs["quantization_config"] = make_bnb_config()
             else:
                 kwargs["torch_dtype"] = gpu_dtype()
             self._txt = AutoModelForCausalLM.from_pretrained(self.text_model, **kwargs)
@@ -151,7 +149,10 @@ class OCRTextAdapter(ModelAdapter):
         inputs.pop("token_type_ids", None)
         with torch.no_grad():
             out = model.generate(**inputs, max_new_tokens=self.max_ocr_tokens, do_sample=False)
-        return proc.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        text = proc.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        del inputs, out
+        free_gpu_memory()
+        return text
 
     def text_to_fields(self, ocr_text: str, system_prompt: str) -> Dict[str, Any]:
         """Step 2: text LLM maps OCR text to the schema. It cannot see the page, so bbox is null."""
@@ -173,9 +174,18 @@ class OCRTextAdapter(ModelAdapter):
             prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tok([prompt], return_tensors="pt").to(model.device)
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=self.max_json_tokens, do_sample=False)
-        text = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        return parse_json_tolerant(text)
+            out = model.generate(
+                **inputs, max_new_tokens=self.max_json_tokens, do_sample=False,
+                return_dict_in_generate=True, output_scores=True,
+            )
+        text, spans = token_confidences(
+            model, out, inputs["input_ids"].shape[1], lambda ids: tok.decode(ids, skip_special_tokens=True)
+        )
+        del inputs, out
+        free_gpu_memory()
+        raw = parse_json_tolerant(text)
+        attach_field_confidence(raw, text, spans)
+        return raw
 
     def extract(self, image_path, system_prompt):
         ocr_text = self.read_text(image_path)

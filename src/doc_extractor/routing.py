@@ -46,12 +46,11 @@ DEFAULT_ROUTING_TABLE: Dict[str, Any] = {
     "version": "1.0.0",
     "default_model": DEFAULT_MODEL,
     "routes": {
-        # Digital printed pages: GLM-OCR reads the text, Qwen3-4B-Instruct-2507 (text only, non-thinking)
-        # formats it into JSON. No boxes on this route, so its values are flagged for review.
-        "structured": {"default": {"adapter": "ocr_text", "ocr_model": "zai-org/GLM-OCR",
-                                   "text_model": "Qwen/Qwen3-4B-Instruct-2507"}},
-        "unstructured": {"default": {"adapter": "ocr_text", "ocr_model": "zai-org/GLM-OCR",
-                                     "text_model": "Qwen/Qwen3-4B-Instruct-2507"}},
+        # Until GLM-OCR returns boxes (FR-RTE-006) its values are all withheld, so every category runs on the
+        # Qwen3-VL default, which gives grounded boxes, checkboxes and character grids. GLM-OCR + text LLM stays
+        # selectable as the "ocr_text" alt engine for the FR-RTE-007 comparison.
+        "structured": {"default": DEFAULT_MODEL},
+        "unstructured": {"default": DEFAULT_MODEL},
         # Handwriting: the vision model reads the page image directly.
         "handwritten": {"default": DEFAULT_MODEL},
     },
@@ -96,7 +95,7 @@ def select_model(category: DocumentCategory, language: str, table: Optional[Dict
 CLASSIFIER_SYSTEM_PROMPT = """You classify document images. Return raw JSON only, no markdown:
 {"filled_by": "hand|machine|empty",
  "category": "structured|unstructured|handwritten",
- "document_type": "DOC-01|DOC-02|DOC-03|DOC-04|DOC-05|DOC-06|DOC-07|DOC-08|OTHER",
+ "document_type": "DOC-01|DOC-02|DOC-03|DOC-04|DOC-05|DOC-06|DOC-07|DOC-08|<short descriptive name>",
  "subtype": "brochure|pamphlet|menu card|CASA leaflet|invitation card|other|null",
  "language": "en|hi|te|ta|ml",
  "confidence": 0.0-1.0,
@@ -112,6 +111,7 @@ Definitions:
 - unstructured: free-layout printed material with no fixed fields (brochures, pamphlets, menu cards, invitation cards, policy wordings DOC-08, discharge summaries DOC-03).
 - handwritten: the content is mostly handwriting, e.g. a doctor's prescription DOC-07.
 If the filled-in entries on a form are handwritten, the category is HANDWRITTEN even though the layout is a form. Use STRUCTURED only when the filled-in entries are typed or printed. Handwritten routes to the vision model; structured digital pages route to the OCR text route.
+If the document is none of the listed DOC types, set "document_type" to a short descriptive name in lower case (for example "rent agreement", "utility bill"); do not force it into a DOC code (FR-CLS-008).
 "language" is the dominant language of the text. Use null for subtype unless the category is unstructured.
 "rotation" is how many degrees CLOCKWISE the page must be turned so the text reads upright (0 if already upright, 180 if upside down)."""
 
