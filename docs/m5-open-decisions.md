@@ -277,6 +277,7 @@ Per repository convention, existing decisions must not be assigned duplicate IDs
 | M2D-D03 | Default page-image representation | PRD owner, API lead | S5 | Open |
 | M2D-D04 | Authorization scopes for page-image retrieval | PRD owner, Team Member 3 | S5 | Open |
 | M2D-D05 | Missing or not-yet-rendered page error code | PRD owner | S5 | Open |
+| M2D-D06 | Page selection for single-page synchronous extraction | PRD owner | S6 | Open |
 
 ### M2D Decision Details
 
@@ -729,12 +730,18 @@ validation is reimplemented. Every choice below is a PROVISIONAL assumption, not
   prompt asks for the printed label), so a key can be document content. A field name is therefore exposed only when it is a
   canonical identifier of the schema that is really bound: `document_type` must be a key of `extractor.SCHEMA_MAP` (a schema id
   that merely exists is not a binding) and the path must belong to that schema's own field set (list positions such as
-  `nominees.0.name` are accepted as positions). Every other field gets a positional public id (`field_1`, `field_2`, in
+  `nominees.0.name` are accepted as positions; a position is one to three ASCII digits matched in full, so a Unicode digit, a
+  trailing newline or whitespace is not a position and the field gets a positional id instead). Every other field gets a positional public id (`field_1`, `field_2`, in
   order, never equal to a canonical name) through one mapping that is also applied to `flags[].fields`; a flag reference that
   cannot be mapped is dropped. `document_category`, `document_subtype` and `language` come from a model and are exposed only
   when they exactly equal a member of the sets the code already defines (`DocumentCategory`, `UNSTRUCTURED_SUBTYPES`, the
-  `LANGUAGES` codes), otherwise they are `null`. `document_type` and `schema_id` are not altered: in the extraction path
-  `document_type` is `generic` or a `SCHEMA_MAP` key. The `redaction` object states these two rules too.
+  `LANGUAGES` codes), otherwise they are `null`. `document_type` and `schema_id` are validated, not passed through: each must be a member of one code-defined set, the
+  `MVPDocumentType` values (`DOC-01`, `DOC-02`, `DOC-03`, `UNKNOWN`) plus `generic`, which are the only values the extraction path
+  produces. Any other value fails the serialization and is answered as the generic fixed-reason `500 INTERNAL_ERROR`, without
+  echoing the value. Both fields share one set because the only schema registry in the code gives schema ids equal to the
+  document types; the two are not cross-checked against each other. A registry with other ids, or the schema ids of dynamic
+  schemas, would be rejected (a 500, fail closed) until the set is deliberately extended; API-004 does not reach dynamic schemas
+  today. The `redaction` object states the field-name and free-text rules too.
 - **Open conflict with the PRD (M2D-D02, Open).** The PRD's contract is the full canonical envelope. Returning it would expose
   extracted values and evidence text (PII) before any masking policy exists, so the response is narrowed instead. This is
   reported as a conflict, not decided. Nothing is persisted: `GET /documents/{id}` still shows `result: null`.
@@ -757,7 +764,11 @@ validation is reimplemented. Every choice below is a PROVISIONAL assumption, not
 - **Logging.** The API layer logs only fixed reason codes, the request id and the document id (constant messages), never values,
   evidence text, filenames or exception texts (a static test pins this). NOT changed and outside this endpoint: the processing
   service and Module B log their own diagnostics, including raw exception text (they can contain paths or provider messages);
-  this belongs to the open F6 logging audit.
+  this belongs to the open F6 logging audit. A regression test sends hostile model output through the real route and checks the
+  response, the application's own log records (captured apart from third-party client logs, and required to be non-empty) and the
+  whole capture for distinctive synthetic PII markers. In that test's setup (Module C stubbed), no application log record is emitted during or after the
+  extract-sync call on the success path; this is an observation about that setup, not a claim about all extraction execution, and
+  the test therefore guards against future logging there; it does not cover the processing service's own diagnostics (F6).
 - **Not implemented.** Page selection, asynchronous continuation of a timed-out extraction, persistence of the result,
   webhooks, review tasks, an approved masking transform, and any cross-process capacity control.
 - **Test scope.** The tests run the real upload, storage, handoff, `DocumentService` and Module B loading; the routed model
@@ -930,6 +941,13 @@ endpoint or webhook and no production adapter.
   flagged path although it is not itself a correctable path (corrections need a position); a flag reference that cannot be mapped
   (for example a dynamic rule's `items[].amount`) is dropped while its code is kept. Per-field thresholds exist only in the schema,
   not in the envelope, so the gate cannot and does not re-evaluate them.
+- **Unmappable references (hardening after the Phase 3 review).** A flag reference that is not a safe public identifier (a Unicode
+  digit as a position, a newline or other whitespace, an empty or non-text value, or more than 128 characters) is dropped on its
+  own: the routing, the other references, the flag's code and the gate's reasons are kept. A genuine internal fault still ends in
+  `ROUTING_FAILED` (fail closed). Remaining low-risk limitation: a flagged field KEY that the identifier mapping treats as
+  canonical but whose public path is longer than 128 characters (reproduced only with a synthetic key, `nominees.` followed by
+  seventy `0.` positions) still aborts with `ROUTING_FAILED`. It fails closed; closing it needs a stricter rule for consecutive
+  positions in the canonical-path check, which is an API-004 contract choice and was not made here.
 
 ### M5 Phase 4 Webhook Dispatcher Foundation Provisional Behavior and Limitations (events, signing, retry arithmetic)
 
@@ -1031,3 +1049,40 @@ scheduler, adds an endpoint or registers a subscription.
   secret lifecycle (M5-D09); an event store and its transactional outbox with the document, review-task and schema state changes
   (Team Member 3); a delivery queue, lease and worker; the transport-result classification and the final retry numbers; the
   signature and wire-format decisions above; the delivery log's privacy constraints; and tenant-scoped rate and size limits.
+
+### M5 Phase 5 Release Acceptance Notes (Team Member 2 API foundation)
+
+This section records the state of the Team Member 2 branch. It resolves no decision: all 24 decisions of this register (M5-D01 to
+M5-D18 and M2D-D01 to M2D-D06) stay **Open**, and finishing this branch is not a statement that the product MVP is ready.
+
+- **What the branch provides.** Routes (provisional, scope-protected, tenant only from the authenticated principal): API-001
+  upload, API-002 get, API-003 page image, API-004 extract-sync (single page, values and evidence text redacted), API-015 list,
+  and the review-task queue (list, claim, release). Contract-level logic without any route, storing and sending nothing:
+  correction validation and the completion port (the task record only), review routing and task drafts, and webhook events, HMAC
+  signing and retry arithmetic. Any port without an adapter answers `503 SERVICE_UNAVAILABLE`. The review-task repository exists
+  only as an in-memory test double, and the document routes run over Module A's local filesystem storage under the
+  single-process prerequisite of API-001; neither is a durable production integration.
+- **Not implemented.** Webhook subscriptions, delivery, a dispatcher or worker; durable review-task persistence and task creation;
+  the completion endpoint and workflow; corrections; a durable audit store; production adapters of any kind; the API-key
+  management, schema, export and metrics routes.
+- **Verification (Phase 5.4, local).** The mandatory CI selection (`tests/test_api_*.py`, tenant isolation, exception-base
+  identity, packaging consistency, CI policy) under `DOC_FAIL_ON_SKIP=1`: Python 3.14.6, 2,919 passed, 0 skipped, 0 failed; this
+  required putting the complete Python 3.11 virtualenv first on `PATH`, so that the fresh-interpreter import test found
+  `python-multipart` (without it, the system `python3.11` fails that one test and the run is 2,918 passed, 1 failed). Python
+  3.11.15, 2,862 passed, 0 skipped; **57 tests were not verified locally** because `uvicorn` was absent from the local 3.11
+  environment: 56 (all of `test_api_protocol_headers.py`) could not be collected, and 1 (`test_api_extra_installed.py`) ran and
+  failed for the same missing dependency. `uvicorn` is declared in the `api` extra and the CI job installs it; these 57 tests
+  passed in the Python 3.14 run. The GitHub Actions workflow itself was not run by these local checks.
+- **Test-environment differences.** The local 3.11 environment is a virtual environment with `--system-site-packages` plus
+  `python-multipart` and `tzdata`; its test client uses `httpx`, not `httpx2`. `tzdata` and `httpx2` are not declared dependencies
+  (see Phase 4 above for `tzdata`); a fresh-interpreter import test probes any `python3.N` on `PATH`, so under `DOC_FAIL_ON_SKIP=1`
+  a system interpreter without `python-multipart` fails it. Starlette's test client emits one deprecation warning (use of `httpx`).
+- **Team Member 2, low risk (documented above).** A flagged field key whose canonical path exceeds 128 characters aborts routing;
+  `document_type` and `schema_id` are not cross-checked and dynamic schema ids are not accepted; the remaining F5 to F7 follow-ups
+  of the document routes; the undeclared test-environment packages.
+- **Team Member 3.** Production adapters for documents, review tasks, API keys, webhooks and audit; atomic claim, release,
+  completion and status-plus-task creation; the event store, outbox, delivery queue, lease and worker; the durable hash-chained
+  audit store; schema snapshot source; production secret storage; tenant policy and provisioning. See `docs/m5-api-ownership.md`.
+- **Awaiting product or security approval.** Every entry of the Summary and M2D tables above, in particular the masking policy
+  (M2D-D02), review-task states and completion policy (M5-D11, M5-D12), audit values (M5-D07), the webhook wire format, replay
+  protection and destination policy (Phase 4 above, M5-D09), and the error-code and envelope vocabulary (M5-D01, M5-D02).
