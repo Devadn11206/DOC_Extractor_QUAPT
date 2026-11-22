@@ -14,14 +14,13 @@ If you change any of these after a run, restart the session (**Run > Restart**) 
 
 ## 2. Run the cells in order
 
-The notebook has five code cells. Run them top to bottom.
+The notebook has four code cells. Run them top to bottom.
 
 | Cell | What it does | Time (first run) |
 | --- | --- | --- |
 | 1. Get code | Clones the repo the first time, or runs `git pull` after that. Prints the latest commit. | under 1 min |
 | 2. Install | Installs the Python packages (`uv`, `transformers`, `gradio`, and others). | a few minutes |
 | 3. Download models | Downloads the model weights. Qwen3-VL-4B is required. GLM-OCR, Qwen3-4B-Instruct and Qwen2.5-7B are optional, and the cell skips any that fail. | 10 to 20 min (about 20 GB) |
-| 3b. Smoke test | Loads Qwen3-VL-4B in 4-bit, reads one generated page and prints each field's confidence, the peak GPU memory and the time. Run it before the app; send back the output (or the error) if it fails. | 1 to 3 min |
 | 4. Launch | Frees port 7860, then starts the app. | the app itself loads the model at startup, 1 to 2 min |
 
 When the app is ready, cell 4 prints a line like `Running on public URL: https://....gradio.live`. Open that link.
