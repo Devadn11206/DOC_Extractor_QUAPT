@@ -27,7 +27,7 @@
 ## B. Five-Phase Execution Plan
 
 ### Phase 1 – Engine Stabilization & Canonical Pipeline
-- **Single Canonical Pipeline:** Unify extraction, grounding, normalization, and envelope assembly under `ModuleCPipeline` (supporting `VLMAdapter` / `Qwen3-VL-4B`, `OCRTextAdapter` / `GLM-OCR`, and `PdfiumTextParserAdapter`—with no Tesseract OS dependency).
+- **Single Canonical Pipeline:** Unify extraction, grounding, normalization, and envelope assembly under `ModuleCPipeline` (supporting `VLMAdapter` / `Qwen3-VL-4B`, `OCRTextAdapter` / `GLM-OCR`, and `PdfiumTextParserAdapter`—with no OS-level OCR dependency).
 - **Multipage & Grounding:** Page-by-page extraction, per-page `CoordinateTransform` to 200-DPI original pixels (`[x0, y0, x1, y1]` per `SCH-013`), cross-page deduplication + conflict flagging (`FIELD_VALUE_CONFLICT`), and `PARTIAL_PAGE_COVERAGE`.
 - **Safe Validation & Confidence Integrity:** Eliminate synthetic confidence values (`ConfidenceProvenance` + `None` when unmeasured), preserve valid fields when required fields are absent (`REQUIRED_FIELD_MISSING`), and block `UNKNOWN` documents from silently binding a schema.
 

@@ -1,6 +1,0 @@
-# Optional: Module B OCR backends (ocr_backend='tesseract' | 'pdfium_hybrid').
-# Also needs the Tesseract binary: macOS: brew install tesseract | Debian/Ubuntu/Kaggle: apt-get install tesseract-ocr
-# Not required by the default pass-through backend, the engine or the test suite.
--r requirements.txt
-
-pytesseract>=0.3.10

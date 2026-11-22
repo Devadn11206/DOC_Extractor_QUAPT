@@ -6,7 +6,7 @@ The **Document Extraction Engine** is an on-premise, schema-driven system design
 
 The system is architected as a modular, decoupled processing pipeline. The authoritative specification is **PRD v1.5** ([`Document_Extraction_Engine_PRD.md`](Document_Extraction_Engine_PRD.md)); earlier revisions are archived under [`docs/prd-versions/`](docs/prd-versions/README.md). Extraction is single-stage and multimodal: a vision-language model (default `Qwen/Qwen3-VL-4B-Instruct`) reads the page image and returns schema JSON with boxes; digital pages can instead be routed to GLM-OCR + a text LLM (PRD D14).
 1. **Module A — Document Ingestion & Preprocessing**: Safe reception, multi-format validation, 200 DPI rendering, image de-skewing, normalization, and secure tenant storage.
-2. **Module B — Layout Parsing & Document Classification**: Document classification, schema binding and **passing the page-image paths** on. OCR is optional: the default parser is an explicit no-OCR pass-through, and Tesseract / PDFium text are opt-in backends (structural extraction of tables, checkboxes and character grids is available when an OCR backend supplies tokens).
+2. **Module B — Layout Parsing & Document Classification**: Document classification, schema binding and **passing the page-image paths** on. OCR is optional: the default parser is an explicit no-OCR pass-through, and PDFium text is an opt-in backend (structural extraction of tables, checkboxes and character grids is available when a backend supplies tokens).
 3. **Module C — Extraction & Grounding**: `ModuleCPipeline` is the canonical processing and envelope-assembly layer. The demo app classifies the document once, routes every page to the specialist for its category (`RoutedExtractor` + `VLMAdapter` / `OCRTextAdapter`), and hands the page results to `ModuleCPipeline.process_routed_pages`, which normalizes values, maps boxes to original-page pixels, validates, aggregates pages, grounds each value in page-specific evidence, gates the output status and emits the PRD §6.3 envelope. A real Qwen-VL run on a GPU (Kaggle T4) has **not** been verified yet (the test suite uses a faked model call); VLM-read fields carry no confidence, so those documents always route to `needs_review`.
 
 ### PRD v1.5 routed extraction (demo app and `ModuleCPipeline`)
@@ -251,12 +251,6 @@ Module C acts as Stage 3 of the engine, consuming `ModuleBOutputPayload` and tra
 ### 1. Prerequisites
 - **Python**: `requires-python >=3.10`. **Verified in this repository** (full test suite, clean install): macOS with Python **3.11.15** and **3.14**. Python 3.10, 3.12 and 3.13 are declared-compatible but **have not been verified**; Python 3.9 and older are rejected by `pip`.
 - **Operating System**: Linux, macOS, or Windows. Verification above was done on macOS only.
-- **Tesseract OCR binary (external, OPTIONAL)**: only needed for `ocr_backend="tesseract"` / `"pdfium_hybrid"`. The default backend is the explicit no-OCR pass-through, so `ModuleBPipeline(storage)` and the demo app start without it (including on Kaggle). To use Tesseract install the Python wrapper (`pip install -e ".[ocr]"`) **and** the executable:
-  - macOS: `brew install tesseract`
-  - Debian/Ubuntu/Kaggle: `sudo apt-get install tesseract-ocr`
-  - Windows: install the UB-Mannheim Tesseract build and add it to `PATH` (or set `ocr_tesseract_cmd`).
-  - Extra languages need their tessdata packs (e.g. `tesseract-ocr-hin`). Verify with `tesseract --version` and `tesseract --list-langs`.
-  - If a Tesseract backend is configured and the runtime is missing it fails with `OCR_DEPENDENCY_MISSING` / `OCR_BINARY_MISSING`; it never silently falls back to another engine.
 
 ### 2. Environment Installation
 
@@ -279,11 +273,10 @@ Install exactly the components you need (the extras are mirrored by the `require
 | Development / run the tests | `pip install -e ".[dev]"` | core + pytest, pytest-cov |
 | Demo UI (`doc_extractor.app`) | `pip install -e ".[ui]"` | core + gradio |
 | REST API foundation (`doc_extractor.api`) | `pip install -e ".[api]"` | core + fastapi, starlette, uvicorn, python-multipart. The API tests also need `httpx`, which is in `dev`; without the `api` extra they skip. |
-| Optional OCR backends | `pip install -e ".[ocr]"` + the Tesseract binary | core + pytesseract |
 
-Extras combine, e.g. `pip install -e ".[dev,ui]"`. Without an editable install, use `pip install -r requirements.txt` (core), `requirements-dev.txt`, `requirements-ui.txt`, `requirements-ocr.txt` or `requirements-api.txt`.
+Extras combine, e.g. `pip install -e ".[dev,ui]"`. Without an editable install, use `pip install -r requirements.txt` (core), `requirements-dev.txt`, `requirements-ui.txt`, or `requirements-api.txt`.
 
-**Dependency classification (PRD v1.5 section 12.1).** The multimodal packages are **core** dependencies, as the PRD lists them. PyTorch and torchvision are the deliberate exception: they are platform specific (CUDA/CPU/MPS), so they are not declared and are installed first with the build for your machine (see <https://pytorch.org/get-started/locally/>), for example `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126` (CUDA 12.x). `accelerate` requires torch, so install torch before `pip install -e .`. `qwen-vl-utils` imports `torchvision`, so the two must match. On Kaggle and Colab keep the preinstalled torch/torchvision: do not upgrade or reinstall them. Gradio and Tesseract are optional extras. The full GPU runtime guide is in "Qwen3-VL GPU runtime" below.
+**Dependency classification (PRD v1.5 section 12.1).** The multimodal packages are **core** dependencies, as the PRD lists them. PyTorch and torchvision are the deliberate exception: they are platform specific (CUDA/CPU/MPS), so they are not declared and are installed first with the build for your machine (see <https://pytorch.org/get-started/locally/>), for example `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126` (CUDA 12.x). `accelerate` requires torch, so install torch before `pip install -e .`. `qwen-vl-utils` imports `torchvision`, so the two must match. On Kaggle and Colab keep the preinstalled torch/torchvision: do not upgrade or reinstall them. Gradio is an optional extra. The full GPU runtime guide is in "Qwen3-VL GPU runtime" below.
 
 ### 3. Configuration
 
@@ -292,7 +285,7 @@ The application does **not** read a `.env` file or environment variables. [`.env
 ```python
 from doc_extractor.config import Settings, load_settings
 
-settings = Settings(ocr_backend="tesseract", ocr_tesseract_lang="eng")      # opt in to OCR (default: "passthrough")
+settings = Settings(ocr_backend="pdfium")                                    # native PDF text (default: "passthrough")
 settings = load_settings({"app_env": "staging", "max_page_count": 50})   # validated
 ```
 
@@ -305,14 +298,12 @@ Module B builds its parser from `Settings.ocr_backend` (fields can be passed as 
 | `ocr_backend` | Parser | Notes |
 | --- | --- | --- |
 | `passthrough` (default) | Explicit no-OCR pass-through | Empty layouts, page images preserved, no confidence invented, classification `UNKNOWN` and review required. Needs no OCR runtime |
-| `tesseract` | Local Tesseract OCR on every page image | Optional: needs `pytesseract` (`.[ocr]`) + the Tesseract binary |
-| `pdfium_hybrid` | Native PDF text per page, Tesseract fallback | Fallback also needs Tesseract |
 | `pdfium` | Native PDF text only | No OCR: fails on scanned pages and images |
 | `none` | Explicit no-parser mode | Reported non-operational; Module B fails closed with `PARSER_NOT_CONFIGURED` |
 
-The pass-through is not a fallback: it is used only when it is the configured backend. Choosing an OCR backend whose runtime is missing is an error, never a silent switch to pass-through.
+The pass-through is not a fallback: it is used only when it is the configured backend. Choosing a backend whose runtime is missing is an error, never a silent switch to pass-through.
 
-Related settings: `ocr_tesseract_lang` (default `eng`, e.g. `eng+hin`), `ocr_tesseract_config` (e.g. `--psm 6`), `ocr_tesseract_cmd` (explicit executable path). A missing package, executable, language pack or invalid value fails immediately with an actionable error (`OCR_DEPENDENCY_MISSING`, `OCR_BINARY_MISSING`, `OCR_BINARY_UNUSABLE`, `OCR_LANGUAGE_MISSING`) instead of silently producing empty pages. A bare `LocalOCRParserAdapter()` without an OCR extractor never reports itself as operational; use the pass-through backend when no OCR is intended.
+A bare `LocalOCRParserAdapter()` without an OCR extractor never reports itself as operational; use the pass-through backend when no OCR is intended. Tesseract support was removed: pages are read by the vision model or by GLM-OCR through the routing table (PRD v1.5).
 
 ---
 
@@ -390,7 +381,7 @@ The repository includes unit, regression, integration and end-to-end test covera
 
 **Earlier result (M5 API foundation before the document and review-task routes; Python 3.11 and 3.14, `api` extra installed, no OCR extra):** 1451 tests collected; 1450 pass, 3 skipped (the opt-in live Ollama test and the two optional-OCR test modules, which skip as a whole). Without the `api` extra: 1075 pass, 18 skipped, 0 failed.
 
-**Earlier result (Phase 1 on PRD v1.5, before the API foundation):** 915 tests collected. With the optional `ocr` extra and the Tesseract binary installed: 914 pass, 1 skipped (the opt-in live Ollama test). In a clean environment without torch, `pytesseract` or Tesseract (fresh Python 3.11 and 3.14): 869 pass, 3 skipped (the live Ollama test and the two optional-OCR test files, which skip as a whole). With `pytesseract` but the binary hidden: 910 pass, 5 skipped. The suite runs without a GPU, torch, model weights or Tesseract. The Qwen-VL runtime (`vlm_runtime.py`) and the OCR + text adapter are covered with fakes; real Qwen-VL / GLM-OCR / GPU behaviour is not covered by any automated test.
+**Earlier result (Phase 1 on PRD v1.5, before the API foundation):** 915 tests collected. That count predates the removal of the Tesseract backend. The suite runs without a GPU, torch or model weights. The Qwen-VL runtime (`vlm_runtime.py`) and the OCR + text adapter are covered with fakes; real Qwen-VL / GLM-OCR / GPU behaviour is not covered by any automated test.
 
 ```bash
 pip install -e ".[dev]"      # test dependencies
@@ -406,7 +397,7 @@ RUN_OLLAMA_TESTS=1 pytest -m live_ollama                         # http://localh
 RUN_OLLAMA_TESTS=1 OLLAMA_API_BASE=http://host:11434 pytest -m live_ollama
 ```
 
-Tests that need the optional `pytesseract` extra or the Tesseract binary skip with an explicit reason when it is not installed (`pytest -rs` lists them); everything else mocks the OCR and model layers. Initialization of `ModuleBPipeline(storage)` and the Module B hand-off are tested with Tesseract absent.
+Tests mock the OCR and model layers. Initialization of `ModuleBPipeline(storage)` and the Module B hand-off are tested with no OCR installed.
 
 ## Repository documents
 
@@ -418,7 +409,7 @@ Tests that need the optional `pytesseract` extra or the Tesseract binary skip wi
 | `docs/prd-versions/` | Archived PRD revisions (v1.0 original PDF, v1.3, v1.4) and their index. |
 | `docs/kaggle/README.md` | How to run the demo notebook on a Kaggle T4, the `DOC_*` settings and troubleshooting. |
 | `docs/model_cost_evaluation.xlsx` | Model / cost evaluation workbook for the routed specialists. |
-| `src/doc_extractor/notebookb4c0029335.ipynb`, `notebookbdb318963a.ipynb` | Kaggle demo launchers: they `git pull` the repository, install dependencies, download the models and launch the Gradio demo. They run the code of the branch they clone, **not** this working tree. They install `gradio` explicitly (it is an optional extra here) and do not install the Tesseract binary (not needed by the default backend). |
+| `src/doc_extractor/notebookbdb318963a.ipynb` | Kaggle demo launchers: they `git pull` the repository, install dependencies, download the models and launch the Gradio demo. They run the code of the branch they clone, **not** this working tree. They install `gradio` explicitly (it is an optional extra here). |
 | `notebooks/*.ipynb`, `notebooks/doc01_support/` | Earlier Colab notebooks for the standalone DOC-01 CASA reader (`casa_reader.py` / `casa_form.py`); legacy, separate from the `ModuleCPipeline` path. |
 | `casa_reader.py`, `casa_form.py`, `insurance_form.py` (`src/doc_extractor/`) | Legacy rule-based form readers. They are not used by the canonical pipeline. `casa_reader.py` additionally imports `rapidocr_onnxruntime`, `torch` and `transformers` lazily; these are intentionally not declared dependencies. |
 
@@ -428,7 +419,7 @@ Tests that need the optional `pytesseract` extra or the Tesseract binary skip wi
 
 This project is under active development. The current codebase implements **Module A**, **Module B**, and **Module C**. Known open gaps and architecture prerequisites include:
 
-- **Module B OCR Runtime**: Module B selects its parser from `Settings.ocr_backend` (default: the explicit no-OCR pass-through; Tesseract and PDFium text are opt-in, see "Module B OCR backend"). With the default, rule-based classification has no content evidence (`UNKNOWN`, review required) and OCR-grounded evidence is unavailable; the vision model supplies boxes instead. Cross-process worker integration with isolated OCR engines (e.g. PaddleOCR) is not implemented.
+- **Module B OCR Runtime**: Module B selects its parser from `Settings.ocr_backend` (default: the explicit no-OCR pass-through; PDFium text is opt-in, see "Module B OCR backend"). With the default, rule-based classification has no content evidence (`UNKNOWN`, review required) and OCR-grounded evidence is unavailable; the vision model supplies boxes instead. Cross-process worker integration with isolated OCR engines (e.g. PaddleOCR) is not implemented.
 - **Local Model Serving Cluster**: Module C supports pluggable LLM extraction (LiteLLM/Instructor) and deterministic extraction heuristics; production deployment on-premise requires containerized vLLM/Ollama services with GPU acceleration per PRD ARC-004/ARC-005.
 - **Durable Message Broker**: Inter-module queues currently provide an in-memory adapter (`LocalMemoryQueueAdapter`); production deployment requires connecting a persistent broker (e.g. RabbitMQ or Redis Streams).
 - **Distributed Idempotency & Locking**: Current concurrency locking is process-local; multi-replica horizontal clustering requires a shared distributed cache (e.g. Redis).

@@ -94,7 +94,7 @@ def message(payload):
 
 
 @pytest.mark.parametrize("payload", [
-    {}, {"schema_id": "casa_account_opening", "schema_version": 3, "ocr_backend": "tesseract", "force": True, "dpi": 200.0, "note": None},
+    {}, {"schema_id": "casa_account_opening", "schema_version": 3, "ocr_backend": "pdfium", "force": True, "dpi": 200.0, "note": None},
     {"page_numbers": [1, 2, 3], "languages": ["en", "hi"]}, {"s": "x" * 256}, {f"k{i}": i for i in range(32)}, {"a1_b2": 1},
 ])
 def test_a_flat_scalar_payload_of_identifiers_and_options_is_accepted(payload):

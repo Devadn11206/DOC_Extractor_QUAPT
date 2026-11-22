@@ -12,8 +12,7 @@ Pillow>=9.0.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 
-# Module B OCR is OPTIONAL (default backend: explicit no-OCR pass-through). To use Tesseract install
-# requirements-ocr.txt (or: pip install -e ".[ocr]") plus the Tesseract binary.
+# Module B has no OCR engine in the core (default backend: explicit no-OCR pass-through).
 
 # Module C: Schema-Guided Extraction & Normalization
 instructor>=1.0.0

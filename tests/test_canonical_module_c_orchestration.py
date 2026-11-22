@@ -687,7 +687,7 @@ def test_settings_reach_module_b_and_storage(tmp_path):
     assert app.get_pipelines(settings) == (pipe_a, pipe_b)              # cached per settings
 
 
-def test_default_app_pipelines_need_no_tesseract(tmp_path):
+def test_default_app_pipelines_need_no_ocr_runtime(tmp_path):
     pipe_a, pipe_b = app.get_pipelines(Settings(storage_base_dir=tmp_path / "store"))
     assert pipe_b.parser.get_metadata().engine_name == "PassThrough-NoOCR"
 

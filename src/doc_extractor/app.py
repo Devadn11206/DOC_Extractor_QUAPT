@@ -105,7 +105,7 @@ def get_pipelines(settings: Optional[Settings] = None) -> Tuple[ModuleAPipeline,
     """
     Builds (and caches per settings) Module A and Module B with the *same* Settings, so the configured
     storage path and OCR backend are used instead of silent defaults. The default backend is the explicit
-    no-OCR pass-through, so this needs no Tesseract; a configured OCR backend whose runtime is missing
+    no-OCR pass-through, so this needs no OCR runtime; a configured backend whose runtime is missing
     raises here with an actionable error (there is no fallback to another engine).
     """
     settings = settings if settings is not None else get_settings()

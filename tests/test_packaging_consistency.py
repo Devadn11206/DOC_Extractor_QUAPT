@@ -84,7 +84,7 @@ def test_extras_are_mirrored_by_their_requirements_files():
     extras = PYPROJECT["optional-dependencies"]
     for extra, filename in (
         ("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"),
-        ("ocr", "requirements-ocr.txt"), ("api", "requirements-api.txt"),
+        ("api", "requirements-api.txt"),
     ):
         declared = {_name(d): d.replace(" ", "") for d in extras[extra]}
         listed = {k: v for k, v in _requirements(filename).items() if k not in _requirements("requirements.txt")}
@@ -117,10 +117,13 @@ def test_multimodal_stack_is_core_per_prd_v15_section_12_1():
     assert "vlm" not in PYPROJECT["optional-dependencies"]
 
 
-def test_tesseract_is_optional_and_not_in_core_or_requirements_txt():
-    core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
-    assert "pytesseract" not in core
-    assert "pytesseract" in {_name(d) for d in PYPROJECT["optional-dependencies"]["ocr"]}
+def test_tesseract_is_gone_from_every_dependency_declaration():
+    everything = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
+    for extra in PYPROJECT["optional-dependencies"].values():
+        everything |= {_name(d) for d in extra}
+    assert "pytesseract" not in everything
+    assert "ocr" not in PYPROJECT["optional-dependencies"]
+    assert not (ROOT / "requirements-ocr.txt").exists()
 
 
 def test_bitsandbytes_is_skipped_on_macos_where_it_has_no_gpu_path():
@@ -173,7 +176,6 @@ def test_requirements_api_installs_core_first_and_lists_only_the_api_extra():
 def test_the_api_extra_leaves_the_existing_groups_unchanged():
     extras = PYPROJECT["optional-dependencies"]
     assert {_name(d) for d in extras["ui"]} == {"gradio"}
-    assert {_name(d) for d in extras["ocr"]} == {"pytesseract"}
     assert {_name(d) for d in extras["dev"]} == {"pytest", "pytest-cov", "httpx"}
 
 

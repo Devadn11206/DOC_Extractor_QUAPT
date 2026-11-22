@@ -105,12 +105,10 @@ jobs:
       - name: Full test suite
         run: python -m pytest -p no:cacheprovider --junitxml=junit-full.xml
 
-      - name: Only optional OCR and live-model tests may have skipped
+      - name: Only live-model tests may have skipped
         if: always()
         run: >
           python scripts/ci/assert_junit.py junit-full.xml --min-tests 1400
-          --allow-skip test_ocr_backend_selection
-          --allow-skip test_tesseract_integration
           --allow-skip test_live_qwen_smoke_against_local_ollama
 
       - name: Upload the junit report
