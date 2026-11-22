@@ -26,11 +26,6 @@ from doc_extractor.parsing.base import (
     RawOCRToken,
 )
 from doc_extractor.parsing.markdown import generate_page_markdown, sort_blocks_reading_order
-from doc_extractor.parsing.tesseract import (
-    TesseractExtractor,
-    check_tesseract_available,
-    tesseract_raw_extractor,
-)
 
 
 class LocalOCRParserAdapter(ParserEngine):
@@ -69,38 +64,6 @@ class LocalOCRParserAdapter(ParserEngine):
 
     def is_operational(self) -> bool:
         return self._is_operational
-
-    @classmethod
-    def with_tesseract(
-        cls,
-        engine_name: str = "Tesseract-OCR",
-        engine_version: Optional[str] = None,
-        lang: str = "eng",
-        config: str = "",
-        default_confidence_when_missing: Optional[float] = None,
-        tesseract_cmd: Optional[str] = None,
-        verify: bool = True,
-    ) -> "LocalOCRParserAdapter":
-        """
-        Factory method to construct a LocalOCRParserAdapter injected with Tesseract OCR.
-
-        With ``verify=True`` (default) the Tesseract runtime is checked first and a
-        ParserEngineError with an actionable message is raised if the Python package,
-        executable or language pack is unavailable, so a non-working OCR engine is never
-        reported as operational. When ``engine_version`` is not given, the detected
-        Tesseract version is used. Pass ``verify=False`` only for tests that fully mock
-        pytesseract.
-        """
-        detected_version: Optional[str] = None
-        if verify:
-            detected_version = check_tesseract_available(lang=lang, tesseract_cmd=tesseract_cmd)
-        return cls(
-            engine_name=engine_name,
-            engine_version=engine_version or detected_version or "unverified",
-            raw_extractor=TesseractExtractor(lang=lang, config=config),
-            is_operational=True,
-            default_confidence_when_missing=default_confidence_when_missing,
-        )
 
     def parse_page(self, loaded_page: LoadedPageImage) -> PageLayoutOutput:
         """

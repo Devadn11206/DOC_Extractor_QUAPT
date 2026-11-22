@@ -63,11 +63,6 @@ api = [
 ui = [
     "gradio>=4.0.0",
 ]
-# Optional OCR backends for Module B (ocr_backend='tesseract' | 'pdfium_hybrid'). Also needs the Tesseract
-# binary (macOS: brew install tesseract | Debian/Ubuntu/Kaggle: apt-get install tesseract-ocr).
-ocr = [
-    "pytesseract>=0.3.10",
-]
 
 [tool.setuptools.packages.find]
 where = ["src"]

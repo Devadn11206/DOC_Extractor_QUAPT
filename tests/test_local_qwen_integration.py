@@ -109,7 +109,7 @@ def mock_module_b_doc01_payload() -> ModuleBOutputPayload:
         ),
         pages=[page],
         combined_markdown=page.markdown_content,
-        parser_model_name="tesseract-5.5.3",
+        parser_model_name="pdfium-text",
         classifier_model_name="heuristic-classifier",
         processing_time_ms=120.0,
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -150,7 +150,7 @@ def mock_module_b_doc02_payload() -> ModuleBOutputPayload:
         ),
         pages=[page],
         combined_markdown=page.markdown_content,
-        parser_model_name="tesseract-5.5.3",
+        parser_model_name="pdfium-text",
         classifier_model_name="heuristic-classifier",
         processing_time_ms=110.0,
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -191,7 +191,7 @@ def mock_module_b_doc03_payload() -> ModuleBOutputPayload:
         ),
         pages=[page],
         combined_markdown=page.markdown_content,
-        parser_model_name="tesseract-5.5.3",
+        parser_model_name="pdfium-text",
         classifier_model_name="heuristic-classifier",
         processing_time_ms=130.0,
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -676,7 +676,7 @@ class TestModuleCPipelineLocalLLMIntegration:
             envelope = pipeline.process(mock_module_b_doc01_payload)
 
         assert envelope.run.model_versions["extractor"] == "ollama/qwen2.5:7b-instruct"
-        assert envelope.run.model_versions["parser"] == "tesseract-5.5.3"
+        assert envelope.run.model_versions["parser"] == "pdfium-text"
         assert envelope.run.provenance is not None
         assert envelope.run.provenance.mode == ExecutionMode.GENUINE_LLM
         assert envelope.run.provenance.provider == "ollama"

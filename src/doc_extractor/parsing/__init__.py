@@ -10,12 +10,6 @@ from doc_extractor.parsing.base import (
 )
 from doc_extractor.parsing.adapter import LocalOCRParserAdapter
 from doc_extractor.parsing.passthrough import PassThroughParserEngine
-from doc_extractor.parsing.tesseract import (
-    TesseractExtractor,
-    check_tesseract_available,
-    normalize_tesseract_confidence,
-    tesseract_raw_extractor,
-)
 from doc_extractor.parsing.factory import (
     SUPPORTED_OCR_BACKENDS,
     NoParserEngine,
@@ -48,11 +42,7 @@ __all__ = [
     "ParserEngineMetadata",
     "RawOCRToken",
     "LocalOCRParserAdapter",
-    "PassThroughParserEngine",
-    "tesseract_raw_extractor",
-    "TesseractExtractor",
-    "check_tesseract_available",
-    "normalize_tesseract_confidence",
+    "PassThroughParserEngine",
     "SUPPORTED_OCR_BACKENDS",
     "NoParserEngine",
     "build_parser_engine",

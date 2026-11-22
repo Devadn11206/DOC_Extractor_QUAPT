@@ -93,29 +93,15 @@ class Settings(BaseModel):
     )
 
     # Module B OCR / layout parser backend (FR-PRS-001, FR-PRS-005, ARC-002)
-    ocr_backend: Literal["passthrough", "tesseract", "pdfium_hybrid", "pdfium", "none"] = Field(
+    ocr_backend: Literal["passthrough", "pdfium", "none"] = Field(
         default="passthrough",
         description=(
             "Module B parser backend. 'passthrough' (default): explicit no-OCR mode - empty layouts, "
             "page images preserved for the vision model, UNKNOWN classification and review required; needs no "
-            "OCR runtime. 'tesseract': local Tesseract OCR on every page image (optional: pip install -e \".[ocr]\" "
-            "plus the Tesseract binary). "
-            "'pdfium_hybrid': native PDF text per page with Tesseract OCR fallback. "
+            "OCR runtime. "
             "'pdfium': native PDF text only (no OCR; fails on scanned pages and images). "
             "'none': explicit no-parser mode; the parser reports non-operational and Module B fails closed."
         ),
-    )
-    ocr_tesseract_lang: str = Field(
-        default="eng",
-        description="Tesseract language string, '+' joins packs (e.g. 'eng+hin'); packs must be installed",
-    )
-    ocr_tesseract_config: str = Field(
-        default="",
-        description="Extra Tesseract CLI configuration (e.g. '--psm 6')",
-    )
-    ocr_tesseract_cmd: Optional[str] = Field(
-        default=None,
-        description="Explicit Tesseract executable path/name; None uses 'tesseract' from PATH",
     )
 
     # Local LLM Extraction Configuration (Module C / PRD ARC-004, ARC-005)
@@ -154,17 +140,6 @@ class Settings(BaseModel):
             raise ValueError(
                 "External egress (allow_external_egress=True) violates ARC-001/SEC-011. "
                 "The engine operates strictly inside the customer VPC/on-prem boundary."
-            )
-        return v
-
-    @field_validator("ocr_tesseract_lang")
-    @classmethod
-    def validate_tesseract_lang(cls, v: str) -> str:
-        """Reject malformed language strings (must look like 'eng' or 'eng+hin')."""
-        if not re.fullmatch(r"[A-Za-z0-9_]+(\+[A-Za-z0-9_]+)*", v or ""):
-            raise ValueError(
-                f"Invalid ocr_tesseract_lang '{v}'. Use Tesseract language codes such as "
-                "'eng' or 'eng+hin'."
             )
         return v
 

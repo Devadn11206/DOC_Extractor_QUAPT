@@ -2,7 +2,7 @@
 Explicit pass-through Module B parser: no OCR, page images preserved (PRD v1.5 Module B scope).
 
 PRD v1.5 describes Module B as "document classification, schema binding, and passing image paths":
-the vision model reads the page image itself, so a Tesseract-style OCR step is not required to
+the vision model reads the page image itself, so an OCR step is not required to
 run the pipeline. ``PassThroughParserEngine`` is that mode, made explicit:
 
 - every page is parsed into an EMPTY layout (no blocks, no tables, no checkboxes),
@@ -13,8 +13,8 @@ run the pipeline. ``PassThroughParserEngine`` is that mode, made explicit:
 
 It is NOT a fallback: it only runs when it is the configured backend (the default), it never
 substitutes for a failing OCR engine, and its metadata says plainly that it performs no OCR.
-Configure ``ocr_backend='tesseract'`` / ``'pdfium_hybrid'`` (extra: ``pip install -e ".[ocr]"``) to
-get OCR-grounded evidence and rule-based classification.
+Configure ``ocr_backend='pdfium'`` to read the native text layer of digital PDFs for grounded evidence and
+rule-based classification.
 """
 
 from typing import List

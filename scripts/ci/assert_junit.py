@@ -3,7 +3,7 @@
 Assert properties of a pytest junit report, so a mandatory CI job cannot pass by running nothing or skipping.
 
   assert_junit.py REPORT.xml --max-skipped 0 --min-tests 300
-  assert_junit.py REPORT.xml --allow-skip test_ocr_backend_selection --allow-skip test_tesseract_integration
+  assert_junit.py REPORT.xml
 
 Always fails on any failure or error. ``--max-skipped N`` bounds the skips; each ``--allow-skip SUBSTRING`` names an
 optional component whose tests may skip (anything else skipped fails).
