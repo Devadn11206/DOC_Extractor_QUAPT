@@ -422,15 +422,16 @@ def test_settings_bridge_valid_mapping():
         log_level="WARNING",
         storage_base_dir="/var/data/staging",
         malware_scan_enabled=True,
-        malware_scanner_type="mock",
+        malware_scanner_type="clamav_socket",
+        malware_clamav_address="clamd.internal:3310",
     )
 
     engine_settings = bridge_to_engine_settings(api_settings)
+    assert engine_settings.malware_scanner_type == "clamav_socket"
     assert engine_settings.app_env == "staging"
     assert engine_settings.log_level == "WARNING"
     assert engine_settings.storage_base_dir == Path("/var/data/staging")
     assert engine_settings.malware_scan_enabled is True
-    assert engine_settings.malware_scanner_type == "mock"
     assert engine_settings.allow_external_egress is False
 
     # Reverse bridge

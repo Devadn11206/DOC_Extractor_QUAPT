@@ -18,6 +18,7 @@ from doc_extractor.api.exceptions import (
     AuthenticationRequiredError,
     ContainerUnavailableError,
     ForbiddenError,
+    RateLimitExceededError,
     PortNotConfiguredError,
 )
 from doc_extractor.api.ports.audit import AuditLogger
@@ -65,8 +66,22 @@ def get_auth_provider(request: Request) -> AuthenticationProvider:
     if provider is not None:
         return provider
 
+    settings = getattr(request.app.state, "settings", None)
+    jwt_provider = None
+    if settings is not None and getattr(settings, "jwt_public_key_path", None):
+        # RS256 user and service tokens (SEC-001, SEC-002). An incomplete JWT configuration is refused, not ignored.
+        if not (settings.jwt_issuer and settings.jwt_audience):
+            raise PortNotConfiguredError("AuthenticationProvider")
+        from doc_extractor.api.providers.jwt_auth import JwtAuthenticationProvider
+
+        with open(settings.jwt_public_key_path, "rb") as key_file:
+            jwt_provider = JwtAuthenticationProvider(
+                key_file.read(), issuer=settings.jwt_issuer, audience=settings.jwt_audience
+            )
+
     # If api_key_repo is configured, auto-construct ApiKeyAuthenticationProvider (TASK-5.7-B). The audit logger must be
     # configured explicitly: nothing is substituted for a missing logger.
+    api_key_provider = None
     api_key_repo = getattr(request.app.state, "api_key_repo", None)
     if api_key_repo is not None:
         audit_logger = getattr(request.app.state, "audit_logger", None)
@@ -74,12 +89,20 @@ def get_auth_provider(request: Request) -> AuthenticationProvider:
             raise PortNotConfiguredError("AuditLogger")
         from doc_extractor.api.providers.api_key_auth import ApiKeyAuthenticationProvider
 
-        provider = ApiKeyAuthenticationProvider(repository=api_key_repo, audit_logger=audit_logger)
-        request.app.state.auth_provider = provider
-        return provider
+        api_key_provider = ApiKeyAuthenticationProvider(repository=api_key_repo, audit_logger=audit_logger)
 
-    # Fail closed: no provider configured and no repository to construct one. Typed 503, not a bare 500.
-    raise PortNotConfiguredError("AuthenticationProvider")
+    if jwt_provider is None and api_key_provider is None:
+        # Fail closed: no provider configured and nothing to construct one from. Typed 503, not a bare 500.
+        raise PortNotConfiguredError("AuthenticationProvider")
+
+    from doc_extractor.api.providers.composite_auth import CompositeAuthenticationProvider
+
+    if jwt_provider is not None and api_key_provider is not None:
+        provider = CompositeAuthenticationProvider(jwt_provider=jwt_provider, api_key_provider=api_key_provider)
+    else:
+        provider = jwt_provider or api_key_provider
+    request.app.state.auth_provider = provider
+    return provider
 
 
 async def get_current_principal(
@@ -105,6 +128,20 @@ async def get_current_principal(
             message="Invalid or revoked authentication credentials.",
             code="INVALID_CREDENTIALS",
         )
+
+    # API-012 / SEC-017: one shared token bucket per principal, across every replica. Applied after authentication so
+    # an anonymous caller cannot exhaust a bucket.
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if limiter is not None:
+        decision = limiter.take(principal.principal_id)
+        if not decision.allowed:
+            from doc_extractor.metrics import RATE_LIMITED
+
+            RATE_LIMITED.inc()
+            raise RateLimitExceededError(
+                message="Too many requests. Try again shortly.",
+                retry_after_seconds=decision.retry_after_seconds,
+            )
     return principal
 
 

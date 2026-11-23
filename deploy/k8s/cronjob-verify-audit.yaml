@@ -1,0 +1,48 @@
+# Scheduled audit-chain verification (PRD SEC-008, SEC-021).
+#
+# Runs scripts/ops/verify_audit_chains.py every 15 minutes. A broken chain makes the job fail (exit status 1), and the
+# failed job is what alerts: wire your alerting to "kube_job_status_failed" for this CronJob, or to the Job's failure
+# condition. The job log names the tenant and the defect reason only, never event content.
+#
+# Replace the image, and mount the same audit storage volume the API writes to (read-only is enough).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: doc-extractor-verify-audit
+  labels:
+    app.kubernetes.io/part-of: doc-extractor
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: doc-extractor
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+          containers:
+            - name: verify-audit
+              image: your-registry/doc-extractor:TAG   # replace with the release image
+              command:
+                - python
+                - scripts/ops/verify_audit_chains.py
+                - --audit-store
+                - /var/lib/doc-extractor/storage
+              volumeMounts:
+                - name: storage
+                  mountPath: /var/lib/doc-extractor/storage
+                  readOnly: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+          volumes:
+            - name: storage
+              persistentVolumeClaim:
+                claimName: doc-extractor-storage   # the PVC the API uses
