@@ -34,6 +34,8 @@ from doc_extractor.api.services.review_task_service import ReviewTaskService
 from doc_extractor.config import Settings
 from doc_extractor.exceptions import InvalidTenantIdentifierError
 from doc_extractor.extractor import SchemaGuidedExtractor
+from doc_extractor.api.audit_chain import DurableAuditLogger, HashChainedAuditRepository
+from doc_extractor.distributed_state import RedisIdempotencyStore, RedisLockProvider, connect_redis, tenant_lock_factory
 from doc_extractor.idempotency import LocalIdempotencyStore
 from doc_extractor.malware import MalwareScanner, build_malware_scanner
 from doc_extractor.pipeline import ModuleAPipeline
@@ -212,6 +214,9 @@ class ApplicationContainer:
         queue_producer: Optional[QueueProducer] = None,
         queue_consumer: Optional[QueueConsumer] = None,
         audit_logger: Optional[AuditLogger] = None,
+        schema_manager: Optional[Any] = None,
+        schema_approval_service: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
     ) -> None:
         self.api_settings = api_settings or load_api_settings()
         self.engine_settings = engine_settings or bridge_to_engine_settings(self.api_settings)
@@ -224,6 +229,8 @@ class ApplicationContainer:
                 scanner_type=self.engine_settings.malware_scanner_type,
                 enabled=self.engine_settings.malware_scan_enabled,
                 app_env=self.engine_settings.app_env,
+                clamav_address=self.engine_settings.malware_clamav_address,
+                clamav_timeout_seconds=self.engine_settings.malware_scan_timeout_seconds,
             )
 
         # 2. Application-scoped thread-safe RoutedExtractor (loaded once per process)
@@ -238,9 +245,12 @@ class ApplicationContainer:
         else:
             self.module_c = ModuleCPipeline(extractor=SchemaGuidedExtractor(use_llm=False))
 
-        # 4. Application-scoped LocalIdempotencyStore (shared across tenants, handles per-(tenant, key) isolation)
+        # 4. Application-scoped idempotency store. With redis_url set it is shared by every replica (ARC-003, NFR-006);
+        #    otherwise it is the single-process LocalIdempotencyStore (shared across tenants, per-(tenant, key) isolation).
         if idempotency_store is not None:
             self.idempotency_store = idempotency_store
+        elif self.engine_settings.redis_url:
+            self.idempotency_store = RedisIdempotencyStore(connect_redis(self.engine_settings.redis_url))
         else:
             self.idempotency_store = LocalIdempotencyStore(self.engine_settings.storage_base_dir)
 
@@ -255,10 +265,32 @@ class ApplicationContainer:
         self.api_key_repo = api_key_repo
         self.webhook_subscription_repo = webhook_subscription_repo
         self.webhook_delivery_repo = webhook_delivery_repo
+        # Durable, hash-chained audit trail (SEC-008). Configured by audit_store_dir; a write failure fails the operation.
+        if audit_repo is None and audit_logger is None and self.api_settings.audit_store_dir:
+            lock_factory = None
+            if self.engine_settings.redis_url:
+                lock_factory = tenant_lock_factory(RedisLockProvider(connect_redis(self.engine_settings.redis_url)))
+            audit_repo = HashChainedAuditRepository(self.api_settings.audit_store_dir, lock_factory=lock_factory)
+        if audit_logger is None and audit_repo is not None and isinstance(audit_repo, HashChainedAuditRepository):
+            audit_logger = DurableAuditLogger(audit_repo)
         self.audit_repo = audit_repo
         self.queue_producer = queue_producer
         self.queue_consumer = queue_consumer
         self.audit_logger = audit_logger
+        # Schema lifecycle (SCH-001..006). Deployment supplies a manager over a durable SchemaRepository. Nothing is
+        # defaulted here: the in-memory repository must never back production schemas.
+        self.schema_manager = schema_manager
+        self.schema_approval_service = schema_approval_service
+        # API-012: a shared token bucket across replicas. Built only when a capacity and a Redis URL are both configured.
+        self.rate_limiter = rate_limiter
+        if self.rate_limiter is None and self.api_settings.rate_limit_capacity and self.engine_settings.redis_url:
+            from doc_extractor.rate_limit import RedisTokenBucket
+
+            self.rate_limiter = RedisTokenBucket(
+                connect_redis(self.engine_settings.redis_url),
+                capacity=self.api_settings.rate_limit_capacity,
+                refill_per_second=self.api_settings.rate_limit_refill_per_second,
+            )
 
         self._is_shutdown = False
 

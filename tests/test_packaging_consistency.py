@@ -30,6 +30,7 @@ DIST_OF_MODULE = {
     "PIL": "pillow",
     "cv2": "opencv-python-headless",
     "yaml": "pyyaml",
+    "jwt": "pyjwt",  # PyJWT is imported as 'jwt' (security extra)
 }
 # Imported lazily by optional/legacy code paths; deliberately NOT declared (see README):
 #   torch              installed separately per platform (CUDA/CPU/MPS), needed only for local Qwen-VL

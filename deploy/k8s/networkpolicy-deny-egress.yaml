@@ -1,0 +1,57 @@
+# Default-deny outbound traffic for the document-extractor workloads (PRD SEC-011, ARC-001).
+#
+# Apply in the workload namespace. Every pod matched by the selector may then reach only the destinations listed below.
+# Keep the allow-list identical to DOC_EGRESS_ALLOWED_DESTINATIONS, so the network layer and the application agree.
+#
+# Replace the placeholder labels (app: redis, app: clamd, app: vllm) with your deployment's labels, and replace the
+# namespace of the internal services where it differs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: doc-extractor-deny-egress
+  labels:
+    app.kubernetes.io/part-of: doc-extractor
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: doc-extractor
+  policyTypes:
+    - Egress
+  egress:
+    # DNS, needed to resolve the internal service names below.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Redis: distributed locks and idempotency (ARC-003).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # clamd: malware scanning (FR-ING-003). Internal only.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: clamd
+      ports:
+        - protocol: TCP
+          port: 3310
+    # Local model server (vLLM / OpenAI-compatible endpoint), if it runs inside the cluster (ARC-004).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: vllm
+      ports:
+        - protocol: TCP
+          port: 8000
+    # Deliberately no other egress rule: no public cloud LLM endpoint, no package index, no telemetry collector
+    # outside the cluster. Add a named destination here only through the change process.

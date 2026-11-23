@@ -75,14 +75,13 @@ async def test_an_invalid_event_still_raises_even_from_the_best_effort_sink():
 
 # -- what that means for a mandatory operation ----------------------------------------------------------------
 
-@async_test
-async def test_with_the_best_effort_sink_a_lost_audit_write_is_not_detected_so_key_creation_is_not_fail_closed(admin, monkeypatch):
-    breaking_serialization(monkeypatch)
-    repo = MockApiKeyRepository()
-    service = ApiKeyService(repository=repo, audit_logger=SafeStructuredAuditLogger())
-    created = await service.create_api_key(creator=admin, name="k", scopes=["documents:read"], roles=["integrator"])
-    assert created.raw_secret                                                   # the key was issued although the audit write was lost
-    assert [k.is_active for k in await repo.list_keys("tenant_alpha")] == [True]
+def test_a_best_effort_sink_is_refused_so_key_creation_cannot_run_unaudited(admin, monkeypatch):
+    """SEC-008: a lost audit write must not leave a key issued with no audit record. The service refuses the sink."""
+    from doc_extractor.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError) as refused:
+        ApiKeyService(repository=MockApiKeyRepository(), audit_logger=SafeStructuredAuditLogger())
+    assert "best-effort" in refused.value.message
 
 
 @async_test
@@ -95,10 +94,12 @@ async def test_with_a_logger_that_raises_key_creation_is_rolled_back_and_the_fai
     assert [k.is_active for k in await repo.list_keys("tenant_alpha")] == [False]
 
 
-def test_the_service_warns_when_built_with_a_best_effort_sink(caplog):
-    with caplog.at_level(logging.WARNING, logger="doc_extractor.api.services.api_key_service"):
+def test_the_service_refuses_a_best_effort_sink_and_says_why():
+    from doc_extractor.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError) as refused:
         ApiKeyService(repository=MockApiKeyRepository(), audit_logger=SafeStructuredAuditLogger())
-    assert "best-effort audit sink" in caplog.text and "SafeStructuredAuditLogger" in caplog.text and "not fail-closed" in caplog.text
+    assert "SafeStructuredAuditLogger" in refused.value.message and "fail closed" in refused.value.message
 
 
 @pytest.mark.parametrize("logger_factory", [RaisingLogger, MockAuditLogger])

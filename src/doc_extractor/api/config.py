@@ -75,6 +75,29 @@ def settings_from_environment(environ: Optional[Mapping[str, str]] = None) -> Di
 class ApiSettings(Settings):
     """Configuration settings for the REST API application."""
 
+    rate_limit_capacity: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Burst size per principal (API-012). Unset disables rate limiting. Needs redis_url to share the limit.",
+    )
+    rate_limit_refill_per_second: float = Field(
+        default=10.0,
+        gt=0,
+        description="Sustained requests per second per principal (API-012).",
+    )
+    audit_store_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Directory of the durable, hash-chained audit trail (SEC-008). When set, mandatory audit writes are "
+            "fsynced and a failed write fails the operation. Unset: no audit logger is configured."
+        ),
+    )
+    jwt_public_key_path: Optional[str] = Field(
+        default=None,
+        description="PEM file with the RSA public key that verifies RS256 access tokens (SEC-002). Unset: JWT disabled.",
+    )
+    jwt_issuer: Optional[str] = Field(default=None, description="Expected JWT 'iss' claim (required with jwt_public_key_path)")
+    jwt_audience: Optional[str] = Field(default=None, description="Expected JWT 'aud' claim (required with jwt_public_key_path)")
     service_name: str = Field(
         default="doc-extractor-api",
         description="Name of the REST API service",

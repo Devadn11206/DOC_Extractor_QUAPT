@@ -25,6 +25,7 @@ from doc_extractor.api.middleware import RequestIdMiddleware, UploadSizeLimitMid
 from doc_extractor.api.routers.documents import router as documents_router
 from doc_extractor.api.routers.health import router as health_router
 from doc_extractor.api.routers.review_tasks import router as review_tasks_router
+from doc_extractor.api.routers.schemas import router as schemas_router
 from doc_extractor.logging import setup_logging
 
 logger = logging.getLogger("doc_extractor.api")
@@ -177,6 +178,11 @@ def create_app(
     # Register canonical API-010 exception handlers
     register_exception_handlers(app)
 
+    # NFR-010: request counts and durations by route template (outermost: every response, including errors, is timed).
+    from doc_extractor.api.metrics_middleware import RequestMetricsMiddleware
+
+    app.add_middleware(RequestMetricsMiddleware)
+
     # Register routers: root /health and versioned /v1/health
     app.include_router(health_router, prefix="", tags=["Health & Status"])
     if resolved_settings.api_prefix:
@@ -191,6 +197,11 @@ def create_app(
     # Register the review-task router (API-005 list, API-016 claim and release; PROVISIONAL, M5-D11 is Open). Without an injected
     # ReviewTaskRepository (no production adapter exists yet) every route answers 503 after authentication and the scope check.
     app.include_router(review_tasks_router, prefix=resolved_settings.api_prefix or "", tags=["Review Tasks"])
+    # Schema lifecycle (SCH-001..006): answers 503 until a schema manager is configured on the container.
+    app.include_router(schemas_router, prefix=resolved_settings.api_prefix or "", tags=["Schemas"])
+    app.state.schema_manager = resolved_container.schema_manager
+    app.state.schema_approval_service = resolved_container.schema_approval_service
+    app.state.rate_limiter = resolved_container.rate_limiter
 
     # The API-key management router (API-019) is intentionally not mounted: it is held back until
     # decision M5-D08 is approved. Webhook routers are a later stage.

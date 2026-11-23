@@ -59,6 +59,14 @@ api = [
     "uvicorn>=0.22.0,<1.0.0",
     "python-multipart>=0.0.9",
 ]
+# Security and state backends (SEC-002 RS256 tokens, ARC-003 Redis locks). Needed by the API in production and by
+# its security tests. Kept apart from 'api' so the API stack stays exactly the documented set.
+security = [
+    "PyJWT[crypto]>=2.8.0",   # RS256 access-token verification, doc_extractor.api.providers.jwt_auth
+    "cryptography>=42.0.0",   # RSA key parsing for the JWT provider (imported directly)
+    "redis>=5.0.0",           # distributed locks and idempotency, doc_extractor.distributed_state
+    "fakeredis>=2.20.0",      # in-process Redis for the distributed-state tests (test-only)
+]
 # Interactive demo UI (doc_extractor.app). Not needed by the engine.
 ui = [
     "gradio>=4.0.0",

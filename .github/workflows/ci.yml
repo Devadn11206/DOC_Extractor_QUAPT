@@ -52,6 +52,9 @@ jobs:
       - name: Install the project with the real extras
         run: python -m pip install -e ".[dev,api]"
 
+      - name: Install the security extra (RS256 tokens, Redis locks, their tests)
+        run: python -m pip install -e ".[security]"
+
       - name: Mandatory API dependency and import check
         run: python scripts/ci/check_api_extra.py
 
@@ -74,6 +77,36 @@ jobs:
         with:
           name: junit-api-py${{ matrix.python-version }}
           path: junit-api.xml
+
+  # Supply-chain gate (PRD SEC-014, SEC-015). Blocks on HIGH-severity SAST findings and on any known vulnerability in the
+  # declared dependencies. Medium findings are reported in the log, not blocking, until they are triaged.
+  supply-chain:
+    name: SAST and dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bandit SAST (fail on high-severity findings)
+        run: |
+          python -m pip install --upgrade pip bandit
+          python -m bandit -q -r src scripts/ops -lll
+
+      - name: Bandit SAST report (medium and above, not blocking)
+        run: python -m bandit -q -r src scripts/ops -ll || true
+
+      - name: pip-audit (fail on known vulnerabilities in the declared dependencies)
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          python -m pip_audit --progress-spinner off -r requirements.txt -r requirements-api.txt -r requirements-security.txt
 
   full-suite:
     name: Full suite (Python ${{ matrix.python-version }})
@@ -101,6 +134,9 @@ jobs:
 
       - name: Install the project with the real extras
         run: python -m pip install -e ".[dev,api]"
+
+      - name: Install the security extra (RS256 tokens, Redis locks, their tests)
+        run: python -m pip install -e ".[security]"
 
       - name: Full test suite
         run: python -m pytest -p no:cacheprovider --junitxml=junit-full.xml
