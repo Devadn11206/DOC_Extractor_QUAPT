@@ -12,7 +12,7 @@ Adheres to:
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -29,6 +29,42 @@ from doc_extractor.api.routers.schemas import router as schemas_router
 from doc_extractor.logging import setup_logging
 
 logger = logging.getLogger("doc_extractor.api")
+
+
+STARTUP_CONFIGURED_PORTS = (
+    "review_task_repo",
+    "api_key_repo",
+    "audit_repo",
+    "audit_logger",
+    "queue_producer",
+    "queue_consumer",
+    "webhook_subscription_repo",
+    "webhook_delivery_repo",
+)
+_PUBLISHED_ATTRIBUTE = "_startup_published_ports"
+
+
+def publish_started_ports(state: Any, container: Any) -> None:
+    """
+    Publish the ports that ``container.startup()`` configured (the MongoDB repositories and the durable audit logger) to the application state, which is
+    where the request dependencies read them: ``create_app`` copied the container's ports onto the state BEFORE start-up ran.
+
+    Called only after a SUCCESSFUL start-up, so a failed start-up publishes nothing. A port is replaced only when its slot is
+    empty or still holds what an earlier start-up published here (an app-owned container is rebuilt on a second lifespan, and
+    the previous adapter is bound to a connection that was closed); a port that was set on the state explicitly is never replaced.
+    """
+    published = getattr(state, _PUBLISHED_ATTRIBUTE, None)
+    if not isinstance(published, dict):
+        published = {}
+    for slot in STARTUP_CONFIGURED_PORTS:
+        adapter = getattr(container, slot, None)
+        current = getattr(state, slot, None)
+        if adapter is not None and (current is None or current is published.get(slot)):
+            setattr(state, slot, adapter)
+            published[slot] = adapter
+    if getattr(container, "_idempotency_replaced_at_startup", False):
+        state.idempotency_store = container.idempotency_store        # informational slot: it must not keep naming the replaced store
+    setattr(state, _PUBLISHED_ATTRIBUTE, published)
 
 
 @asynccontextmanager
@@ -72,6 +108,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         if settings.allow_external_egress:
             raise RuntimeError("FATAL: External egress is enabled. System must run in isolated VPC/on-prem.")
 
+        # MongoDB (when configured): connect, verify the replica set and apply the declared indexes. A failure stops the
+        # application here with a typed error whose message holds no connection detail (no fallback to another store).
+        await container.startup()
+        publish_started_ports(app.state, container)
+
         yield
     finally:
         logger.info("Shutting down Document Extraction Engine API. Releasing resources.")
@@ -79,6 +120,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         if getattr(app.state, "owns_container", False):
             active_container = getattr(app.state, "container", None)
             if active_container is not None and not getattr(active_container, "_is_shutdown", False):
+                try:
+                    await active_container.ashutdown()
+                except Exception as exc:
+                    logger.error("Error while closing the database connection (%s)", type(exc).__name__)
                 try:
                     active_container.shutdown()
                 except Exception as exc:

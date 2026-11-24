@@ -194,3 +194,21 @@ def test_a_successful_authentication_raises_no_alert(capture):
     router = CompositeAuthenticationProvider(jwt_provider=_AcceptingProvider())
     asyncio.run(router.authenticate("Bearer aaa.bbb.ccc"))
     assert capture.alerts == []
+
+
+def test_queue_worker_failure_alert(capture):
+    monitor = AlertMonitor(capture)
+    alert = monitor.record_queue_worker_failure("job_999", "lease_expired")
+    assert alert is not None
+    assert alert.condition == AlertCondition.QUEUE_WORKER_FAILURE
+    assert alert.subject == "job_999"
+    assert alert.details["reason"] == "lease_expired"
+
+
+def test_audit_checkpoint_failure_alert(capture):
+    monitor = AlertMonitor(capture)
+    alert = monitor.record_checkpoint_failure("tenant_audit_fail", "sink_unavailable")
+    assert alert is not None
+    assert alert.condition == AlertCondition.AUDIT_CHECKPOINT_FAILURE
+    assert alert.subject == "tenant_audit_fail"
+    assert alert.details["reason"] == "sink_unavailable"

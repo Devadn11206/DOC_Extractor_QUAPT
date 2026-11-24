@@ -8,8 +8,9 @@ Adheres to:
 
 import os
 from functools import lru_cache
-from typing import Any, Dict, List, Mapping, Optional
-from pydantic import Field, field_validator, model_validator
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Mapping, Optional
+from pydantic import ConfigDict, Field, SecretStr, field_validator, model_validator
 from doc_extractor.config import Settings
 from doc_extractor.exceptions import ConfigurationError
 
@@ -32,6 +33,60 @@ ENV_VARIABLES: Dict[str, str] = {
     "DOC_API_UPLOAD_BODY_TOTAL_TIMEOUT_SECONDS": "upload_body_total_timeout_seconds",
     "DOC_API_MAX_CONCURRENT_EXTRACTIONS": "max_concurrent_extractions",
     "DOC_API_EXTRACT_SYNC_TIMEOUT_SECONDS": "extract_sync_timeout_seconds",
+    # MongoDB (Team Member 3, Phase 2A). The connection string is a secret: prefer the _FILE form (a mounted secret).
+    "DOC_API_MONGO_URI": "mongo_uri",
+    "DOC_API_MONGO_URI_FILE": "mongo_uri_file",
+    "DOC_API_MONGO_DATABASE": "mongo_database",
+    "DOC_API_MONGO_REPLICA_SET": "mongo_replica_set",
+    "DOC_API_MONGO_SERVER_SELECTION_TIMEOUT_MS": "mongo_server_selection_timeout_ms",
+    "DOC_API_MONGO_CONNECT_TIMEOUT_MS": "mongo_connect_timeout_ms",
+    "DOC_API_MONGO_SOCKET_TIMEOUT_MS": "mongo_socket_timeout_ms",
+    "DOC_API_MONGO_MAX_POOL_SIZE": "mongo_max_pool_size",
+    "DOC_API_MONGO_MIN_POOL_SIZE": "mongo_min_pool_size",
+    "DOC_API_MONGO_ENSURE_INDEXES": "mongo_ensure_indexes_on_startup",
+    # Durable message broker (Team Member 3, Phase 3). The URL is a secret: prefer the _FILE form (a mounted secret).
+    "DOC_API_BROKER_URL": "broker_url",
+    "DOC_API_BROKER_URL_FILE": "broker_url_file",
+    "DOC_API_BROKER_QUEUE_PREFIX": "broker_queue_prefix",
+    "DOC_API_BROKER_MAX_IN_FLIGHT": "broker_max_in_flight",
+    "DOC_API_BROKER_CONNECT_TIMEOUT_SECONDS": "broker_connect_timeout_seconds",
+    "DOC_API_BROKER_PUBLISH_TIMEOUT_SECONDS": "broker_publish_timeout_seconds",
+    # S3 Object Storage (Team Member 3, Phase 4A).
+    "DOC_API_STORAGE_BACKEND": "storage_backend",
+    "DOC_API_S3_BUCKET": "s3_bucket",
+    "DOC_API_S3_ENDPOINT_URL": "s3_endpoint_url",
+    "DOC_API_S3_REGION": "s3_region",
+    "DOC_API_S3_ACCESS_KEY_ID": "s3_access_key_id",
+    "DOC_API_S3_ACCESS_KEY_ID_FILE": "s3_access_key_id_file",
+    "DOC_API_S3_SECRET_ACCESS_KEY": "s3_secret_access_key",
+    "DOC_API_S3_SECRET_ACCESS_KEY_FILE": "s3_secret_access_key_file",
+    "DOC_API_S3_SESSION_TOKEN": "s3_session_token",
+    "DOC_API_S3_FORCE_PATH_STYLE": "s3_force_path_style",
+    "DOC_API_S3_PREFIX": "s3_prefix",
+    "DOC_API_S3_CONNECT_TIMEOUT_SECONDS": "s3_connect_timeout_seconds",
+    "DOC_API_S3_READ_TIMEOUT_SECONDS": "s3_read_timeout_seconds",
+    "DOC_API_S3_VERIFY_SSL": "s3_verify_ssl",
+    "DOC_API_S3_CA_BUNDLE": "s3_ca_bundle",
+    "DOC_API_S3_SPOOL_DIR": "s3_spool_dir",
+    "DOC_API_STORAGE_ENCRYPTION_ENABLED": "storage_encryption_enabled",
+    "DOC_API_KMS_PROVIDER_TYPE": "kms_provider_type",
+    "DOC_API_KMS_KEK_ID": "kms_kek_id",
+    "DOC_API_KMS_KEY_VERSION": "kms_key_version",
+    "DOC_API_KMS_ENDPOINT_URL": "kms_endpoint_url",
+    "DOC_API_SPOOL_IS_PROTECTED": "spool_is_protected",
+    # Audit Checkpoints (Team Member 3, Phase 4C - SEC-008).
+    "DOC_API_AUDIT_CHECKPOINT_ENABLED": "audit_checkpoint_enabled",
+    "DOC_API_AUDIT_CHECKPOINT_SINK_TYPE": "audit_checkpoint_sink_type",
+    "DOC_API_AUDIT_SIGNING_KEY_ID": "audit_signing_key_id",
+    "DOC_API_AUDIT_SIGNING_KEY_VERSION": "audit_signing_key_version",
+    "DOC_API_AUDIT_OBJECT_LOCK_RETENTION_DAYS": "audit_object_lock_retention_days",
+    "DOC_API_AUDIT_OBJECT_LOCK_MODE": "audit_object_lock_mode",
+    # JWT & Internal Identity (Team Member 3, Phase 5A - SEC-001, SEC-002, SEC-003).
+    "DOC_API_JWT_PUBLIC_KEY_PATH": "jwt_public_key_path",
+    "DOC_API_JWT_ISSUER": "jwt_issuer",
+    "DOC_API_JWT_AUDIENCE": "jwt_audience",
+    "DOC_API_IDENTITY_PROVIDER_ENABLED": "identity_provider_enabled",
+    "DOC_API_OIDC_SSO_ENABLED": "oidc_sso_enabled",
 }
 _LIST_FIELDS = frozenset({"cors_origins"})
 # Upper bounds of the upload body timeouts (seconds). A timeout that is infinite or absurdly long would let one silent
@@ -75,6 +130,10 @@ def settings_from_environment(environ: Optional[Mapping[str, str]] = None) -> Di
 class ApiSettings(Settings):
     """Configuration settings for the REST API application."""
 
+    # A validation error of ANY field must not echo the raw input: the input dict carries the MongoDB connection string
+    # (a secret) as supplied. Error messages keep the field names and the reasons, never the values.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     rate_limit_capacity: Optional[int] = Field(
         default=None,
         ge=1,
@@ -98,6 +157,173 @@ class ApiSettings(Settings):
     )
     jwt_issuer: Optional[str] = Field(default=None, description="Expected JWT 'iss' claim (required with jwt_public_key_path)")
     jwt_audience: Optional[str] = Field(default=None, description="Expected JWT 'aud' claim (required with jwt_public_key_path)")
+    # --- MongoDB persistence (Team Member 3, Phase 2A). Validated by doc_extractor.infrastructure.mongo.settings. ---
+    mongo_uri: Optional[SecretStr] = Field(
+        default=None,
+        description="MongoDB connection string (a secret). Mutually exclusive with mongo_uri_file. Unset together with it: no MongoDB.",
+    )
+    mongo_uri_file: Optional[str] = Field(
+        default=None,
+        description="File holding the MongoDB connection string (a mounted secret), read at start-up. Mutually exclusive with mongo_uri.",
+    )
+    mongo_database: Optional[str] = Field(
+        default=None,
+        description="MongoDB database name. Required whenever a connection string is set; there is no default.",
+    )
+    mongo_replica_set: Optional[str] = Field(
+        default=None,
+        description="Expected replica set name. Staging and production always require a replica set; this pins which one.",
+    )
+    mongo_server_selection_timeout_ms: int = Field(default=5000, ge=100, le=30000, description="Bounded server selection timeout.")
+    mongo_connect_timeout_ms: int = Field(default=5000, ge=100, le=30000, description="Bounded connection timeout.")
+    mongo_socket_timeout_ms: int = Field(default=30000, ge=1000, le=120000, description="Bounded socket timeout.")
+    mongo_max_pool_size: int = Field(default=50, ge=1, le=500, description="Maximum pooled connections.")
+    mongo_min_pool_size: int = Field(default=0, ge=0, le=500, description="Minimum pooled connections.")
+    mongo_ensure_indexes_on_startup: bool = Field(
+        default=True,
+        description="Create the declared indexes at start-up (idempotent; never drops an index).",
+    )
+    # --- Durable message broker (Team Member 3, Phase 3). Validated by doc_extractor.infrastructure.queue.settings. ---
+    broker_url: Optional[SecretStr] = Field(
+        default=None,
+        description="AMQP broker URL (a secret). Mutually exclusive with broker_url_file. Unset together with it: no broker (the queue ports stay unconfigured, 503). Needs MongoDB.",
+    )
+    broker_url_file: Optional[str] = Field(
+        default=None,
+        description="File holding the broker URL (a mounted secret), read at start-up. Mutually exclusive with broker_url.",
+    )
+    broker_queue_prefix: str = Field(default="doc_extractor", description="Prefix of the queue names: lowercase letters, digits, underscores, hyphens.")
+    broker_max_in_flight: int = Field(default=10, ge=1, le=100, description="Unacknowledged messages one consumer may hold.")
+    broker_connect_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0, allow_inf_nan=False, description="Bounded broker connection timeout.")
+    broker_publish_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0, allow_inf_nan=False, description="Bounded broker publish, get and acknowledge timeout.")
+    # S3 Object Storage (Team Member 3, Phase 4A).
+    storage_backend: Literal["local", "s3"] = Field(
+        default="local",
+        description="Storage backend: 'local' (filesystem) or 's3' (object storage).",
+    )
+    s3_bucket: Optional[str] = Field(
+        default=None,
+        description="S3 bucket name. Required when storage_backend is 's3'.",
+    )
+    s3_endpoint_url: Optional[str] = Field(
+        default=None,
+        description="Custom S3 endpoint URL (MinIO, Ceph, etc.).",
+    )
+    s3_region: str = Field(
+        default="us-east-1",
+        description="S3 region name.",
+    )
+    s3_access_key_id: Optional[SecretStr] = Field(
+        default=None,
+        description="S3 access key ID (a secret).",
+    )
+    s3_access_key_id_file: Optional[str] = Field(
+        default=None,
+        description="File containing S3 access key ID (mounted secret).",
+    )
+    s3_secret_access_key: Optional[SecretStr] = Field(
+        default=None,
+        description="S3 secret access key (a secret).",
+    )
+    s3_secret_access_key_file: Optional[str] = Field(
+        default=None,
+        description="File containing S3 secret access key (mounted secret).",
+    )
+    s3_session_token: Optional[SecretStr] = Field(
+        default=None,
+        description="Optional S3 session token (STS / temporary credentials).",
+    )
+    s3_force_path_style: Optional[bool] = Field(
+        default=None,
+        description="Force path-style addressing. Defaults to True for custom endpoints, False for AWS.",
+    )
+    s3_prefix: str = Field(
+        default="",
+        description="Optional object key prefix prepended to all tenant object keys.",
+    )
+    s3_connect_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0.5,
+        le=60.0,
+        description="Connect timeout for S3 requests.",
+    )
+    s3_read_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=300.0,
+        description="Read timeout for S3 requests.",
+    )
+    s3_verify_ssl: bool = Field(
+        default=True,
+        description="Whether to verify TLS certificates (required in staging and production).",
+    )
+    s3_ca_bundle: Optional[str] = Field(
+        default=None,
+        description="Custom CA certificate bundle path for TLS verification.",
+    )
+    s3_spool_dir: Optional[Path] = Field(
+        default=None,
+        description="Local directory for spooling objects when descriptor paths are requested.",
+    )
+    storage_encryption_enabled: bool = Field(
+        default=False,
+        description="Whether to enable AES-256-GCM envelope encryption at rest for object storage.",
+    )
+    kms_provider_type: Literal["aws_kms", "fake"] = Field(
+        default="fake",
+        description="KMS key provider implementation: 'aws_kms' or 'fake'.",
+    )
+    kms_kek_id: Optional[str] = Field(
+        default=None,
+        description="Key identifier (ARN or alias) for KMS KEK.",
+    )
+    kms_key_version: str = Field(
+        default="v1",
+        description="Current key version identifier.",
+    )
+    kms_endpoint_url: Optional[str] = Field(
+        default=None,
+        description="Custom KMS endpoint URL (LocalStack, KMS emulator, etc.).",
+    )
+    spool_is_protected: bool = Field(
+        default=False,
+        description="Whether the local spool directory is backed by hardware/OS volume encryption.",
+    )
+    # Audit Checkpoints & Signed Integrity (Team Member 3, Phase 4C - SEC-008).
+    audit_checkpoint_enabled: bool = Field(
+        default=False,
+        description="Whether independently signed audit checkpoints and external storage are enabled.",
+    )
+    audit_checkpoint_sink_type: Literal["memory", "s3"] = Field(
+        default="memory",
+        description="External sink type for immutable checkpoint storage: 'memory' or 's3'.",
+    )
+    audit_signing_key_id: Optional[str] = Field(
+        default=None,
+        description="Asymmetric KMS signing key identifier (ARN or alias) for audit checkpoints.",
+    )
+    audit_signing_key_version: str = Field(
+        default="v1",
+        description="Version identifier for audit checkpoint signing key.",
+    )
+    audit_object_lock_retention_days: int = Field(
+        default=365,
+        ge=1,
+        description="Retention period in days for S3 Object Lock compliance/governance retention.",
+    )
+    audit_object_lock_mode: Literal["COMPLIANCE", "GOVERNANCE"] = Field(
+        default="COMPLIANCE",
+        description="S3 Object Lock retention mode.",
+    )
+    # Identity & Federation (Team Member 3, Phase 5A - SEC-001, SEC-002, SEC-003).
+    identity_provider_enabled: bool = Field(
+        default=False,
+        description="Whether internal product-owned identity and session lifecycle are enabled.",
+    )
+    oidc_sso_enabled: bool = Field(
+        default=False,
+        description="Whether customer OIDC federation and SSO are enabled.",
+    )
     service_name: str = Field(
         default="doc-extractor-api",
         description="Name of the REST API service",
@@ -203,6 +429,9 @@ class ApiSettings(Settings):
     @model_validator(mode="after")
     def validate_production_guards(self) -> "ApiSettings":
         """Enforces security hardening in production/staging environments and CORS constraints."""
+        self._validate_mongo_settings()
+        self._validate_broker_settings()
+        self._validate_storage_settings()
         if self.app_env in ("production", "staging") and self.debug:
             raise ValueError("Debug mode must be disabled in production and staging environments.")
         if "*" in self.cors_origins and self.cors_allow_credentials:
@@ -223,6 +452,57 @@ class ApiSettings(Settings):
             self.redoc_url = None
             self.openapi_url = None
         return self
+
+    def _validate_mongo_settings(self) -> None:
+        """MongoDB settings: complete, exclusive, and compliant with the connection-string policy for this environment."""
+        from doc_extractor.infrastructure.mongo.errors import PersistenceConfigurationError
+        from doc_extractor.infrastructure.mongo.settings import MongoSettings
+
+        try:
+            # No file I/O while settings are validated: a mounted secret is read when the container is built.
+            MongoSettings.from_api_settings(self, read_uri_file=False)
+        except PersistenceConfigurationError as exc:
+            # The fixed reason only; neither the connection string nor any path is echoed.
+            raise ValueError(f"Invalid MongoDB settings: {exc.details.get('reason')}.") from None
+        except ValueError as exc:
+            # A pydantic error from MongoSettings: its messages are fixed strings written in that module (inputs are hidden).
+            errors = getattr(exc, "errors", None)
+            reasons = sorted({str(e.get("msg", "")).replace("Value error, ", "") for e in errors()}) if callable(errors) else []
+            raise ValueError("Invalid MongoDB settings: " + ("; ".join(reasons) or "a value is not permitted") + ".") from None
+
+    def _validate_broker_settings(self) -> None:
+        """Broker settings: complete, exclusive, compliant with the URL policy of this environment, and backed by MongoDB."""
+        from doc_extractor.infrastructure.queue.errors import BrokerConfigurationError
+        from doc_extractor.infrastructure.queue.settings import BrokerSettings
+
+        try:
+            # No file I/O while settings are validated: a mounted secret is read when the container is built.
+            configured = BrokerSettings.from_api_settings(self, read_url_file=False)
+        except BrokerConfigurationError as exc:
+            raise ValueError(f"Invalid broker settings: {exc.details.get('reason')}.") from None
+        except ValueError as exc:
+            errors = getattr(exc, "errors", None)
+            reasons = sorted({str(e.get("msg", "")).replace("Value error, ", "") for e in errors()}) if callable(errors) else []
+            raise ValueError("Invalid broker settings: " + ("; ".join(reasons) or "a value is not permitted") + ".") from None
+        has_broker = configured is not None or self.broker_url_file is not None
+        if has_broker and self.mongo_uri is None and self.mongo_uri_file is None:
+            # The lease store (job ownership, attempts, fencing) is the authority on every job and lives in MongoDB: a broker alone would
+            # leave duplicate deliveries and dead workers unarbitrated, so there is no broker without it.
+            raise ValueError("Invalid broker settings: mongodb_is_required_for_processing_state.")
+
+    def _validate_storage_settings(self) -> None:
+        """S3 object storage settings: validate if storage_backend is s3 or bucket is provided."""
+        from doc_extractor.infrastructure.storage.errors import ObjectStorageConfigurationError
+        from doc_extractor.infrastructure.storage.settings import S3StorageSettings
+
+        try:
+            S3StorageSettings.from_api_settings(self, read_credential_files=False)
+        except ObjectStorageConfigurationError as exc:
+            raise ValueError(f"Invalid storage settings: {exc.details.get('reason')}.") from None
+        except ValueError as exc:
+            errors = getattr(exc, "errors", None)
+            reasons = sorted({str(e.get("msg", "")).replace("Value error, ", "") for e in errors()}) if callable(errors) else []
+            raise ValueError("Invalid storage settings: " + ("; ".join(reasons) or "a value is not permitted") + ".") from None
 
     def to_engine_settings(self) -> Settings:
         """Create a validated engine Settings instance from this ApiSettings instance."""

@@ -16,6 +16,16 @@ Fail closed: when Redis cannot be reached, or a lock is not acquired within the 
 
 Lease caveat: a critical section that runs longer than ``lease_ms`` loses its lock. Choose the lease above the
 longest guarded operation; the guarded operations here are short (one record read or write).
+
+A LOCK IS COORDINATION, NEVER THE SOURCE OF TRUTH (Phase 3). A Redis lock lease can expire while its holder is still running
+(a long pause, a slow dependency), and then a second holder is inside the same critical section. What stays correct in that case
+is whatever is enforced by durable state: the MongoDB idempotency store (``infrastructure/mongo/idempotency.py``) refuses a second
+live record for one (tenant, key) with a unique index, and the processing lease store fences stale workers with a token.
+``RedisLockProvider.acquire_lease`` is the explicit, long-running form: it returns a ``LockLease`` with a monotonically increasing
+``fencing_token``, ``extend`` (a heartbeat) and ``still_held``, so a long job can renew its lock and stop when renewal fails.
+
+``lock(name)`` objects also offer ``acquire()`` and ``release()`` (the interface of ``threading.RLock``), because the ingestion path
+takes the per-key lock that way. They were missing: a Redis-backed store could not be used by ingestion before.
 """
 
 from __future__ import annotations
@@ -29,7 +39,14 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Optional
 
-from redis.exceptions import RedisError, WatchError
+try:
+    from redis.exceptions import RedisError, WatchError
+except ImportError:  # pragma: no cover - when redis optional extra is not installed
+    class RedisError(Exception):  # type: ignore[no-redef]
+        pass
+
+    class WatchError(Exception):  # type: ignore[no-redef]
+        pass
 
 from doc_extractor.exceptions import StorageError
 from doc_extractor.idempotency import IdempotencyStore
@@ -74,12 +91,21 @@ class _LockContext:
         self._provider = provider
         self._name = name
 
-    def __enter__(self) -> "_LockContext":
+    def acquire(self) -> bool:
+        """``threading.RLock.acquire()``: wait for the lock (raises ``LockTimeoutError`` / ``StorageError`` instead of returning False)."""
         self._provider._enter(self._name)
+        return True
+
+    def release(self) -> None:
+        """``threading.RLock.release()``. The lock is deleted only while this holder still owns it (see ``RedisLockProvider._release``)."""
+        self._provider._exit(self._name)
+
+    def __enter__(self) -> "_LockContext":
+        self.acquire()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self._provider._exit(self._name)
+        self.release()
 
 
 class RedisLockProvider:
@@ -121,25 +147,78 @@ class RedisLockProvider:
     def _key(self, name: str) -> str:
         return f"{self._namespace}:lock:{_digest(name)}"
 
+    def _acquire_key(self, key: str, lease_ms: int, timeout: float) -> str:
+        """Take the lock ``key`` (``SET NX PX``), waiting up to ``timeout`` seconds. Returns the holder's token."""
+        token = uuid.uuid4().hex
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                acquired = self._client.set(key, token, nx=True, px=lease_ms)
+            except RedisError as exc:
+                raise StorageError(message="Lock store is unavailable.", details={"error_type": type(exc).__name__}) from exc
+            if acquired:
+                return token
+            if time.monotonic() >= deadline:
+                raise LockTimeoutError(message="Could not acquire the lock in time.", details={"lock": "held elsewhere"})
+            time.sleep(self._retry)
+
     def _enter(self, name: str) -> None:
         held = self._held()
         if name in held:
             held[name].depth += 1
             return
         key = self._key(name)
-        token = uuid.uuid4().hex
-        deadline = time.monotonic() + self._timeout
-        while True:
-            try:
-                acquired = self._client.set(key, token, nx=True, px=self._lease_ms)
-            except RedisError as exc:
-                raise StorageError(message="Lock store is unavailable.", details={"error_type": type(exc).__name__}) from exc
-            if acquired:
-                held[name] = _HeldLock(key, token)
-                return
-            if time.monotonic() >= deadline:
-                raise LockTimeoutError(message="Could not acquire the lock in time.", details={"lock": "held elsewhere"})
-            time.sleep(self._retry)
+        held[name] = _HeldLock(key, self._acquire_key(key, self._lease_ms, self._timeout))
+
+    def acquire_lease(
+        self, name: str, *, lease_ms: Optional[int] = None, timeout_seconds: Optional[float] = None
+    ) -> "LockLease":
+        """
+        An explicit, NON-reentrant lease on ``name`` for long-running work. It carries a ``fencing_token`` that is larger than the token of
+        every earlier lease on the same name (a Redis counter), and it can be renewed (``extend``) and checked (``still_held``).
+        Raises ``LockTimeoutError`` when the lock is held elsewhere for ``timeout_seconds`` and ``StorageError`` when Redis is down.
+        """
+        if not name:
+            raise ValueError("A lock name is required.")
+        lease = int(lease_ms if lease_ms is not None else self._lease_ms)
+        if lease <= 0:
+            raise ValueError("The lock lease must be positive.")
+        timeout = float(timeout_seconds if timeout_seconds is not None else self._timeout)
+        if timeout < 0:
+            raise ValueError("The acquire timeout must not be negative.")
+        key = self._key(name)
+        token = self._acquire_key(key, lease, timeout)
+        try:
+            fencing = int(self._client.incr(f"{key}:fence"))
+        except RedisError as exc:
+            self._release(_HeldLock(key, token))
+            raise StorageError(message="Lock store is unavailable.", details={"error_type": type(exc).__name__}) from exc
+        return LockLease(self, key, token, fencing, lease)
+
+    def _holds(self, key: str, token: str) -> bool:
+        try:
+            return _as_text(self._client.get(key)) == token
+        except RedisError as exc:
+            logger.warning("Lock ownership could not be confirmed (%s); treating it as lost.", type(exc).__name__)
+            return False
+
+    def _extend(self, key: str, token: str, lease_ms: int) -> bool:
+        """Renew the lease only while ``token`` still owns ``key`` (compare, then set the expiry, under WATCH). False: lost or unconfirmed."""
+        try:
+            with self._client.pipeline() as pipe:
+                pipe.watch(key)
+                if _as_text(pipe.get(key)) != token:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.pexpire(key, lease_ms)
+                pipe.execute()
+            return True
+        except WatchError:
+            return False
+        except RedisError as exc:
+            logger.warning("Lock renewal failed (%s); treating the lock as lost.", type(exc).__name__)
+            return False
 
     def _exit(self, name: str) -> None:
         held = self._held()
@@ -169,6 +248,44 @@ class RedisLockProvider:
         except RedisError as exc:
             # The lease will expire on its own; the next holder waits at most one lease.
             logger.warning("Lock release failed (%s); the lease will expire.", type(exc).__name__)
+
+
+class LockLease:
+    """
+    One explicit lease on a named lock (``RedisLockProvider.acquire_lease``). Not reentrant. The ``fencing_token`` increases with
+    every lease taken on the same name: pass it to whatever the lease protects so that a stale holder's writes can be refused.
+    ``release`` deletes the lock only while this holder still owns it; it is safe to call twice. Usable with ``with``.
+    """
+
+    def __init__(self, provider: RedisLockProvider, key: str, token: str, fencing_token: int, lease_ms: int) -> None:
+        self._provider = provider
+        self._key = key
+        self._token = token
+        self._lease_ms = lease_ms
+        self.fencing_token = fencing_token
+        self._released = False
+
+    def still_held(self) -> bool:
+        """True only when Redis confirms this holder owns the lock right now. Unconfirmed (Redis down) counts as lost: fail closed."""
+        return not self._released and self._provider._holds(self._key, self._token)
+
+    def extend(self, lease_ms: Optional[int] = None) -> bool:
+        """Heartbeat: renew the lease. False means the lock is lost (expired, taken over or unconfirmed): stop the guarded work."""
+        if self._released:
+            return False
+        return self._provider._extend(self._key, self._token, int(lease_ms if lease_ms is not None else self._lease_ms))
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._provider._release(_HeldLock(self._key, self._token))
+
+    def __enter__(self) -> "LockLease":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
 
 
 class RedisIdempotencyStore(IdempotencyStore):

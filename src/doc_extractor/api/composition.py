@@ -19,6 +19,7 @@ from doc_extractor.api.contracts.tenant_bound import require_path_safe_tenant_id
 from doc_extractor.api.exceptions import ContainerUnavailableError, PortNotConfiguredError
 from doc_extractor.api.ports.audit import AuditLogger
 from doc_extractor.api.ports.authentication import AuthenticationProvider
+from doc_extractor.api.ports.processing import ProcessingLeaseStore
 from doc_extractor.api.ports.queue import QueueConsumer, QueueProducer
 from doc_extractor.api.ports.repositories import (
     ApiKeyRepository,
@@ -35,6 +36,11 @@ from doc_extractor.config import Settings
 from doc_extractor.exceptions import InvalidTenantIdentifierError
 from doc_extractor.extractor import SchemaGuidedExtractor
 from doc_extractor.api.audit_chain import DurableAuditLogger, HashChainedAuditRepository
+from doc_extractor.infrastructure.mongo import DEFAULT_REGISTRY, IndexRegistry, MongoConnection, MongoSettings, ensure_indexes
+from doc_extractor.infrastructure.mongo.errors import PersistenceConfigurationError
+from doc_extractor.infrastructure.mongo.settings import HARDENED_ENVIRONMENTS
+from doc_extractor.infrastructure.queue.errors import BrokerConfigurationError
+from doc_extractor.infrastructure.queue.settings import BrokerSettings
 from doc_extractor.distributed_state import RedisIdempotencyStore, RedisLockProvider, connect_redis, tenant_lock_factory
 from doc_extractor.idempotency import LocalIdempotencyStore
 from doc_extractor.malware import MalwareScanner, build_malware_scanner
@@ -43,7 +49,7 @@ from doc_extractor.pipeline_b import ModuleBPipeline
 from doc_extractor.pipeline_c import ModuleCPipeline
 from doc_extractor.processing_service import DocumentProcessingService
 from doc_extractor.routing import RoutedExtractor
-from doc_extractor.storage import LocalDiskStorage
+from doc_extractor.storage import LocalDiskStorage, StorageBackend
 
 logger = logging.getLogger("doc_extractor.api.composition")
 
@@ -101,7 +107,7 @@ class TenantComponents:
       in the future strictly requires a lease/reference-counting mechanism or active-request drain protection.
     """
     tenant_id: str
-    storage: LocalDiskStorage
+    storage: StorageBackend
     idempotency_store: LocalIdempotencyStore
     module_a: ModuleAPipeline
     module_b: ModuleBPipeline
@@ -217,6 +223,14 @@ class ApplicationContainer:
         schema_manager: Optional[Any] = None,
         schema_approval_service: Optional[Any] = None,
         rate_limiter: Optional[Any] = None,
+        mongo_connection: Optional[MongoConnection] = None,
+        index_registry: Optional[IndexRegistry] = None,
+        processing_lease_store: Optional[ProcessingLeaseStore] = None,
+        broker_transport: Optional[Any] = None,
+        tenant_repo: Optional[Any] = None,
+        tenant_service: Optional[Any] = None,
+        identity_service: Optional[Any] = None,
+        webhook_dispatcher: Optional[Any] = None,
     ) -> None:
         self.api_settings = api_settings or load_api_settings()
         self.engine_settings = engine_settings or bridge_to_engine_settings(self.api_settings)
@@ -247,6 +261,8 @@ class ApplicationContainer:
 
         # 4. Application-scoped idempotency store. With redis_url set it is shared by every replica (ARC-003, NFR-006);
         #    otherwise it is the single-process LocalIdempotencyStore (shared across tenants, per-(tenant, key) isolation).
+        self._idempotency_supplied = idempotency_store is not None
+        self._idempotency_replaced_at_startup = False
         if idempotency_store is not None:
             self.idempotency_store = idempotency_store
         elif self.engine_settings.redis_url:
@@ -276,11 +292,21 @@ class ApplicationContainer:
         self.audit_repo = audit_repo
         self.queue_producer = queue_producer
         self.queue_consumer = queue_consumer
+        # Durable queue (Phase 3). The broker is configured only by an explicit URL; nothing falls back to an in-memory queue. The
+        # job-ownership store and the broker connection are created by ``startup()`` (they connect inside the event loop).
+        self.processing_lease_store = processing_lease_store
+        self.broker_settings: Optional[BrokerSettings] = BrokerSettings.from_api_settings(self.api_settings)
+        self._broker_transport = broker_transport
+        self._owned_queue: Optional[Any] = None
         self.audit_logger = audit_logger
         # Schema lifecycle (SCH-001..006). Deployment supplies a manager over a durable SchemaRepository. Nothing is
         # defaulted here: the in-memory repository must never back production schemas.
         self.schema_manager = schema_manager
         self.schema_approval_service = schema_approval_service
+        self.tenant_repo = tenant_repo
+        self.tenant_service = tenant_service
+        self.identity_service = identity_service
+        self.webhook_dispatcher = webhook_dispatcher
         # API-012: a shared token bucket across replicas. Built only when a capacity and a Redis URL are both configured.
         self.rate_limiter = rate_limiter
         if self.rate_limiter is None and self.api_settings.rate_limit_capacity and self.engine_settings.redis_url:
@@ -292,7 +318,250 @@ class ApplicationContainer:
                 refill_per_second=self.api_settings.rate_limit_refill_per_second,
             )
 
+        # MongoDB (Team Member 3, Phase 2A). Built from the API settings when a connection string is configured; nothing
+        # connects here (construction is synchronous and opens no socket): ``startup()`` connects inside the event loop.
+        # There is NO in-memory fallback. A configured database that is unreachable or invalid stops the application at
+        # start-up. An unconfigured one leaves the persistence ports unconfigured (503) in DEVELOPMENT only: staging and
+        # production refuse to start without one (``_require_durable_database``).
+        self.mongo: Optional[MongoConnection] = mongo_connection
+        if self.mongo is None:
+            mongo_settings = MongoSettings.from_api_settings(self.api_settings)
+            if mongo_settings is not None:
+                self.mongo = MongoConnection(mongo_settings)
+        self.index_registry: IndexRegistry = index_registry or DEFAULT_REGISTRY
+
         self._is_shutdown = False
+
+    def _require_durable_database(self) -> None:
+        """
+        The database start-up gate of staging and production (Phase 2A-5). Development keeps MongoDB optional.
+
+        In a hardened environment the application must not run without a verified durable database, however its repositories
+        were supplied: an injected repository does NOT waive this, and there is no flag that does. Raises
+        ``PersistenceConfigurationError`` with a fixed reason (never a connection string, host, path or credential) when
+        - no MongoDB is configured (neither a connection string / file in the settings nor an injected connection), or
+        - the connection in use was built for a different, non-hardened environment (so its TLS, authentication and
+          replica-set policy was not the one this environment requires).
+        An unreachable server, a failed replica-set check or a failed index bootstrap are raised by ``startup()`` itself.
+        """
+        environment = self.api_settings.app_env
+        if environment not in HARDENED_ENVIRONMENTS:
+            return
+        if self.mongo is None:
+            logger.error("Start-up refused: MongoDB is required in %s and is not configured (reason=database_is_required)", environment)
+            raise PersistenceConfigurationError("database_is_required_in_staging_and_production", setting="mongo_uri")
+        deployment = self.mongo.settings
+        if deployment.app_env != environment or not deployment.require_replica_set:
+            logger.error("Start-up refused: the MongoDB settings do not match the %s environment (reason=settings_mismatch)", environment)
+            raise PersistenceConfigurationError("database_settings_do_not_match_the_environment", setting="mongo_uri")
+
+    async def startup(self) -> None:
+        """
+        Asynchronous start-up, run once inside the event loop by the application lifespan. Idempotent.
+        In staging and production a verified MongoDB is REQUIRED (``_require_durable_database``); in development it is optional.
+        Connects MongoDB (when configured), applies the declared indexes (when enabled) and then configures the MongoDB
+        ``ReviewTaskRepository``, ``ApiKeyRepository`` and durable audit repository with its logger (each unless one was injected;
+        audit also yields to an explicitly configured file store). A failure raises a typed persistence error with a fixed message;
+        the application does not start, and nothing falls back to another store.
+        """
+        self._require_durable_database()
+        if self.mongo is None:
+            if self.broker_settings is not None or self._broker_transport is not None:
+                # The lease store (ownership, attempts, fencing) is the authority on every job and lives in MongoDB.
+                raise BrokerConfigurationError("mongodb_is_required_for_processing_state", setting="broker_url")
+            return
+        await self.mongo.connect()
+        if self.mongo.settings.ensure_indexes_on_startup:
+            try:
+                await ensure_indexes(self.mongo.database, self.index_registry)
+            except Exception:
+                await self.mongo.aclose()          # leave nothing open when start-up fails
+                raise
+        # The MongoDB adapters are configured only now: a database that failed its checks above leaves every port
+        # unconfigured (503), never half-wired. An adapter injected by the caller always wins. Everything is prepared and
+        # checked FIRST and assigned LAST, so a failure part-way leaves nothing configured.
+        # Imported here, not at module level: the adapters import the API's ports, and this module is part of the package
+        # those imports load (a module-level import would be circular).
+        review_task_repo = api_key_repo = audit_repo = audit_logger = None
+        idempotency_store = lease_store = queue = None
+        started: list = []
+        # Imported BEFORE the guarded block below: an import of this distribution must never sit inside a ``try`` that catches ``Exception``
+        # (tests/test_api_m4_roles_direct_import.py), even though that block re-raises after closing what it opened.
+        from doc_extractor.infrastructure.mongo.api_keys import MongoApiKeyRepository
+        from doc_extractor.infrastructure.mongo.audit import MongoAuditRepository
+        from doc_extractor.infrastructure.mongo.idempotency import MongoIdempotencyStore
+        from doc_extractor.infrastructure.mongo.processing import MongoProcessingLeaseStore
+        from doc_extractor.infrastructure.mongo.review_tasks import MongoReviewTaskRepository
+        from doc_extractor.infrastructure.queue.rabbitmq import RabbitMQQueue
+        from doc_extractor.infrastructure.queue.transport import AioPikaTransport
+
+        try:
+            if self.review_task_repo is None:
+                review_task_repo = MongoReviewTaskRepository(self.mongo)
+            if self.api_key_repo is None:
+                api_key_repo = MongoApiKeyRepository(self.mongo)
+            # Durable audit (Phase 2B). Only when NOTHING audit-related was supplied: an injected audit repository or logger, or an
+            # explicitly configured file audit store (``audit_store_dir``), is never replaced, and no best-effort sink ever stands in.
+            # The chain is only safe with its unique (tenant, sequence) index, so that index is verified even when bootstrap is off.
+            if self.audit_repo is None and self.audit_logger is None:
+                audit_repo = MongoAuditRepository(self.mongo)
+                await audit_repo.require_unique_sequence_index()
+                audit_logger = DurableAuditLogger(audit_repo)
+            # Durable idempotency (Phase 3): the unique record in MongoDB is the source of truth; Redis (when configured) only coordinates
+            # the per-key lock. An injected store is never replaced. The unique index is verified even when bootstrap is off.
+            if not self._idempotency_supplied:
+                locks = RedisLockProvider(connect_redis(self.engine_settings.redis_url)) if self.engine_settings.redis_url else None
+                idempotency_store = MongoIdempotencyStore(self.mongo, locks=locks)
+                await idempotency_store.start()
+                started.append(idempotency_store)
+            # Durable queue (Phase 3): only when a broker is configured (or a transport injected) and a queue port is still empty.
+            # Injected producers and consumers always win. The lease store is required first; the broker connects and declares its
+            # topology here, so an unreachable or refusing broker stops start-up (fail closed, no in-memory fallback).
+            wants_queue = self.broker_settings is not None or self._broker_transport is not None
+            if wants_queue and (self.queue_producer is None or self.queue_consumer is None):
+                lease_store = self.processing_lease_store
+                if lease_store is None:
+                    lease_store = MongoProcessingLeaseStore(self.mongo)
+                    await lease_store.require_unique_job_index()
+                transport = self._broker_transport or AioPikaTransport(self.broker_settings)
+                queue = RabbitMQQueue(
+                    transport, lease_store,
+                    max_in_flight=self.broker_settings.max_in_flight if self.broker_settings is not None else 10,
+                )
+                await queue.start()
+                started.append(queue)
+        except Exception:
+            for adapter in reversed(started):          # leave nothing open and nothing configured when start-up fails
+                try:
+                    if hasattr(adapter, "stop"):
+                        adapter.stop()
+                    else:
+                        await adapter.close()
+                except Exception:                      # noqa: BLE001 - closing is best effort; the original failure is what matters
+                    pass
+            await self.mongo.aclose()
+            raise
+        self.review_task_repo = review_task_repo or self.review_task_repo
+        self.api_key_repo = api_key_repo or self.api_key_repo
+        if audit_repo is not None:
+            self.audit_repo, self.audit_logger = audit_repo, audit_logger
+        if idempotency_store is not None:
+            self.idempotency_store = idempotency_store
+            self._idempotency_replaced_at_startup = True
+        if lease_store is not None:
+            self.processing_lease_store = lease_store
+        if queue is not None:
+            self._owned_queue = queue
+            self.queue_producer = self.queue_producer or queue
+            self.queue_consumer = self.queue_consumer or queue
+        # Schema lifecycle (Phase 5B): wire durable MongoDB repository and approval service when mongo is configured
+        if self.schema_manager is None and self.mongo is not None:
+            from doc_extractor.infrastructure.mongo.schemas import MongoSchemaRepository, ensure_schema_indexes
+            from schema_lifecycle.manager import SchemaLifecycleManager
+            from schema_lifecycle.approval import BenchmarkResultVerifier, InMemoryBenchmarkReportStore, SchemaApprovalService
+            from schema_lifecycle.roles import ProductionSchemaAuthorizer
+
+            await ensure_schema_indexes(self.mongo.database)
+            schema_repo = MongoSchemaRepository(self.mongo)
+            self.schema_manager = SchemaLifecycleManager(repository=schema_repo)
+            if self.schema_approval_service is None:
+                authorizer = ProductionSchemaAuthorizer()
+                report_store = InMemoryBenchmarkReportStore()
+                verifier = BenchmarkResultVerifier(report_store=report_store)
+                self.schema_approval_service = SchemaApprovalService(
+                    manager=self.schema_manager,
+                    authorizer=authorizer,
+                    verifier=verifier,
+                    report_store=report_store,
+                )
+
+        # Phase 5C: Tenant provisioning, persistent identity and webhook security
+        if self.mongo is not None:
+            from doc_extractor.infrastructure.mongo.webhooks import (
+                MongoWebhookSubscriptionRepository,
+                MongoWebhookDeliveryRepository,
+                ensure_webhook_indexes,
+            )
+            from doc_extractor.infrastructure.mongo.tenants import (
+                MongoTenantRepository,
+                ensure_tenant_indexes,
+            )
+            from doc_extractor.infrastructure.mongo.identity import (
+                MongoUserRepository,
+                MongoRefreshTokenRepository,
+                MongoTokenRevocationStore,
+                ensure_identity_indexes,
+            )
+            from doc_extractor.infrastructure.tenancy.service import TenantProvisioningService
+            from doc_extractor.infrastructure.webhook.dispatcher import WebhookDispatcher
+            from doc_extractor.infrastructure.webhook.security import EphemeralSecretResolver
+            from doc_extractor.egress import EgressPolicy
+
+            await ensure_webhook_indexes(self.mongo.database)
+            await ensure_tenant_indexes(self.mongo.database)
+            await ensure_identity_indexes(self.mongo.database)
+
+            if self.webhook_subscription_repo is None:
+                self.webhook_subscription_repo = MongoWebhookSubscriptionRepository(
+                    self.mongo,
+                    allow_loopback=(self.engine_settings.app_env == "development"),
+                )
+            if self.webhook_delivery_repo is None:
+                self.webhook_delivery_repo = MongoWebhookDeliveryRepository(self.mongo)
+
+            if self.tenant_repo is None:
+                self.tenant_repo = MongoTenantRepository(self.mongo)
+            if self.tenant_service is None:
+                self.tenant_service = TenantProvisioningService(
+                    self.tenant_repo,
+                    audit_logger=self.audit_logger,
+                )
+
+            if self.webhook_dispatcher is None:
+                egress = EgressPolicy.from_environment()
+                self.webhook_dispatcher = WebhookDispatcher(
+                    subscription_repo=self.webhook_subscription_repo,
+                    delivery_repo=self.webhook_delivery_repo,
+                    secret_resolver=EphemeralSecretResolver(),
+                    egress_policy=egress,
+                    queue_producer=self.queue_producer,
+                    audit_logger=self.audit_logger,
+                    allow_loopback=(self.engine_settings.app_env == "development"),
+                )
+
+    async def ashutdown(self) -> None:
+        """
+        Asynchronous shutdown: closes the broker connection this container opened, stops the MongoDB idempotency bridge and closes the
+        MongoDB client. Idempotent; the synchronous ``shutdown`` is unchanged. Unsettled deliveries return to the queue.
+        """
+        queue, self._owned_queue = self._owned_queue, None
+        if queue is not None:
+            try:
+                await queue.close()
+            except Exception:                          # noqa: BLE001 - shutdown must reach the database close
+                logger.warning("The message broker did not close cleanly")
+        stop = getattr(self.idempotency_store, "stop", None)
+        if self._idempotency_replaced_at_startup and callable(stop):
+            stop()
+        if self.mongo is not None:
+            await self.mongo.aclose()
+
+    def get_storage(self, tenant_id: str) -> StorageBackend:
+        """
+        Create or retrieve the tenant-bound storage backend based on configuration.
+        Fails closed: if remote S3 storage is configured but invalid, raises typed error
+        and NEVER falls back to local disk or memory.
+        """
+        require_path_safe_tenant_id(tenant_id)
+        if getattr(self.api_settings, "storage_backend", "local") == "s3":
+            from doc_extractor.infrastructure.storage.adapter import S3Storage
+            from doc_extractor.infrastructure.storage.settings import S3StorageSettings
+
+            s3_settings = S3StorageSettings.from_api_settings(self.api_settings)
+            if s3_settings is None:
+                raise TenantStorageUnavailableError("s3_configuration_missing")
+            return S3Storage(settings=s3_settings, tenant_id=tenant_id)
+        return LocalDiskStorage(self.engine_settings.storage_base_dir, tenant_id=tenant_id)
 
     def get_tenant_components(self, tenant_id: str) -> TenantComponents:
         """
@@ -321,7 +590,7 @@ class ApplicationContainer:
             if cached is not None:
                 return cached
 
-            storage = LocalDiskStorage(self.engine_settings.storage_base_dir, tenant_id=tenant_id)
+            storage = self.get_storage(tenant_id)
             module_a = ModuleAPipeline(
                 settings=self.engine_settings,
                 scanner=self.malware_scanner,
@@ -391,6 +660,11 @@ class ApplicationContainer:
         if not tenant_id.strip():
             raise InvalidTenantIdentifierError("Tenant ID cannot be whitespace.")
         require_path_safe_tenant_id(tenant_id)
+
+        if getattr(self.api_settings, "storage_backend", "local") == "s3":
+            # DocumentReadService performs descriptor-relative directory operations (openat) on LocalDiskStorage.
+            # Reading document records and images under S3 object storage depends on Open Decision M5-D18.
+            raise TenantStorageUnavailableError("document_read_service_requires_local_disk_storage")
 
         storage = LocalDiskStorage(self.engine_settings.storage_base_dir, tenant_id=tenant_id)
         return DocumentReadService(storage=storage, tenant_id=tenant_id)

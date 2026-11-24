@@ -41,6 +41,8 @@ class AlertCondition(str, Enum):
     EGRESS_ATTEMPT = "egress_attempt"
     AUDIT_CHAIN_FAILURE = "audit_chain_failure"
     MODEL_FILE_CHANGE = "model_file_change"
+    QUEUE_WORKER_FAILURE = "queue_worker_failure"
+    AUDIT_CHECKPOINT_FAILURE = "audit_checkpoint_failure"
 
 
 @dataclass(frozen=True)
@@ -156,6 +158,28 @@ class AlertMonitor:
             count=1,
             window_seconds=0,
             details={"reason": reason or "unknown", "first_bad_seq": first_bad_seq},
+        )
+        return self._dispatch(alert)
+
+    def record_queue_worker_failure(self, job_id: str, reason: str) -> Optional[Alert]:
+        """Emits an alert when a queue worker encounters a terminal processing failure."""
+        alert = Alert(
+            condition=AlertCondition.QUEUE_WORKER_FAILURE,
+            subject=job_id,
+            count=1,
+            window_seconds=0,
+            details={"reason": reason},
+        )
+        return self._dispatch(alert)
+
+    def record_checkpoint_failure(self, tenant_id: str, reason: str) -> Optional[Alert]:
+        """Emits an alert when signed checkpoint generation or external sink persistence fails."""
+        alert = Alert(
+            condition=AlertCondition.AUDIT_CHECKPOINT_FAILURE,
+            subject=tenant_id,
+            count=1,
+            window_seconds=0,
+            details={"reason": reason},
         )
         return self._dispatch(alert)
 

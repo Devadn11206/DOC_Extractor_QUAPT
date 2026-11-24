@@ -1,0 +1,5 @@
+# Optional: the durable message broker client (mirrors the 'queue' extra in pyproject.toml). The client is imported only when a broker
+# connection is made. RabbitMQ quorum queues are the working baseline, not an approved architecture decision.
+-r requirements.txt
+
+aio-pika>=9.4.0,<10.0.0

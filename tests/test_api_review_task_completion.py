@@ -123,8 +123,10 @@ def test_no_production_adapter_for_complete_exists_and_the_container_is_still_un
                 isinstance(item, ast.AsyncFunctionDef) and item.name == "complete" for item in node.body
             ):
                 classes.append(node.name)
-    # the Protocol itself and the service that calls it: no class of the application implements the repository
-    assert sorted(classes) == ["ReviewTaskRepository", "ReviewTaskService"]
+    # the Protocol itself, the service that calls it, and (Phase 2A-3) the ONE production adapter, the MongoDB repository, which
+    # the container wires only after a verified connection (asserted above: unconfigured stays None). Any other class that
+    # implements ``complete``, and any in-memory substitute (asserted above), still fails this test.
+    assert sorted(classes) == ["MongoReviewTaskRepository", "ReviewTaskRepository", "ReviewTaskService"]
 
 
 def test_there_is_no_completion_endpoint():

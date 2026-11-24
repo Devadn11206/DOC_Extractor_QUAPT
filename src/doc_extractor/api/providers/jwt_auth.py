@@ -17,6 +17,7 @@ identity service that holds the signing key belong to the identity service, not 
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional, Set, Union
 
@@ -54,16 +55,18 @@ KeyMaterial = Union[str, bytes]
 
 
 class JwtAuthenticationProvider(AuthenticationProvider):
-    """Verifies RS256 access tokens against one public key and returns an authoritative ApiPrincipal."""
+    """Verifies RS256 access tokens against one public key or KeyRing and returns an authoritative ApiPrincipal."""
 
     def __init__(
         self,
-        public_key_pem: KeyMaterial,
-        issuer: str,
-        audience: str,
+        public_key_pem: Optional[KeyMaterial] = None,
+        issuer: str = "",
+        audience: str = "",
         *,
         leeway_seconds: int = 0,
         max_lifetime_seconds: int = DEFAULT_MAX_LIFETIME_SECONDS,
+        key_ring: Optional[Any] = None,
+        revocation_store: Optional[Any] = None,
     ) -> None:
         if not issuer or not audience:
             raise ValueError("The JWT issuer and audience are required.")
@@ -71,8 +74,15 @@ class JwtAuthenticationProvider(AuthenticationProvider):
             raise ValueError("Access tokens must live at most 3600 seconds (SEC-002).")
         if leeway_seconds < 0 or leeway_seconds > 60:
             raise ValueError("Clock-skew leeway must be between 0 and 60 seconds.")
-        # Parse the key now: a malformed, non-RSA or weak key is a configuration error, not a per-request failure.
-        self._public_key = _load_rsa_public_key(public_key_pem)
+        self._key_ring = key_ring
+        self._revocation_store = revocation_store
+        if key_ring is not None:
+            self._public_key = None
+        elif public_key_pem is not None:
+            # Parse the key now: a malformed, non-RSA or weak key is a configuration error, not a per-request failure.
+            self._public_key = _load_rsa_public_key(public_key_pem)
+        else:
+            raise ValueError("Either public_key_pem or key_ring must be provided.")
         self._issuer = issuer
         self._audience = audience
         self._leeway = leeway_seconds
@@ -96,9 +106,20 @@ class JwtAuthenticationProvider(AuthenticationProvider):
 
     def _verify(self, token: str) -> Dict[str, Any]:
         try:
+            unverified_header = jwt.get_unverified_header(token)
+            kid = unverified_header.get("kid")
+        except Exception:
+            kid = None
+
+        if self._key_ring is not None:
+            public_key = self._key_ring.get_public_key(kid)
+        else:
+            public_key = self._public_key
+
+        try:
             claims = jwt.decode(
                 token,
-                self._public_key,
+                public_key,
                 algorithms=[ALGORITHM],
                 audience=self._audience,
                 issuer=self._issuer,
@@ -114,14 +135,37 @@ class JwtAuthenticationProvider(AuthenticationProvider):
         lifetime = int(claims["exp"]) - int(claims["iat"])
         if lifetime <= 0 or lifetime > self._max_lifetime:
             raise InvalidTokenError(message="Access token lifetime is not permitted.", code="INVALID_CREDENTIALS")
+
+        if self._revocation_store is not None:
+            jti = claims.get("jti")
+            if jti and self._revocation_store.is_jti_revoked(jti):
+                raise InvalidTokenError(message="Token has been revoked.", code="INVALID_CREDENTIALS")
+            sub = str(claims.get("sub"))
+            tenant_id = str(claims.get("tenant_id"))
+            iat_dt = datetime.fromtimestamp(int(claims["iat"]), tz=timezone.utc)
+            if self._revocation_store.is_user_revoked(sub, tenant_id, iat_dt):
+                raise InvalidTokenError(message="Session has been revoked.", code="INVALID_CREDENTIALS")
+
         return claims
 
 
-def _load_rsa_public_key(key: KeyMaterial) -> bytes:
+def _load_rsa_public_key(key: Any) -> Any:
     from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
     from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
+    if isinstance(key, RSAPublicKey):
+        if key.key_size < 2048:
+            raise ValueError("The JWT verification key must be an RSA key of at least 2048 bits (SEC-002).")
+        return key
+
     data = key.encode("utf-8") if isinstance(key, str) else key
+    try:
+        loaded = load_pem_public_key(data)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("The JWT verification key must be a PEM public key.") from exc
+    if not isinstance(loaded, RSAPublicKey) or loaded.key_size < 2048:
+        raise ValueError("The JWT verification key must be an RSA key of at least 2048 bits (SEC-002).")
+    return data
     try:
         loaded = load_pem_public_key(data)
     except (ValueError, TypeError) as exc:
@@ -188,6 +232,8 @@ def issue_access_token(
     mfa_verified: bool = False,
     lifetime_seconds: int = DEFAULT_MAX_LIFETIME_SECONDS,
     now: Optional[datetime] = None,
+    kid: Optional[str] = None,
+    jti: Optional[str] = None,
 ) -> str:
     """
     Sign an RS256 access token. Used by the identity service and by tests. Refuses roles outside the canonical seven
@@ -199,10 +245,12 @@ def issue_access_token(
     if not 0 < lifetime_seconds <= DEFAULT_MAX_LIFETIME_SECONDS:
         raise ValueError("Access tokens must live at most 3600 seconds (SEC-002).")
     issued_at = now or datetime.now(timezone.utc)
+    token_jti = jti or str(uuid.uuid4())
     payload: Dict[str, Any] = {
         "iss": issuer,
         "aud": audience,
         "sub": subject,
+        "jti": token_jti,
         "iat": issued_at,
         "exp": issued_at + timedelta(seconds=lifetime_seconds),
         "tenant_id": tenant_id,
@@ -210,4 +258,5 @@ def issue_access_token(
         "scope": " ".join(sorted(set(scopes))),
         "amr": ["pwd", "mfa"] if mfa_verified else ["pwd"],
     }
-    return jwt.encode(payload, private_key_pem, algorithm=ALGORITHM)
+    headers = {"kid": kid} if kid else None
+    return jwt.encode(payload, private_key_pem, algorithm=ALGORITHM, headers=headers)

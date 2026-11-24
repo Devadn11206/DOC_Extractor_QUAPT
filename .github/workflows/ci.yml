@@ -6,6 +6,12 @@ name: CI
 #                     dependency, FAILS the job (see tests/skip_policy.py). The junit report is then re-checked.
 #   full-suite        Everything. Only the genuinely optional OCR and live-model tests may skip; the junit report is
 #                     checked against that allow-list, so an API test can never skip unnoticed here either.
+#   production-install  Installs ONLY the production extras (no dev, no test), NON-editable, and proves the package is complete and
+#                     that no test-only package (pytest, pytest-cov, fakeredis) is part of a production install.
+#   queue-integration  A real RabbitMQ, MongoDB replica set and Redis for the durable queue, leases and idempotency (Phase 3).
+#   mongo-integration, live-services  Real MongoDB / real Redis and clamd. They install the production extras they exercise plus the
+#                     test runner, but NOT the 'test' extra: they run against the production dependency bounds.
+# Which extras each job installs is guarded by tests/test_ci_workflow.py.
 on:
   push:
   pull_request:
@@ -52,8 +58,8 @@ jobs:
       - name: Install the project with the real extras
         run: python -m pip install -e ".[dev,api]"
 
-      - name: Install the security extra (RS256 tokens, Redis locks, their tests)
-        run: python -m pip install -e ".[security]"
+      - name: Install the security and MongoDB extras and the test-only extra
+        run: python -m pip install -e ".[security,mongo,queue,test]"
 
       - name: Mandatory API dependency and import check
         run: python scripts/ci/check_api_extra.py
@@ -106,7 +112,234 @@ jobs:
       - name: pip-audit (fail on known vulnerabilities in the declared dependencies)
         run: |
           python -m pip install --upgrade pip pip-audit
-          python -m pip_audit --progress-spinner off -r requirements.txt -r requirements-api.txt -r requirements-security.txt
+          python -m pip_audit --progress-spinner off -r requirements.txt -r requirements-api.txt -r requirements-security.txt -r requirements-mongo.txt -r requirements-queue.txt
+
+  # MongoDB integration (Team Member 3, Phase 2A): the foundation against a REAL single-node replica set and a REAL standalone
+  # server (for the standalone-refusal check). Any skip fails the job: these tests prove nothing when skipped.
+  mongo-integration:
+    name: MongoDB integration, real replica set (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    env:
+      DOC_FAIL_ON_SKIP: "1"
+      DOC_TEST_MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0
+      DOC_TEST_MONGO_REPLICA_SET: rs0
+      DOC_TEST_MONGO_STANDALONE_URI: mongodb://localhost:27018/
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Start a single-node MongoDB 8.0 replica set and a standalone MongoDB 8.0
+        run: |
+          docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          docker run -d --name mongo-solo -p 127.0.0.1:27018:27017 mongo:8.0
+          for i in $(seq 1 30); do docker exec mongo-rs mongosh --quiet --eval "db.adminCommand('ping').ok" && break; sleep 2; done
+          docker exec mongo-rs mongosh --quiet --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]})"
+          for i in $(seq 1 30); do docker exec mongo-rs mongosh --quiet --eval "db.hello().isWritablePrimary" | grep -q true && break; sleep 2; done
+
+      - name: Install CPU-only PyTorch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # 'security' is required too: importing the API package (doc_extractor.api) imports redis at module level. The 'test' extra is NOT
+      # installed: nothing here needs fakeredis, and the production redis bound is the one that should be exercised.
+      - name: Install the project with the API, security and MongoDB extras
+        run: python -m pip install -e ".[dev,api,security,mongo]"
+
+      - name: MongoDB integration tests (any skip fails)
+        run: python -m pytest -p no:cacheprovider --junitxml=junit-mongo.xml tests/test_mongo_integration.py
+
+      - name: Re-check the junit report (no skips, all tests ran)
+        if: always()
+        run: python scripts/ci/assert_junit.py junit-mongo.xml --max-skipped 0 --min-tests 30
+
+      - name: Upload the junit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-mongo-py${{ matrix.python-version }}
+          path: junit-mongo.xml
+
+  # Durable queue integration (Team Member 3, Phase 3): the broker adapter, the lease store and the idempotency store against a REAL
+  # RabbitMQ 4.0 (quorum queues), a REAL single-node MongoDB replica set and a REAL Redis. Any skip fails the job. RabbitMQ is the
+  # working baseline, not an approved architecture decision.
+  queue-integration:
+    name: Queue integration, real RabbitMQ, MongoDB and Redis (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    env:
+      DOC_FAIL_ON_SKIP: "1"
+      DOC_TEST_MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0
+      DOC_TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+      DOC_TEST_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Start RabbitMQ 4.0, Redis 7 and a single-node MongoDB 8.0 replica set
+        run: |
+          docker run -d --name rabbit -p 127.0.0.1:5672:5672 rabbitmq:4.0
+          docker run -d --name redis -p 127.0.0.1:6379:6379 redis:7
+          docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:8.0 --replSet rs0 --bind_ip_all
+          for i in $(seq 1 60); do docker exec rabbit rabbitmq-diagnostics -q ping && break; sleep 2; done
+          for i in $(seq 1 30); do docker exec mongo-rs mongosh --quiet --eval "db.adminCommand('ping').ok" && break; sleep 2; done
+          docker exec mongo-rs mongosh --quiet --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]})"
+          for i in $(seq 1 30); do docker exec mongo-rs mongosh --quiet --eval "db.hello().isWritablePrimary" | grep -q true && break; sleep 2; done
+
+      - name: Install CPU-only PyTorch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      # The 'test' extra is NOT installed: the real clients must be the production ones, not the versions capped for fakeredis.
+      - name: Install the project with the API, security, MongoDB and queue extras
+        run: python -m pip install -e ".[dev,api,security,mongo,queue]"
+
+      - name: Queue integration tests (any skip fails)
+        run: python -m pytest -p no:cacheprovider --junitxml=junit-queue.xml tests/test_queue_integration.py
+
+      - name: Re-check the junit report (no skips, all tests ran)
+        if: always()
+        run: python scripts/ci/assert_junit.py junit-queue.xml --max-skipped 0 --min-tests 14
+
+      - name: Upload the junit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-queue-py${{ matrix.python-version }}
+          path: junit-queue.xml
+
+  # Production packaging and import check (Phase 2A-7): the project is installed NON-editable with ONLY the production extras, then
+  # scripts/ci/check_production_install.py proves that every production requirement is satisfied, that no test-only package
+  # (pytest, pytest-cov, fakeredis) was installed, and that the production entry points import from the INSTALLED distribution.
+  production-install:
+    name: Production install, no test-only packages (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install CPU-only PyTorch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the project with ONLY the production extras (non-editable)
+        run: python -m pip install ".[api,security,mongo,queue]"
+
+      - name: Production install check (requirements, no test-only package, imports from the installed package)
+        run: cd "$RUNNER_TEMP" && python "$GITHUB_WORKSPACE/scripts/ci/check_production_install.py" --require-site-packages
+
+  # Live-service tests (Phase 2A-7): the security backends against a REAL Redis and a REAL clamd. Any skip fails the job: these tests
+  # prove nothing when skipped (the full-suite job still allows them to skip, as it has no services). The 'test' extra is NOT
+  # installed: the real client must be the production redis, not the version capped for fakeredis.
+  live-services:
+    name: Live services, real Redis and clamd (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    env:
+      DOC_FAIL_ON_SKIP: "1"
+      DOC_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      DOC_TEST_CLAMD_ADDRESS: 127.0.0.1:3310
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Start clamd and wait until it answers PING
+        run: |
+          docker run -d --name clamd -p 127.0.0.1:3310:3310 clamav/clamav:1.4
+          python - <<'PY'
+          import socket, time
+          deadline = time.time() + 300
+          while time.time() < deadline:
+              try:
+                  with socket.create_connection(("127.0.0.1", 3310), timeout=3) as conn:
+                      conn.sendall(b"zPING\0")
+                      if conn.recv(16).strip(b"\0\n") == b"PONG":
+                          raise SystemExit(0)
+              except OSError:
+                  pass
+              time.sleep(5)
+          raise SystemExit("clamd did not become ready")
+          PY
+
+      - name: Install CPU-only PyTorch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the project with the security extra (no test-only extra)
+        run: python -m pip install -e ".[dev,security]"
+
+      - name: Live-service tests (any skip fails)
+        run: python -m pytest -p no:cacheprovider --junitxml=junit-live.xml tests/test_live_services.py
+
+      - name: Re-check the junit report (no skips, all tests ran)
+        if: always()
+        run: python scripts/ci/assert_junit.py junit-live.xml --max-skipped 0 --min-tests 10
+
+      - name: Upload the junit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-live-py${{ matrix.python-version }}
+          path: junit-live.xml
 
   full-suite:
     name: Full suite (Python ${{ matrix.python-version }})
@@ -135,8 +368,8 @@ jobs:
       - name: Install the project with the real extras
         run: python -m pip install -e ".[dev,api]"
 
-      - name: Install the security extra (RS256 tokens, Redis locks, their tests)
-        run: python -m pip install -e ".[security]"
+      - name: Install the security and MongoDB extras and the test-only extra
+        run: python -m pip install -e ".[security,mongo,queue,test]"
 
       - name: Full test suite
         run: python -m pytest -p no:cacheprovider --junitxml=junit-full.xml
@@ -146,6 +379,9 @@ jobs:
         run: >
           python scripts/ci/assert_junit.py junit-full.xml --min-tests 1400
           --allow-skip test_live_qwen_smoke_against_local_ollama
+          --allow-skip test_mongo_integration
+          --allow-skip test_queue_integration
+          --allow-skip test_live_services
 
       - name: Upload the junit report
         if: always()

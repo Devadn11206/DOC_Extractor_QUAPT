@@ -85,7 +85,9 @@ def test_extras_are_mirrored_by_their_requirements_files():
     extras = PYPROJECT["optional-dependencies"]
     for extra, filename in (
         ("dev", "requirements-dev.txt"), ("ui", "requirements-ui.txt"),
-        ("api", "requirements-api.txt"),
+        ("api", "requirements-api.txt"), ("security", "requirements-security.txt"),
+        ("mongo", "requirements-mongo.txt"), ("queue", "requirements-queue.txt"),
+        ("storage", "requirements-storage.txt"), ("test", "requirements-test.txt"),
     ):
         declared = {_name(d): d.replace(" ", "") for d in extras[extra]}
         listed = {k: v for k, v in _requirements(filename).items() if k not in _requirements("requirements.txt")}
@@ -193,3 +195,221 @@ def test_package_discovery_ships_every_first_party_package():
     assert config == {"where": ["src"]}
     discovered = {p.name for p in (ROOT / "src").iterdir() if p.is_dir() and (p / "__init__.py").exists()}
     assert discovered == set(FIRST_PARTY) and "engine_errors" in discovered
+
+
+# -- MongoDB foundation (Team Member 3, Phase 2A): production and test-only dependencies are separate ------------------
+
+def test_the_mongo_driver_is_a_dedicated_optional_extra_and_never_core():
+    assert {_name(d) for d in PYPROJECT["optional-dependencies"]["mongo"]} == {"pymongo"}
+    core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
+    assert "pymongo" not in core
+    for extra in ("api", "dev", "security", "queue", "test", "ui"):
+        assert "pymongo" not in {_name(d) for d in PYPROJECT["optional-dependencies"][extra]}
+
+
+def test_fakeredis_is_test_only_and_in_no_production_group():
+    extras = PYPROJECT["optional-dependencies"]
+    # redis is bounded here (test environments only); packaging and tomli are the CI scripts' own imports, declared rather than left transitive
+    assert {_name(d) for d in extras["test"]} == {"fakeredis", "redis", "packaging", "tomli"}
+    redis_spec = next(d for d in extras["security"] if _name(d) == "redis")
+    assert "<" not in redis_spec                                                # production keeps the unbounded floor
+    for group in ("security", "api", "mongo", "queue", "ui"):
+        assert "fakeredis" not in {_name(d) for d in extras[group]}, group
+    core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
+    assert "fakeredis" not in core
+    for filename in ("requirements-security.txt", "requirements-api.txt", "requirements-mongo.txt", "requirements-queue.txt"):
+        assert "fakeredis" not in _requirements(filename), filename
+    assert "fakeredis" in _requirements("requirements-test.txt")
+
+
+def test_the_mongo_driver_is_imported_only_by_the_mongo_infrastructure():
+    importers = sorted(
+        str(path.relative_to(ROOT)) for path in (ROOT / "src").rglob("*.py")
+        if any(
+            (isinstance(node, ast.Import) and any(a.name.split(".")[0] == "pymongo" for a in node.names))
+            or (isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] == "pymongo")
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
+    )
+    assert importers and all(name.startswith("src/doc_extractor/infrastructure/mongo/") for name in importers), importers
+
+
+
+# -- Phase 2A-7: test-only dependencies stay out of every production group, now and in future ---------------------------------
+
+PRODUCTION_EXTRAS = ("api", "security", "mongo", "queue", "storage", "ui")
+TEST_EXTRAS = ("dev", "test")
+# A test group may only TIGHTEN a production dependency (the fakeredis-compatible redis cap); nothing else may be shared.
+SHARED_WITH_PRODUCTION = {"redis"}
+# Well-known test-only packages. They are refused in any production group even before they appear in a test group.
+KNOWN_TEST_ONLY = {
+    "pytest", "pytest-cov", "pytest-asyncio", "pytest-mock", "pytest-xdist", "pytest-timeout", "pytest-randomly", "pytest-benchmark",
+    "coverage", "fakeredis", "mongomock", "freezegun", "time-machine", "hypothesis", "responses", "respx", "requests-mock", "faker",
+    "factory-boy", "tox", "nox", "mock", "testcontainers", "moto", "vcrpy",
+}
+PRODUCTION_REQUIREMENT_FILES = ("requirements.txt", "requirements-api.txt", "requirements-security.txt", "requirements-mongo.txt",
+                                "requirements-queue.txt", "requirements-ui.txt")
+TEST_REQUIREMENT_FILES = ("requirements-dev.txt", "requirements-test.txt")
+
+
+def _extra_names(*extras):
+    names = set()
+    for extra in extras:
+        names |= {_name(d) for d in PYPROJECT["optional-dependencies"][extra]}
+    return names
+
+
+def _production_names():
+    return {_name(d) for d in PYPROJECT["dependencies"]} | _extra_names(*PRODUCTION_EXTRAS)
+
+
+def _test_only_names():
+    """Declared by a test extra and not part of any production group (redis is shared, with a tighter test bound)."""
+    return _extra_names(*TEST_EXTRAS) - SHARED_WITH_PRODUCTION
+
+
+def test_no_test_only_package_is_in_the_base_installation_or_any_production_extra():
+    production = _production_names()
+    assert not production & KNOWN_TEST_ONLY, sorted(production & KNOWN_TEST_ONLY)
+    assert not production & _test_only_names(), sorted(production & _test_only_names())
+
+
+def test_no_production_requirements_file_lists_a_test_only_package_or_includes_a_test_file():
+    forbidden = KNOWN_TEST_ONLY | _test_only_names()
+    for filename in PRODUCTION_REQUIREMENT_FILES:
+        listed = set(_requirements(filename))
+        assert not listed & forbidden, (filename, sorted(listed & forbidden))
+        includes = [line.strip() for line in (ROOT / filename).read_text(encoding="utf-8").splitlines() if line.strip().startswith("-r")]
+        assert not [i for i in includes if "requirements-test" in i or "requirements-dev" in i], (filename, includes)
+
+
+def test_the_test_requirement_files_install_the_core_first_and_nothing_else():
+    for filename in TEST_REQUIREMENT_FILES:
+        includes = [line.strip() for line in (ROOT / filename).read_text(encoding="utf-8").splitlines() if line.strip().startswith("-r")]
+        assert includes == ["-r requirements.txt"], filename
+
+
+def test_a_package_shared_between_a_test_group_and_production_may_only_be_tightened_by_the_test_group():
+    declared = {}
+    for extra in (*TEST_EXTRAS, *PRODUCTION_EXTRAS):
+        for spec in PYPROJECT["optional-dependencies"][extra]:
+            declared.setdefault(_name(spec), {})[extra] = spec
+    shared = {name for name, groups in declared.items() if set(groups) & set(TEST_EXTRAS) and set(groups) & set(PRODUCTION_EXTRAS)}
+    assert shared == SHARED_WITH_PRODUCTION
+    for name in shared:
+        production_spec = next(spec for extra, spec in declared[name].items() if extra in PRODUCTION_EXTRAS)
+        test_spec = next(spec for extra, spec in declared[name].items() if extra in TEST_EXTRAS)
+        assert "<" not in production_spec, production_spec                   # production keeps its bound open
+        assert "<" in test_spec, test_spec                                   # the test group alone carries the cap
+
+
+def test_every_runtime_import_in_src_is_declared_in_a_production_group_not_only_in_a_test_group():
+    """A runtime dependency declared only under 'dev' or 'test' would pass every other check and break a production install."""
+    production = _production_names()
+    not_in_production = {}
+    for module, where in _third_party_imports().items():
+        dist = DIST_OF_MODULE.get(module, module).lower().replace("_", "-")
+        if module in DOCUMENTED_OPTIONAL:
+            continue
+        if dist not in production:
+            not_in_production[module] = where
+    assert not_in_production == {}, f"runtime imports not declared in a production group: {not_in_production}"
+
+
+def _imports_of(directory):
+    std = set(sys.stdlib_module_names)
+    found = {}
+    for path in (ROOT / directory).rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            mods = []
+            if isinstance(node, ast.Import):
+                mods = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                mods = [node.module]
+            for mod in mods:
+                top = mod.split(".")[0]
+                if top not in std and top not in FIRST_PARTY and top not in ("tests", "scripts"):
+                    found.setdefault(top, str(path.relative_to(ROOT)))
+    return found
+
+
+def test_the_full_test_installation_declares_everything_the_tests_and_ci_scripts_import():
+    """``pip install ".[dev,api,security,mongo,queue,test]"`` must hold every third-party package the suite imports (none left to chance)."""
+    complete = _declared()                                                   # the base and every extra
+    missing = {}
+    mapping = {**DIST_OF_MODULE, "bson": "pymongo", "gridfs": "pymongo", "multipart": "python-multipart", "python_multipart": "python-multipart"}
+    for directory in ("tests", "scripts"):
+        for module, where in _imports_of(directory).items():
+            dist = mapping.get(module, module).lower().replace("_", "-")
+            if dist not in complete and module not in DOCUMENTED_OPTIONAL:
+                missing[module] = where
+    assert missing == {}, f"imported by the tests or CI scripts but declared nowhere: {missing}"
+
+
+def test_the_runner_and_test_only_extras_are_never_imported_by_the_shipped_code():
+    imported_by_src = {DIST_OF_MODULE.get(m, m).lower().replace("_", "-") for m in _third_party_imports()}
+    leaked = (_test_only_names() | KNOWN_TEST_ONLY) & imported_by_src
+    assert leaked == set(), f"src/ imports a test-only package: {sorted(leaked)}"
+
+
+def test_the_production_install_check_agrees_with_the_project_metadata():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("check_production_install", ROOT / "scripts" / "ci" / "check_production_install.py")
+    check = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(check)
+    assert set(check.PRODUCTION_EXTRAS) == set(PRODUCTION_EXTRAS) and set(check.TEST_EXTRAS) == set(TEST_EXTRAS)
+    assert set(check.FIRST_PARTY) == set(FIRST_PARTY)
+    assert check.declared_only_by_tests(PYPROJECT) == _test_only_names()
+    assert set(check.ABSOLUTELY_FORBIDDEN) <= _test_only_names()
+    assert set(check.DEFAULT_EXTRAS) <= set(check.PRODUCTION_EXTRAS)
+
+
+# -- Durable queue (Team Member 3, Phase 3): the AMQP client is a dedicated optional extra imported only by the queue infrastructure ---
+
+def test_the_amqp_client_is_a_dedicated_optional_extra_and_never_core():
+    assert {_name(d) for d in PYPROJECT["optional-dependencies"]["queue"]} == {"aio-pika"}
+    core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
+    assert "aio-pika" not in core
+    for extra in ("api", "dev", "security", "mongo", "test", "ui"):
+        assert "aio-pika" not in {_name(d) for d in PYPROJECT["optional-dependencies"][extra]}
+
+
+def test_the_amqp_client_is_imported_only_by_the_queue_transport():
+    importers = sorted(
+        str(path.relative_to(ROOT)) for path in (ROOT / "src").rglob("*.py")
+        if any(
+            (isinstance(node, ast.Import) and any(a.name.split(".")[0] == "aio_pika" for a in node.names))
+            or (isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] == "aio_pika")
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
+    )
+    assert importers == ["src/doc_extractor/infrastructure/queue/transport.py"], importers
+
+
+# -- Object storage (Team Member 3, Phase 4A/4B): boto3 is a dedicated optional extra imported only by storage adapter & KMS ---
+
+def test_the_object_storage_client_is_a_dedicated_optional_extra_and_never_core():
+    assert {_name(d) for d in PYPROJECT["optional-dependencies"]["storage"]} == {"boto3", "botocore", "cryptography"}
+    core = {_name(d) for d in PYPROJECT["dependencies"]} | set(_requirements("requirements.txt"))
+    assert "boto3" not in core and "botocore" not in core
+    for extra in ("api", "dev", "mongo", "queue", "test", "ui"):
+        assert "boto3" not in {_name(d) for d in PYPROJECT["optional-dependencies"][extra]}
+        assert "botocore" not in {_name(d) for d in PYPROJECT["optional-dependencies"][extra]}
+
+
+def test_the_object_storage_client_is_imported_only_by_the_storage_adapter():
+    importers = sorted(
+        str(path.relative_to(ROOT)) for path in (ROOT / "src").rglob("*.py")
+        if any(
+            (isinstance(node, ast.Import) and any(a.name.split(".")[0] in ("boto3", "botocore") for a in node.names))
+            or (isinstance(node, ast.ImportFrom) and node.level == 0 and (node.module or "").split(".")[0] in ("boto3", "botocore"))
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
+    )
+    assert importers == [
+        "src/doc_extractor/infrastructure/audit/kms_signer.py",
+        "src/doc_extractor/infrastructure/audit/sink.py",
+        "src/doc_extractor/infrastructure/storage/adapter.py",
+        "src/doc_extractor/infrastructure/storage/kms/aws_kms.py",
+    ], importers

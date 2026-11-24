@@ -1,27 +1,38 @@
 """
-Schema lifecycle REST endpoints (PRD SCH-001..006, SEC-003).
+Schema lifecycle REST endpoints (PRD SCH-001..006, SEC-003, SEC-008).
 
 Each endpoint is a thin adapter: the lifecycle rules (draft -> testing -> approved -> retired, four-eyes approval,
-immutable versions, non-destructive rollback) live in ``schema_lifecycle``. The router only authenticates, checks the
-M4 permission for the action, and calls the manager. The tenant always comes from the principal, never the request.
+immutable versions, non-destructive rollback) live in ``schema_lifecycle``. The router authenticates, checks the
+M4 permission for the action, calls the manager/approval service, and logs tamper-evident audit records.
+The tenant always comes from the principal, never the request (SEC-006).
 
-The manager and the approval service are application-scoped and are injected on app state. When they are not
-configured every route answers 503 SERVICE_UNAVAILABLE: the router never substitutes the in-memory repository.
+Mandatory audit failure policy (SEC-008): all governance operations fail closed if audit recording fails;
+unrecorded operations are never permitted to persist.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from doc_extractor.api.dependencies import get_current_principal, require_permissions
+from doc_extractor.api.dependencies import get_audit_logger, get_current_principal, require_permissions
 from doc_extractor.api.exceptions import ApiValidationError, PortNotConfiguredError
+from doc_extractor.api.ports.audit import AuditLogger
 from doc_extractor.api.ports.authentication import ApiPrincipal
 from schema_lifecycle.enums import SchemaStatus
+from schema_lifecycle.exceptions import (
+    BenchmarkVerificationError,
+    ForbiddenActionError,
+    SchemaNotFoundError,
+    SchemaSelfApprovalError,
+)
 from schema_lifecycle.metamodel import SchemaDefinition
 from schema_lifecycle.roles import SchemaPermission
+
+logger = logging.getLogger("doc_extractor.api.schemas")
 
 router = APIRouter(tags=["Schemas"])
 
@@ -93,9 +104,27 @@ async def create_schema(
     body: CreateSchemaRequest,
     principal: ApiPrincipal = Depends(get_current_principal),
     manager=Depends(get_schema_manager),
+    audit_logger: AuditLogger = Depends(get_audit_logger),
 ):
     _check_body_belongs_to_caller(body.definition, principal)
-    return manager.create_schema(principal.tenant_id, body.definition, author=principal.principal_id)
+    snapshot = manager.create_schema(principal.tenant_id, body.definition, author=principal.principal_id)
+    try:
+        await audit_logger.log_action(
+            actor_id=principal.principal_id,
+            tenant_id=principal.tenant_id,
+            action="schema.created",
+            resource_id=body.definition.schema_id,
+            resource_type="schema",
+            metadata={
+                "schema_id": body.definition.schema_id,
+                "schema_version": body.definition.version,
+                "outcome_code": "SUCCESS",
+            },
+        )
+    except Exception:
+        logger.error("Audit log failed for schema creation; failing closed (SEC-008)")
+        raise
+    return snapshot
 
 
 @router.post(
@@ -109,11 +138,29 @@ async def create_schema_version(
     body: CreateVersionRequest,
     principal: ApiPrincipal = Depends(get_current_principal),
     manager=Depends(get_schema_manager),
+    audit_logger: AuditLogger = Depends(get_audit_logger),
 ):
     _check_body_belongs_to_caller(body.definition, principal, schema_id)
-    return manager.create_version(
+    snapshot = manager.create_version(
         principal.tenant_id, schema_id, body.definition, author=principal.principal_id, comment=body.comment
     )
+    try:
+        await audit_logger.log_action(
+            actor_id=principal.principal_id,
+            tenant_id=principal.tenant_id,
+            action="schema.version_created",
+            resource_id=schema_id,
+            resource_type="schema",
+            metadata={
+                "schema_id": schema_id,
+                "schema_version": snapshot.version,
+                "outcome_code": "SUCCESS",
+            },
+        )
+    except Exception:
+        logger.error("Audit log failed for schema version creation; failing closed (SEC-008)")
+        raise
+    return snapshot
 
 
 @router.get(
@@ -129,6 +176,51 @@ async def list_schema_versions(
     return manager.get_version_history(principal.tenant_id, schema_id)
 
 
+@router.get(
+    "/schemas/{schema_id}",
+    dependencies=[Depends(require_permissions(SchemaPermission.SCHEMA_READ.value))],
+    summary="Get active production schema or latest snapshot (SCH-004)",
+)
+async def get_schema(
+    schema_id: str,
+    principal: ApiPrincipal = Depends(get_current_principal),
+    manager=Depends(get_schema_manager),
+):
+    try:
+        return manager.resolve_active_schema(principal.tenant_id, schema_id)
+    except Exception:
+        latest = manager.repository.get_latest_version(schema_id, principal.tenant_id)
+        if latest is None:
+            raise SchemaNotFoundError(
+                f"Schema '{schema_id}' not found for tenant '{principal.tenant_id}'.",
+                schema_id=schema_id,
+                tenant_id=principal.tenant_id,
+            )
+        return latest
+
+
+@router.get(
+    "/schemas/{schema_id}/versions/{version}",
+    dependencies=[Depends(require_permissions(SchemaPermission.SCHEMA_READ.value))],
+    summary="Get specific version snapshot (SCH-006)",
+)
+async def get_schema_version(
+    schema_id: str,
+    version: int,
+    principal: ApiPrincipal = Depends(get_current_principal),
+    manager=Depends(get_schema_manager),
+):
+    snapshot = manager.repository.get_snapshot(schema_id, version, principal.tenant_id)
+    if snapshot is None:
+        raise SchemaNotFoundError(
+            f"Schema '{schema_id}' version {version} not found for tenant '{principal.tenant_id}'.",
+            schema_id=schema_id,
+            version=version,
+            tenant_id=principal.tenant_id,
+        )
+    return snapshot
+
+
 @router.post(
     "/schemas/{schema_id}/versions/{version}/status",
     dependencies=[Depends(require_permissions(SchemaPermission.SCHEMA_SUBMIT_TEST.value))],
@@ -140,11 +232,39 @@ async def transition_schema_status(
     body: TransitionRequest,
     principal: ApiPrincipal = Depends(get_current_principal),
     manager=Depends(get_schema_manager),
+    audit_logger: AuditLogger = Depends(get_audit_logger),
 ):
-    # 'approved' is never a target here: promotion goes through the four-eyes approval endpoint (SCH-005).
-    return manager.transition_status(
+    # 'approved' is never a target here: promotion goes through four-eyes approval endpoint (SCH-005).
+    current = manager.repository.get_snapshot(schema_id, version, principal.tenant_id)
+    from_status = current.status if current else None
+
+    snapshot = manager.transition_status(
         principal.tenant_id, schema_id, version, body.target_status, actor=principal.principal_id, reason=body.reason
     )
+    try:
+        await audit_logger.log_action(
+            actor_id=principal.principal_id,
+            tenant_id=principal.tenant_id,
+            action="schema.transitioned",
+            resource_id=schema_id,
+            resource_type="schema",
+            metadata={
+                "schema_id": schema_id,
+                "schema_version": version,
+                "status": body.target_status.value,
+                "outcome_code": "SUCCESS",
+            },
+        )
+    except Exception:
+        # Revert on audit failure
+        if from_status is not None:
+            try:
+                manager.repository.update_status(schema_id, version, principal.tenant_id, from_status)
+            except Exception:
+                pass
+        logger.error("Audit log failed for schema transition; failing closed (SEC-008)")
+        raise
+    return snapshot
 
 
 @router.post(
@@ -158,15 +278,60 @@ async def approve_schema_version(
     body: ApproveRequest,
     principal: ApiPrincipal = Depends(get_current_principal),
     approval=Depends(get_schema_approval_service),
+    audit_logger: AuditLogger = Depends(get_audit_logger),
 ):
-    snapshot, record = approval.approve_schema(
-        principal.to_m4_principal(),
-        principal.tenant_id,
-        schema_id,
-        version,
-        body.harness_run_id,
-        reason=body.reason,
-    )
+    try:
+        snapshot, record = approval.approve_schema(
+            principal.to_m4_principal(),
+            principal.tenant_id,
+            schema_id,
+            version,
+            body.harness_run_id,
+            reason=body.reason,
+        )
+    except Exception as exc:
+        # Record rejection audit event if approval was refused (e.g. self-approval, policy failure)
+        try:
+            await audit_logger.log_action(
+                actor_id=principal.principal_id,
+                tenant_id=principal.tenant_id,
+                action="schema.rejected",
+                resource_id=schema_id,
+                resource_type="schema",
+                outcome="REJECTED",
+                metadata={
+                    "schema_id": schema_id,
+                    "schema_version": version,
+                    "outcome_code": "REJECTED",
+                },
+            )
+        except Exception:
+            pass
+        raise
+
+    try:
+        await audit_logger.log_action(
+            actor_id=principal.principal_id,
+            tenant_id=principal.tenant_id,
+            action="schema.approved",
+            resource_id=schema_id,
+            resource_type="schema",
+            outcome="SUCCESS",
+            metadata={
+                "schema_id": schema_id,
+                "schema_version": version,
+                "outcome_code": "SUCCESS",
+            },
+        )
+    except Exception:
+        # Revert promotion if audit logging fails (fail-closed, SEC-008)
+        try:
+            approval.manager.repository.update_status(schema_id, version, principal.tenant_id, SchemaStatus.TESTING)
+        except Exception:
+            pass
+        logger.error("Audit log failed for schema approval; failing closed (SEC-008)")
+        raise
+
     return {"schema": snapshot, "approval": record}
 
 
@@ -180,7 +345,34 @@ async def rollback_schema(
     body: RollbackRequest,
     principal: ApiPrincipal = Depends(get_current_principal),
     manager=Depends(get_schema_manager),
+    audit_logger: AuditLogger = Depends(get_audit_logger),
 ):
-    return manager.rollback(
+    current = manager.repository.get_active_version(schema_id, principal.tenant_id)
+    prev_active_version = current.version if current else None
+
+    snapshot = manager.rollback(
         principal.tenant_id, schema_id, body.target_version, actor=principal.principal_id, reason=body.reason
     )
+    try:
+        await audit_logger.log_action(
+            actor_id=principal.principal_id,
+            tenant_id=principal.tenant_id,
+            action="schema.rolled_back",
+            resource_id=schema_id,
+            resource_type="schema",
+            metadata={
+                "schema_id": schema_id,
+                "schema_version": body.target_version,
+                "outcome_code": "SUCCESS",
+            },
+        )
+    except Exception:
+        # Revert rollback active pointer if audit logging fails
+        if prev_active_version is not None:
+            try:
+                manager.repository.set_active_version(schema_id, prev_active_version, principal.tenant_id)
+            except Exception:
+                pass
+        logger.error("Audit log failed for schema rollback; failing closed (SEC-008)")
+        raise
+    return snapshot

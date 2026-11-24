@@ -6,7 +6,14 @@ canonical API-010 error handling, authentication/tenant interfaces, repository a
 durable queue protocols.
 """
 
-from doc_extractor.api.app import create_app
+try:
+    from doc_extractor.api.app import create_app
+except RuntimeError as _err:
+    if "python-multipart" in str(_err):
+        def create_app(*args, **kwargs):  # type: ignore[no-redef]
+            raise RuntimeError('Form data requires "python-multipart" to be installed.')
+    else:
+        raise
 from doc_extractor.api.composition import (
     ApplicationContainer,
     TenantComponentCache,

@@ -1,0 +1,35 @@
+# MinIO S3-compatible object storage for LOCAL DEVELOPMENT and integration tests (Team Member 3, Phase 4A).
+#
+# NOT FOR PRODUCTION: default credentials, no TLS.
+# Development allows http:// and path-style addressing. Production uses customer-controlled private cloud S3 or AWS S3.
+#
+#   docker compose -f deploy/compose/minio.yml up -d --wait
+#   export DOC_API_STORAGE_BACKEND=s3
+#   export DOC_API_S3_BUCKET=doc-extractor
+#   export DOC_API_S3_ENDPOINT_URL=http://localhost:9000
+#   export DOC_API_S3_ACCESS_KEY_ID=minioadmin
+#   export DOC_API_S3_SECRET_ACCESS_KEY=minioadmin
+#
+#   DOC_TEST_S3_ENDPOINT_URL=http://localhost:9000 DOC_TEST_S3_BUCKET=doc-extractor DOC_TEST_S3_ACCESS_KEY=minioadmin DOC_TEST_S3_SECRET_KEY=minioadmin python -m pytest tests/test_storage_s3_integration.py
+#
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-28Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  minio-data:

@@ -270,9 +270,16 @@ Install exactly the components you need (the extras are mirrored by the `require
 | Goal | Command | Installs |
 | --- | --- | --- |
 | Engine + multimodal stack (core) | install PyTorch + torchvision first (below), then `pip install -e .` | Modules A/B/C, schema lifecycle, `instructor`/`litellm`, and the PRD v1.5 section 12.1 multimodal stack: transformers (>=4.57.1), accelerate (>=0.26.0), bitsandbytes (>=0.43.1, skipped on macOS), qwen-vl-utils (==0.0.14) |
-| Development / run the tests | `pip install -e ".[dev]"` | core + pytest, pytest-cov |
+| Test runner only | `pip install -e ".[dev]"` | core + pytest, pytest-cov, httpx (the runner; never a production dependency) |
+| **Complete test environment** (the whole suite, as CI runs it) | `pip install -e ".[dev,api,security,mongo,queue,test]"` | the runner, every production extra the code under test needs, and the **test-only** extra: `fakeredis` (with `redis<8`, the cap fakeredis needs) and the CI scripts' own imports (`packaging`, `tomli` on 3.10) |
 | Demo UI (`doc_extractor.app`) | `pip install -e ".[ui]"` | core + gradio |
+| Security backends | `pip install -e ".[security]"` | core + PyJWT[crypto], cryptography, redis. Required wherever `doc_extractor.api` is imported (it imports `redis` at module level). |
+| MongoDB persistence | `pip install -e ".[mongo]"` | core + pymongo (the asynchronous driver) |
+| Durable message broker | `pip install -e ".[queue]"` | core + aio-pika (the asynchronous AMQP client of the RabbitMQ working baseline; needs MongoDB for job ownership). The broker choice is a candidate, not an approved decision. |
+| **Production deployment** | `pip install ".[api,security,mongo,queue]"` | core + the API stack, the security backends, the MongoDB driver and the AMQP client. No `dev` and no `test`: no pytest, no pytest-cov, no fakeredis (CI job `production-install` proves it). |
 | REST API foundation (`doc_extractor.api`) | `pip install -e ".[api]"` | core + fastapi, starlette, uvicorn, python-multipart. The API tests also need `httpx`, which is in `dev`; without the `api` extra they skip. |
+
+**Test-only packages never reach production.** `pytest`, `pytest-cov`, `fakeredis` (and the CI scripts' `packaging` / `tomli`) are declared only under the `dev` and `test` extras. `redis` is the one package shared with production: the `security` extra keeps it open-ended, and the `test` extra alone caps it below 8 because `fakeredis` does not yet work with redis-py 8. The live-service tests (real Redis, real clamd) deliberately do not use the `test` extra, so they exercise the production `redis`. `tests/test_packaging_consistency.py` fails if a test-only package enters the base installation, a production extra or a production `requirements-*.txt` file, or if a runtime dependency is declared only for tests.
 
 Extras combine, e.g. `pip install -e ".[dev,ui]"`. Without an editable install, use `pip install -r requirements.txt` (core), `requirements-dev.txt`, `requirements-ui.txt`, or `requirements-api.txt`.
 
@@ -377,14 +384,14 @@ extractor = SchemaGuidedExtractor(          # defaults shown
 ### Automated Test Suite
 The repository includes unit, regression, integration and end-to-end test coverage across Modules A, B and C, the schema lifecycle, OCR backends, multipage multimodal extraction (with a faked model call) and the DOC-01/02/03 launch types.
 
-**Mandatory tests and CI.** Tests that need an optional component skip with a visible reason, so a developer without it still gets a green run. In the CI job that must prove the API and tenant-isolation tests ran, `DOC_FAIL_ON_SKIP=1` turns **any** skip into a failure, including a missing dependency skipped at collection (`tests/skip_policy.py`). `.github/workflows/ci.yml` runs on Python 3.11 and 3.14: a mandatory `api-and-security` job (real `pip install -e ".[dev,api]"`, `scripts/ci/check_api_extra.py`, the strict test run, and a junit re-check of zero skips) and a `full-suite` job where only the optional OCR and live-model tests may skip. Run the same thing locally with `DOC_FAIL_ON_SKIP=1 pytest tests/test_api_*.py tests/test_tenant_isolation.py tests/test_exception_base_identity.py tests/test_packaging_consistency.py tests/test_ci_policy.py`. Without the `api` extra the suite still passes (the API modules skip with a reason; the storage-side tenant-isolation tests always run).
+**Mandatory tests and CI.** Tests that need an optional component skip with a visible reason, so a developer without it still gets a green run. In the CI job that must prove the API and tenant-isolation tests ran, `DOC_FAIL_ON_SKIP=1` turns **any** skip into a failure, including a missing dependency skipped at collection (`tests/skip_policy.py`). `.github/workflows/ci.yml` runs on Python 3.11 and 3.14: a mandatory `api-and-security` job (real `pip install -e ".[dev,api]"`, `scripts/ci/check_api_extra.py`, the strict test run, and a junit re-check of zero skips) and a `full-suite` job where only the optional OCR and live-model tests may skip. Four further jobs install exactly the extras they exercise (a fifth, `queue-integration`, runs a real RabbitMQ, MongoDB replica set and Redis): `production-install` (only `api,security,mongo,queue`, non-editable, then `scripts/ci/check_production_install.py`), `mongo-integration` (a real replica set) and `live-services` (a real Redis and clamd); neither of the last two installs the `test` extra. Run the same thing locally with `DOC_FAIL_ON_SKIP=1 pytest tests/test_api_*.py tests/test_tenant_isolation.py tests/test_exception_base_identity.py tests/test_packaging_consistency.py tests/test_ci_policy.py`. Without the `api` extra the suite still passes (the API modules skip with a reason; the storage-side tenant-isolation tests always run).
 
 **Earlier result (M5 API foundation before the document and review-task routes; Python 3.11 and 3.14, `api` extra installed, no OCR extra):** 1451 tests collected; 1450 pass, 3 skipped (the opt-in live Ollama test and the two optional-OCR test modules, which skip as a whole). Without the `api` extra: 1075 pass, 18 skipped, 0 failed.
 
 **Earlier result (Phase 1 on PRD v1.5, before the API foundation):** 915 tests collected. That count predates the removal of the Tesseract backend. The suite runs without a GPU, torch or model weights. The Qwen-VL runtime (`vlm_runtime.py`) and the OCR + text adapter are covered with fakes; real Qwen-VL / GLM-OCR / GPU behaviour is not covered by any automated test.
 
 ```bash
-pip install -e ".[dev]"      # test dependencies
+pip install -e ".[dev,api,security,mongo,queue,test]"      # the complete test environment (see the install table)
 pytest                       # default run: everything except the opt-in live test (reported as skipped)
 pytest -rs                   # same, and print why tests were skipped
 pytest --cov=src --cov-branch --cov-report=term-missing   # coverage
@@ -406,6 +413,7 @@ Tests mock the OCR and model layers. Initialization of `ModuleBPipeline(storage)
 | `Document_Extraction_Engine_PRD.md` | **Authoritative PRD v1.5** (router-and-specialist architecture, six-layer IDP capability alignment, `[x1, y1, x2, y2]` box contract). |
 | `docs/m5-open-decisions.md` | Register of every open decision the REST API depends on (M5-D01 to M5-D18, M2D-D01 to M2D-D06), each route's provisional behaviour and limitations, and the release acceptance notes. |
 | `docs/m5-api-ownership.md` | Who owns each API record, port and queue type, and what depends on Team Member 3. |
+| `docs/team3-mongodb-foundation.md` | MongoDB foundation (Team Member 3, Phase 2A): configuration, lifecycle, indexes, what the tests prove and what is not done yet. |
 | `docs/prd-versions/` | Archived PRD revisions (v1.0 original PDF, v1.3, v1.4) and their index. |
 | `docs/kaggle/README.md` | How to run the demo notebook on a Kaggle T4, the `DOC_*` settings and troubleshooting. |
 | `docs/model_cost_evaluation.xlsx` | Model / cost evaluation workbook for the routed specialists. |

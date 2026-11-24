@@ -231,6 +231,7 @@ class WebhookSubscriptionRecord(TenantBoundModel):
     target_url: str = Field(..., min_length=1, description="Destination HTTPS webhook endpoint")
     event_types: List[str] = Field(..., min_length=1, description="List of subscribed event patterns")
     secret_hash: str = Field(..., description="Hash of webhook signing secret")
+    secret_ref: Optional[str] = Field(default=None, description="Secret reference identifier")
     is_active: bool = Field(default=True, description="Whether subscription is enabled")
     created_at: datetime = Field(default_factory=utc_now, description="Creation timestamp")
     updated_at: datetime = Field(default_factory=utc_now, description="Last update timestamp")

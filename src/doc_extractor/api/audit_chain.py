@@ -41,6 +41,10 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+# Public name for adapters (the MongoDB audit repository) that must store the EXACT text that was hashed. The format is unchanged.
+canonical_json = _canonical_json
+
+
 def compute_event_hash(prev_hash: str, seq: int, event: Dict[str, Any]) -> str:
     """SHA-256 over the previous hash, the sequence number and the canonical event JSON."""
     material = f"{prev_hash}|{seq}|{_canonical_json(event)}".encode("utf-8")

@@ -31,7 +31,7 @@ then to `DocumentResource`. Do not reintroduce a parallel API record.
 | Durability | None: in-memory, development only, lost on restart | Required: survives restarts, redelivery with lease and `ack`/`nack`, dead-letter |
 | Who produces | `ModuleAPipeline` | The API after accepting an upload |
 | Who consumes | Module B | A worker, which then reads the persisted hand-off **by document id** |
-| Adapter | `LocalMemoryQueueAdapter` | None yet (broker choice: Team Member 3) |
+| Adapter | `LocalMemoryQueueAdapter` | `RabbitMQQueue` (`infrastructure/queue/`, Phase 3), a working baseline over RabbitMQ quorum queues with job ownership in a MongoDB lease store; the broker choice is NOT approved and queue isolation (shared versus per-tenant queues) is open |
 
 A job message never embeds a hand-off, page image or extracted content. Do not add a third queue abstraction.
 
