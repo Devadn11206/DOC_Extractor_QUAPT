@@ -1,4 +1,5 @@
-# Development & test dependencies (mirrors the 'dev' extra in pyproject.toml).
+# Test-runner tooling (mirrors the 'dev' extra in pyproject.toml): never imported by src/, never a production dependency.
+# The test-only substitutes (fakeredis, ...) are in requirements-test.txt.
 -r requirements.txt
 
 pytest>=7.0.0

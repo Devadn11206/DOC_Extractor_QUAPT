@@ -185,8 +185,10 @@ class DefaultSchemaAuthorizer:
     def __init__(
         self,
         trusted_principals: Optional[Dict[str, AuthenticatedPrincipal]] = None,
+        trust_authenticated_boundary: bool = False,
     ) -> None:
         self._trusted_principals: Dict[str, AuthenticatedPrincipal] = dict(trusted_principals or {})
+        self._trust_authenticated_boundary: bool = trust_authenticated_boundary
 
     def register_principal(self, principal: AuthenticatedPrincipal) -> None:
         """Registers a principal in the trusted authorizer boundary."""
@@ -224,11 +226,13 @@ class DefaultSchemaAuthorizer:
 
         trusted_record = self._trusted_principals.get(principal.principal_id)
         if trusted_record is None:
-            return AuthorizationDecision(
-                is_authorized=False,
-                reason=f"Principal '{principal.principal_id}' is not registered in the trusted authentication boundary.",
-                code="UNAUTHENTICATED",
-            )
+            if not self._trust_authenticated_boundary:
+                return AuthorizationDecision(
+                    is_authorized=False,
+                    reason=f"Principal '{principal.principal_id}' is not registered in the trusted authentication boundary.",
+                    code="UNAUTHENTICATED",
+                )
+            trusted_record = principal
 
         # Detect forged or tampered credentials between caller-supplied principal and authoritative record
         if (
@@ -300,3 +304,16 @@ class DefaultSchemaAuthorizer:
             reason=f"Permission '{permission.value}' granted to principal '{auth_principal.principal_id}'.",
             code="AUTHORIZED",
         )
+
+
+class ProductionSchemaAuthorizer(DefaultSchemaAuthorizer):
+    """
+    Authoritative SchemaAuthorizer for production API execution (Phase 5A / 5B).
+    Directly evaluates principals verified by the trusted identity and authentication boundary.
+    """
+
+    def __init__(
+        self,
+        trusted_principals: Optional[Dict[str, AuthenticatedPrincipal]] = None,
+    ) -> None:
+        super().__init__(trusted_principals=trusted_principals, trust_authenticated_boundary=True)

@@ -1,0 +1,4 @@
+# Optional: MongoDB persistence (mirrors the 'mongo' extra in pyproject.toml). The driver is imported only when a connection is made.
+-r requirements.txt
+
+pymongo>=4.13.0,<5.0.0

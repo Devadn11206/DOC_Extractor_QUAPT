@@ -1,0 +1,7 @@
+# Optional: RS256 access tokens and Redis locks (mirrors the 'security' extra in pyproject.toml). Test-only packages are in
+# requirements-test.txt and are never part of this production list.
+-r requirements.txt
+
+PyJWT[crypto]>=2.8.0
+cryptography>=42.0.0
+redis>=5.0.0

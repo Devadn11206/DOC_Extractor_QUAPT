@@ -147,7 +147,7 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **PRD reference.** PRD 7.1 (webhooks); API-008.
 - **Options.** A) a secret-manager reference. B) store the secret encrypted. **Plan's recommendation.** A (replace the field before any adapter exists).
 - **Owner.** Team Member 3, PRD owner. **Blocks.** S8. **Status.** Open. **Resolution.** none.
-- **In the code.** Flagged on `WebhookSubscriptionRecord`; no adapter or endpoint exists.
+- **In the code.** `WebhookSubscriptionRecord` preserves `secret_hash` (for integrity verification / deduplication) and introduces `secret_ref: Optional[str] = Field(default=None)` for secret manager / vault integration. Plaintext secrets are never stored in the database; `WebhookSecretResolver` interface resolves `secret_ref` dynamically at signing time (`src/doc_extractor/infrastructure/webhook/security.py`). Decision M5-D09 remains **Open** until the organization approves the production secret manager provider integration (e.g. AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager).
 
 ### M5-D10 Synchronous extraction timeout
 
@@ -181,6 +181,7 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **Options.** A) keep for now. B) per-tenant opt-in once confidence is calibrated.
 - **Plan's recommendation.** A. Do not invent a confidence proxy.
 - **Owner.** PRD owner (product). **Blocks.** S5, S7. **Status.** Open. **Resolution.** none.
+- **Phase 5B schema governance note (Team Member 3):** Four-eyes schema approval (`SchemaApprovalService`) strictly enforces human four-eyes approval (`author != approver`) with mandatory MFA and verified benchmark harness reports. Automatic approval of schemas is prohibited; auto-approval policy for document processing remains **Open** under M5-D12.
 
 ### M5-D13 Role vocabulary in tests
 
@@ -189,6 +190,7 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **PRD reference.** PRD section 15.5; SEC-003.
 - **Options.** Use the PRD and M4 roles. **Owner.** Team Member 2. **Blocks.** none (fixture edits only).
 - **Status.** Open (deliberately not changed in the hardening pass, to keep it minimal). **Resolution.** none.
+- **Phase 5B RBAC note (Team Member 3):** Strict canonical 7-role RBAC enforcement (`analyst`, `reviewer`, `schema_author`, `schema_approver`, `integrator`, `auditor`, `admin`) per SEC-003 and PRD section 15.5 is enforced across all schema lifecycle routes and authorizers (`ProductionSchemaAuthorizer`). Legacy route test fixtures using back-office roles remain isolated and M5-D13 remains **Open** for Team Member 2.
 
 ### M5-D14 Split of Module A `process_document`
 
@@ -207,12 +209,16 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **Description.** Whether a best-effort sink (`SafeStructuredAuditLogger`, which swallows its write failures) may back
   operations that are specified as mandatory audit, or whether those must refuse to run unless the configured logger
   raises on failure. Raised by the independent review (finding R7). Today the service is written to fail closed but only a
-  logger that raises makes that effective, and the only logger shipped is best-effort.
+  logger that raises makes that effective, and the only logger shipped is best-effort. Furthermore, in Phase 4C, signed
+  checkpoints and an external immutable sink (`S3ObjectLockCheckpointSink`) are introduced; whether checkpoint creation
+  runs synchronously blocking write operations or asynchronously via an event worker pending sink availability is also
+  governed by this policy.
 - **PRD reference.** SEC-008; SEC-012.
 - **Options.** A) refuse to build the service with a sink that declares `propagates_failures = False`. B) allow it with a
   warning (current behaviour). **Plan's recommendation.** none yet.
 - **Owner.** Team Member 3, PRD owner. **Blocks.** S10 (API-key router), S7, S9. **Status.** Open. **Resolution.** none.
-- **In the code.** Option B: `ApiKeyService` logs a warning; documented in `docs/m5-api-ownership.md`.
+- **In the code.** Option B: `ApiKeyService` logs a warning; documented in `docs/m5-api-ownership.md`. Phase 4C signed
+  checkpoints (`src/doc_extractor/infrastructure/audit/`) implement fail-closed sinks but preserve M5-D15 as Open.
 
 ### M5-D16 Tenant-ID policy
 
@@ -221,7 +227,7 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
   directory, and stores non-simple identifiers under `h+<hash>` with an identity marker.
 - **PRD reference.** SEC-006; SEC-001.
 - **Options.** Owned by identity provisioning. **Owner.** Team Member 3. **Blocks.** S4, S5. **Status.** Open. **Resolution.** none.
-- **In the code.** `src/doc_extractor/tenancy.py`; `docs/m5-api-ownership.md` (tenant isolation contract).
+- **In the code.** `src/doc_extractor/tenancy.py`; `docs/m5-api-ownership.md` (tenant isolation contract). Phase 5C tenant provisioning (`src/doc_extractor/infrastructure/tenancy/service.py`) enforces strict path-safe validation (`require_path_safe_tenant_id`) refusing characters that could escape directories or cause ambiguity (`..`, `/`, `\`, null bytes, control characters, unprintable Unicode). Non-destructive identity handling preserves original tenant IDs. Decision M5-D16 remains **Open** pending global consensus on case-folding / Unicode normalization standards.
 
 ### M5-D17 Tenant provisioning
 
@@ -230,7 +236,7 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
   tenant must exist beforehand (explicit provisioning) is not decided.
 - **PRD reference.** SEC-006; PRD 15.5.
 - **Owner.** Team Member 3. **Blocks.** S4, S5. **Status.** Open. **Resolution.** none.
-- **In the code.** `TenantDirectoryResolver.resolve(create=...)`; `tests/test_storage_read_write_separation.py`.
+- **In the code.** `TenantDirectoryResolver.resolve(create=...)`; `tests/test_storage_read_write_separation.py`. Phase 5C implements explicit administrative provisioning via `TenantProvisioningService` (`src/doc_extractor/infrastructure/tenancy/service.py`) gated by `admin` role and verified MFA (`mfa_verified=True`) with fail-closed audit recording. Prevents implicit creation on unverified writes. Decision M5-D17 remains **Open** pending finalization of whether multi-tenant SaaS self-signup workflows or customer API keys may auto-provision tenants.
 
 ### M5-D18 One persistence interface for the document record
 
@@ -245,6 +251,8 @@ recommendation** (a recommendation, not a decision), **Owner**, **Blocks**, **St
 - **PRD reference.** PRD section 20; OQ-DOCX-05 (store choice).
 - **Owner.** Team Member 2 and Team Member 3. **Blocks.** S4, S5. **Status.** Open. **Resolution.** none.
 - **In the code.** `doc_extractor/storage.py`, `doc_extractor/api/ports/repositories.py`; `docs/m5-api-ownership.md`.
+- **Phase 4A object storage note (Team Member 3):** `S3Storage` implements `StorageBackend` including `save_document_record` and `get_document_record`. However, `DocumentReadService` in Team 2's API implementation utilizes descriptor-relative directory operations (`openat`) on local disk. When `storage_backend == "s3"`, `get_document_read_service` fails closed with `TenantStorageUnavailableError("document_read_service_requires_local_disk_storage")`. Resolving this requires closing M5-D18 (routing document record queries through `DocumentMetadataRepository` and retrieving page images via presigned URLs or gateway streams). Decision M5-D18 remains **Open**.
+- **Phase 4B envelope encryption & spooling security note (Team Member 3):** `S3Storage` implements AES-256-GCM envelope encryption protecting stored objects in S3. However, callers invoking `resolve_uri_to_path()` require local disk spooling to supply a filesystem path for legacy file descriptor readers (`SecureModuleBLoader`). Spool files are restricted to permissions 0700/0600 and isolated by tenant, with explicit cleanup. Full SEC-005 compliance across unencrypted host disks requires eliminating disk spooling in favor of in-memory streaming descriptors (blocked on M5-D18) or verifying host volume encryption (`DOC_API_SPOOL_IS_PROTECTED=true`). Decision M5-D18 remains **Open**.
 
 ---
 

@@ -11,7 +11,7 @@ Enforces:
 from pathlib import Path
 import re
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from doc_extractor.exceptions import ConfigurationError
 
 
@@ -87,9 +87,29 @@ class Settings(BaseModel):
         default=True,
         description="Enforce pre-processing malware scanning",
     )
-    malware_scanner_type: str = Field(
-        default="mock",
-        description="Scanner backend (mock, clamav_socket, offline_bundle)",
+    malware_scanner_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "Scanner backend. Unset resolves to 'mock' in development and 'clamav_socket' elsewhere (FR-ING-003, SEC-009). "
+            "'mock' is refused outside development."
+        ),
+    )
+    malware_clamav_address: Optional[str] = Field(
+        default=None,
+        description="clamd socket: a Unix socket path or host:port inside the deployment boundary (SEC-009)",
+    )
+    redis_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Redis URL for idempotency and distributed locks across replicas (ARC-003, NFR-006). "
+            "Unset means single-process local state."
+        ),
+    )
+    malware_scan_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=300,
+        description="Socket timeout for one clamd request (fail closed when exceeded)",
     )
 
     # Module B OCR / layout parser backend (FR-PRS-001, FR-PRS-005, ARC-002)
@@ -130,6 +150,17 @@ class Settings(BaseModel):
         gt=0.0,
         description="Local inference request timeout in seconds",
     )
+
+    @model_validator(mode="after")
+    def resolve_and_validate_scanner(self):
+        """FR-ING-003, SEC-009: resolve the scanner from the environment, and refuse the mock outside development."""
+        if self.malware_scanner_type is None:
+            self.malware_scanner_type = "mock" if self.app_env == "development" else "clamav_socket"
+        if self.malware_scanner_type.strip().lower() == "mock" and self.app_env != "development":
+            raise ValueError(
+                f"malware_scanner_type='mock' is refused in app_env='{self.app_env}': use 'clamav_socket' (SEC-009)."
+            )
+        return self
 
     @field_validator("allow_external_egress")
     @classmethod

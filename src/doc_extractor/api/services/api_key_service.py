@@ -61,11 +61,12 @@ class ApiKeyService:
         # so the service cannot silently run unaudited.
         if audit_logger is None:
             raise ConfigurationError("ApiKeyService requires an audit logger: key creation and revocation are mandatory-audit operations.")
+        # SEC-008: a best-effort sink cannot back a mandatory audit. Refuse it rather than run unaudited.
         if getattr(audit_logger, "propagates_failures", None) is False:
-            logger.warning(
-                "ApiKeyService is configured with a best-effort audit sink (%s): a failed audit write is NOT reported, so key "
-                "creation and revocation are not fail-closed and not durably audited. Configure a logger that raises on failure.",
-                type(audit_logger).__name__,
+            raise ConfigurationError(
+                "ApiKeyService refuses a best-effort audit sink (%s): key creation and revocation must fail closed when the "
+                "audit write fails. Configure a logger that raises on failure, such as DurableAuditLogger."
+                % type(audit_logger).__name__,
             )
         self._repository = repository
         self._audit_logger = audit_logger

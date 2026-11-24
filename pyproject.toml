@@ -44,6 +44,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# TEST-RUNNER tooling (never imported by src/). A complete test environment is ".[dev,api,security,mongo,queue,test]": 'dev' is the
+# runner, 'test' the test-only substitutes and CI-script tooling, and the production extras the code under test. See README.
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -58,6 +60,40 @@ api = [
     "anyio>=3.4.0",           # imported directly by the upload guard (already required by every supported starlette)
     "uvicorn>=0.22.0,<1.0.0",
     "python-multipart>=0.0.9",
+]
+# Security and state backends (SEC-002 RS256 tokens, ARC-003 Redis locks). Needed by the API in production and by
+# its security tests. Kept apart from 'api' so the API stack stays exactly the documented set. NOTE: importing the API package
+# (doc_extractor.api) imports redis at module level, so any environment that imports it needs 'security' as well as 'api'.
+security = [
+    "PyJWT[crypto]>=2.8.0",   # RS256 access-token verification, doc_extractor.api.providers.jwt_auth
+    "cryptography>=42.0.0",   # RSA key parsing for the JWT provider (imported directly)
+    "redis>=5.0.0",           # distributed locks and idempotency, doc_extractor.distributed_state
+]
+# MongoDB persistence (Team Member 3): the asynchronous driver. Imported only when a connection is made, so the rest of the
+# application runs without it. Needed in staging and production once a MongoDB deployment is configured.
+mongo = [
+    "pymongo>=4.13.0,<5.0.0",  # AsyncMongoClient (generally available from 4.13)
+]
+# Durable message broker (Team Member 3, Phase 3): the asynchronous AMQP client of the RabbitMQ baseline (a candidate, not an approved
+# decision). Imported only when a broker connection is made (doc_extractor.infrastructure.queue.transport), so the rest of the
+# application runs without it. Needed in staging and production once a broker is configured.
+queue = [
+    "aio-pika>=9.4.0,<10.0.0",  # robust (auto-reconnecting) connections, publisher confirms, quorum queues
+]
+# S3-compatible object storage (Team Member 3, Phase 4A). Imported only when an S3 storage backend is instantiated
+# (doc_extractor.infrastructure.storage.adapter), so the rest of the application runs without it.
+storage = [
+    "boto3>=1.28.0",
+    "botocore>=1.31.0",
+    "cryptography>=42.0.0",
+]
+# TEST-ONLY packages that must never be part of a production install. fakeredis stands in for Redis in unit tests. The live-service
+# tests (real Redis, real clamd) deliberately do NOT use this extra: they run against the production redis bound.
+test = [
+    "fakeredis>=2.20.0",      # in-process Redis for the distributed-state and rate-limit tests
+    "redis>=5.0.0,<8",        # test environments only: fakeredis 2.40 fails against redis-py 8.x (production stays unbounded)
+    "packaging>=21.0",        # imported directly by scripts/ci/check_api_extra.py and check_production_install.py (not left to chance)
+    "tomli>=2.0.0; python_version < '3.11'",   # tomllib backport for the packaging tests and CI scripts on Python 3.10
 ]
 # Interactive demo UI (doc_extractor.app). Not needed by the engine.
 ui = [

@@ -145,13 +145,15 @@ class TenantDirectoryResolver:
 
     def _decide(self, tenant_id: str) -> str:
         key = tenant_storage_key(tenant_id)
-        entries = self._entries()
         if key == tenant_id:                                   # plain key: the directory is named exactly like the tenant
-            if key not in entries and os.path.lexists(self.base_dir / key):
+            # Check the name first, then take the listing. A concurrent creator that makes the directory between a
+            # listing and this check would otherwise look like an alias of another directory.
+            if os.path.lexists(self.base_dir / key) and key not in self._entries():
                 # The name exists although no entry is spelled exactly like it: a case/Unicode alias of
                 # ANOTHER directory on a case- or normalization-insensitive filesystem. Never share it.
                 raise _isolation("directory_alias_collision")
             return key
+        entries = self._entries()
         legacy_ok = (
             tenant_id in entries
             and not tenant_id.startswith((HASHED_KEY_PREFIX, "."))     # never adopt another tenant's hashed dir or a temp dir

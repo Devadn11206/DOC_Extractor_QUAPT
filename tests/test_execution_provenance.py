@@ -147,10 +147,13 @@ def test_genuine_llm_via_instructor_mocking(doc_01_payload, valid_casa_model, mo
     import instructor
     monkeypatch.setattr(instructor, "from_litellm", lambda completion_fn, *args, **kwargs: mock_client)
 
+    # The endpoint must be verifiably local: litellm would otherwise reach the provider's public endpoint, which the
+    # egress policy refuses (SEC-011). Loopback is always permitted.
     extractor = SchemaGuidedExtractor(
         model_name="Qwen2.5-7B-Instruct",
         use_llm=True,
         allow_fallback=True,
+        api_base="http://localhost:8000/v1",
     )
 
     result = extractor.extract_with_provenance(doc_01_payload)

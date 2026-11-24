@@ -898,6 +898,14 @@ class SchemaGuidedExtractor:
         response_mode = (
             instructor.Mode.JSON if is_ollama else instructor.Mode.TOOLS
         )
+        # SEC-011 / ARC-001: litellm reaches the endpoint it is given. With no api_base it falls back to the provider's
+        # public endpoint, so only an endpoint that the egress policy permits may be used (Ollama defaults to loopback).
+        from doc_extractor.egress import EgressDeniedError, EgressPolicy
+
+        endpoint = self.api_base or ("http://localhost:11434" if is_ollama else None)
+        if endpoint is None:
+            raise EgressDeniedError(purpose="litellm_extraction")
+        EgressPolicy.from_environment().check_url(endpoint, purpose="litellm_extraction")
         client = instructor.from_litellm(
             litellm.completion,
             mode=response_mode,
@@ -1298,6 +1306,10 @@ class SchemaGuidedExtractor:
         }
 
         url = f"{api_base.rstrip('/')}/chat/completions"
+        # SEC-011 / ARC-001: default deny. The endpoint may be loopback or an allow-listed internal host only.
+        from doc_extractor.egress import EgressPolicy
+
+        EgressPolicy.from_environment().check_url(url, purpose="vllm_extraction")
         req = urllib.request.Request(
             url,
             data=json.dumps(req_body).encode("utf-8"),

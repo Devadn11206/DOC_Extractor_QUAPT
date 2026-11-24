@@ -1,0 +1,9 @@
+# TEST-ONLY packages (mirrors the 'test' extra in pyproject.toml). Never install these in a production image.
+# A complete test environment also needs the runner (requirements-dev.txt) and the production extras under test:
+#   pip install -r requirements-dev.txt -r requirements-api.txt -r requirements-security.txt -r requirements-mongo.txt -r requirements-queue.txt -r requirements-test.txt
+-r requirements.txt
+
+fakeredis>=2.20.0
+redis>=5.0.0,<8        # test environments only: fakeredis 2.40 fails against redis-py 8.x
+packaging>=21.0         # imported directly by the CI scripts (scripts/ci/)
+tomli>=2.0.0; python_version < '3.11'   # tomllib backport on Python 3.10

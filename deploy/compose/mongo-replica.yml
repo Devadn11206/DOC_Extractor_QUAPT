@@ -1,0 +1,36 @@
+# Single-node MongoDB 8.0 REPLICA SET for LOCAL DEVELOPMENT and integration tests (Team Member 3, Phase 2A).
+#
+# NOT FOR PRODUCTION: no authentication, no TLS, one node. It exists because the application requires a replica set
+# (transactions, majority concerns) even where only one node runs. Production uses the deployment profile's own MongoDB
+# (the connection string policy in doc_extractor.infrastructure.mongo.settings requires TLS, authentication and a replica set).
+#
+#   docker compose -f deploy/compose/mongo-replica.yml up -d --wait
+#   export DOC_API_ENV=development
+#   export DOC_API_MONGO_URI='mongodb://localhost:27017/?replicaSet=rs0'
+#   export DOC_API_MONGO_DATABASE=doc_extractor
+#
+#   DOC_TEST_MONGO_URI='mongodb://localhost:27017/?replicaSet=rs0' python -m pytest tests/test_mongo_integration.py
+#
+# The port is published on the loopback interface only. The health check initiates the replica set the first time.
+services:
+  mongo:
+    image: mongo:8.0
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "try { rs.status().ok } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:27017'}]}).ok }"
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  mongo-data:
