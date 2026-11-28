@@ -11,6 +11,16 @@ A laptop without an NVIDIA GPU cannot run the models at a usable speed, so use o
 
 **Data:** with option A, pages are sent to the GPU server. Use made-up documents unless the data policy approves the server.
 
+## Quick start: one script
+
+After step 2 (get the code), run this in the project folder. It installs everything, asks for the server addresses and key once (saved in `server.env`, never uploaded), checks the server and opens the app:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File run_app.ps1
+```
+
+The steps below do the same thing by hand.
+
 ## 1. Install uv (once)
 
 Open **PowerShell** and run:

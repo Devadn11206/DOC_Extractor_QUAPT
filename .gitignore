@@ -60,3 +60,6 @@ tmp/
 
 # vLLM server logs and process ids (scripts/serve_vllm.py)
 vllm-logs/
+
+# Local server addresses and key for run_app.ps1
+server.env
