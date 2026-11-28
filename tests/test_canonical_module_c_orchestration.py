@@ -358,14 +358,14 @@ def test_out_of_grid_bbox_is_treated_as_ungrounded(casa_run, monkeypatch):
 
 
 # ----------------------------------------------------------------------------
-# 4. Text (Ollama) extraction stays available behind the same interface
+# 4. Text (vLLM) extraction stays available behind the same interface
 # ----------------------------------------------------------------------------
 
 def test_multimodal_is_inferred_from_the_model():
     assert SchemaGuidedExtractor().multimodal is True
     assert SchemaGuidedExtractor(model_name="Qwen/Qwen2.5-VL-7B-Instruct").multimodal is True
-    assert SchemaGuidedExtractor.for_local_ollama().multimodal is False
-    assert SchemaGuidedExtractor(model_name="Qwen2.5-7B-Instruct").multimodal is False
+    assert SchemaGuidedExtractor.for_vllm().multimodal is False
+    assert SchemaGuidedExtractor(model_name="Qwen3-4B-Instruct-2507").multimodal is False
     assert SchemaGuidedExtractor(model_name=VLM_MODEL, multimodal=False).multimodal is False
 
 
@@ -381,7 +381,7 @@ def test_text_extractor_ignores_page_images_and_never_calls_the_vlm(casa_run, mo
         return {"applicant": {"full_name": "BANK ACCOUNT OPENING FORM"}}, "req-text-1"
 
     extractor = SchemaGuidedExtractor(
-        model_name="ollama/qwen2.5:7b-instruct", use_llm=True, allow_fallback=False, llm_caller=text_caller
+        model_name="Qwen/Qwen3-4B-Instruct-2507", use_llm=True, allow_fallback=False, llm_caller=text_caller
     )
     env = ModuleCPipeline(extractor=extractor).process(casa_run["payload"], page_images=casa_run["page_images"])
 
@@ -406,7 +406,7 @@ def test_fallback_extractor_runs_when_primary_vlm_fails(casa_run, monkeypatch):
 
     primary = SchemaGuidedExtractor(model_name=VLM_MODEL, use_llm=True, allow_fallback=False)
     fallback = SchemaGuidedExtractor(
-        model_name="ollama/qwen2.5:7b-instruct", use_llm=True, allow_fallback=False, llm_caller=text_caller
+        model_name="Qwen/Qwen3-4B-Instruct-2507", use_llm=True, allow_fallback=False, llm_caller=text_caller
     )
     env = ModuleCPipeline(extractor=primary, fallback_extractor=fallback).process(
         casa_run["payload"], page_images=casa_run["page_images"]

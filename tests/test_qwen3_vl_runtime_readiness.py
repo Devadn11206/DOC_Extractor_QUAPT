@@ -247,7 +247,7 @@ def test_too_old_transformers_is_rejected_even_if_a_class_exists():
 
 
 @pytest.mark.parametrize("checkpoint", [
-    "meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-7B-Instruct", "Qwen/Qwen3-VL-30B-A3B-Instruct", "", "mock",
+    "meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-VL-30B-A3B-Instruct", "", "mock",
 ])
 def test_unsupported_checkpoints_are_rejected_not_guessed(checkpoint):
     with pytest.raises(rt.VLMRuntimeError) as exc:

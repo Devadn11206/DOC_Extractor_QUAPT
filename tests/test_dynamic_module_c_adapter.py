@@ -248,7 +248,7 @@ def test_end_to_end_extraction_testing_schema(lifecycle_manager, sample_payload)
         return data, "req_end_to_end_123"
 
     extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=False,
         llm_caller=mock_caller,
@@ -565,7 +565,7 @@ def test_strict_no_fallback_behavior(lifecycle_manager, sample_payload):
         raise ConnectionResetError("Provider network connection reset")
 
     extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=False,
         llm_caller=failing_caller,

@@ -11,8 +11,15 @@ Enforces:
 from pathlib import Path
 import re
 from typing import List, Literal, Optional
+import urllib.parse
 from pydantic import BaseModel, Field, field_validator
 from doc_extractor.exceptions import ConfigurationError
+from doc_extractor.vllm_client import is_private_host
+
+
+# Text model served by vLLM for the settings-driven extraction path (text only, non-thinking).
+DEFAULT_LLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+DEFAULT_LLM_API_BASE = "http://localhost:8000/v1"
 
 
 class Settings(BaseModel):
@@ -106,16 +113,16 @@ class Settings(BaseModel):
 
     # Local LLM Extraction Configuration (Module C / PRD ARC-004, ARC-005)
     llm_model_name: str = Field(
-        default="ollama/qwen2.5:7b-instruct",
-        description="Target local extraction model identifier (e.g. 'ollama/qwen2.5:7b-instruct')",
+        default=DEFAULT_LLM_MODEL,
+        description="Model id as served by vLLM (the `vllm serve <model>` name)",
     )
     llm_api_base: str = Field(
-        default="http://localhost:11434",
-        description="Local model server base URL (Ollama or vLLM loopback endpoint)",
+        default=DEFAULT_LLM_API_BASE,
+        description="vLLM OpenAI-compatible base URL; a public host needs https and VLLM_API_KEY",
     )
     llm_provider: str = Field(
-        default="ollama",
-        description="Local LLM provider backend ('ollama' or 'vllm')",
+        default="vllm",
+        description="LLM serving backend ('vllm')",
     )
     llm_use_inference: bool = Field(
         default=False,
@@ -126,7 +133,7 @@ class Settings(BaseModel):
         description="Strict no-fallback policy: fail closed if LLM extraction fails",
     )
     llm_timeout_seconds: float = Field(
-        default=30.0,
+        default=120.0,
         gt=0.0,
         description="Local inference request timeout in seconds",
     )
@@ -162,6 +169,9 @@ class Settings(BaseModel):
                 f"Configured llm_api_base '{v}' targets a public cloud provider, "
                 "violating on-prem zero-egress policy (ARC-001, SEC-011)."
             )
+        parts = urllib.parse.urlsplit(v_clean)
+        if parts.scheme == "http" and parts.hostname and not is_private_host(parts.hostname):
+            raise ValueError(f"Configured llm_api_base host '{parts.hostname}' is public: use https.")
         return v
 
     @field_validator("target_render_dpi")

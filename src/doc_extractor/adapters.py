@@ -10,6 +10,8 @@ different kind of model without changing the app:
                    text to the schema (for example GLM-OCR + Qwen3-4B-Instruct-2507). The text LLM cannot see the
                    page, so checkboxes and character grids should stay on the VLM route.
 
+Each model runs on a vLLM server when its base URL is set (see ``vllm_client``), otherwise in-process.
+
 OCRTextAdapter is UNTESTED against the real models: it follows the published model-card usage and
 needs a GPU run (Kaggle) to confirm. The OCR step gives no coordinates, so values from this route
 carry no evidence box (grounded=False) and the app flags them for review.
@@ -22,6 +24,7 @@ import re
 import threading
 from typing import Any, Dict, Optional, Tuple
 
+from doc_extractor import vllm_client
 from doc_extractor.contracts_c import ExecutionMode, ExecutionProvenance
 from doc_extractor.extractor import (
     attach_field_confidence,
@@ -157,6 +160,14 @@ class OCRTextAdapter(ModelAdapter):
     # -- steps -----------------------------------------------------------
     def read_text(self, image_path: str) -> str:
         """Step 1: OCR model turns the page image into text."""
+        api_base = vllm_client.endpoint("ocr")
+        if api_base:
+            content = [vllm_client.image_part(load_capped_image(image_path)), {"type": "text", "text": OCR_PROMPT}]
+            text, _ = vllm_client.chat(
+                api_base, self.ocr_model, [{"role": "user", "content": content}], self.max_ocr_tokens
+            )
+            return text.strip()
+
         import torch
 
         model, proc = self._load_ocr()
@@ -177,9 +188,6 @@ class OCRTextAdapter(ModelAdapter):
 
     def text_to_fields(self, ocr_text: str, system_prompt: str) -> Dict[str, Any]:
         """Step 2: text LLM maps OCR text to the schema. It cannot see the page, so bbox is null."""
-        import torch
-
-        model, tok = self._load_text()
         sys_msg = (
             system_prompt
             + "\n\nIMPORTANT: you are given OCR text of the page, not the image. Use only what appears in the "
@@ -189,6 +197,22 @@ class OCRTextAdapter(ModelAdapter):
             {"role": "system", "content": sys_msg},
             {"role": "user", "content": f"OCR TEXT:\n{ocr_text}\n\nReturn the JSON object only."},
         ]
+        api_base = vllm_client.endpoint("text")
+        if api_base:
+            text, spans = vllm_client.chat(
+                api_base, self.text_model, messages, self.max_json_tokens, logprobs=True
+            )
+        else:
+            text, spans = self._generate_text(messages)
+        raw = parse_json_tolerant(text)
+        attach_field_confidence(raw, text, spans)
+        return raw
+
+    def _generate_text(self, messages):
+        """In-process generation: (text, token spans)."""
+        import torch
+
+        model, tok = self._load_text()
         try:
             prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
         except TypeError:
@@ -204,19 +228,18 @@ class OCRTextAdapter(ModelAdapter):
         )
         del inputs, out
         free_gpu_memory()
-        raw = parse_json_tolerant(text)
-        attach_field_confidence(raw, text, spans)
-        return raw
+        return text, spans
 
     def extract(self, image_path, system_prompt):
         ocr_text = self.read_text(image_path)
         raw = self.text_to_fields(ocr_text, system_prompt)
+        served_by = {role: "vllm" if vllm_client.endpoint(role) else "transformers" for role in ("ocr", "text")}
         prov = ExecutionProvenance(
             mode=ExecutionMode.GENUINE_LLM,
             model_name=self.model_label,
-            provider="transformers_ocr_text",
+            provider="vllm_ocr_text" if "vllm" in served_by.values() else "transformers_ocr_text",
             fallback_occurred=False,
-            details={"ocr_chars": len(ocr_text)},
+            details={"ocr_chars": len(ocr_text), "served_by": served_by},
         )
         meta = {
             "grounded": False,

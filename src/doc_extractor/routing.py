@@ -43,7 +43,7 @@ LANGUAGES = {
 # Until the model evaluation workbook (FR-EVL-001) picks specialists, every route uses the
 # default model. Change a row here (or in the JSON override) to route a category elsewhere.
 DEFAULT_ROUTING_TABLE: Dict[str, Any] = {
-    "version": "1.0.0",
+    "version": "1.1.0",
     "default_model": DEFAULT_MODEL,
     "routes": {
         # Digital printed pages: GLM-OCR reads the text, Qwen3-4B-Instruct-2507 (text only, non-thinking)
@@ -61,7 +61,6 @@ DEFAULT_ROUTING_TABLE: Dict[str, Any] = {
     "alt_engines": {
         # text step must be a pure text, non-thinking model (no VLM, no thinking mode)
         "ocr_text": {"adapter": "ocr_text", "ocr_model": "zai-org/GLM-OCR", "text_model": "Qwen/Qwen3-4B-Instruct-2507"},
-        "ocr_text_7b": {"adapter": "ocr_text", "ocr_model": "zai-org/GLM-OCR", "text_model": "Qwen/Qwen2.5-7B-Instruct"},
     },
 }
 

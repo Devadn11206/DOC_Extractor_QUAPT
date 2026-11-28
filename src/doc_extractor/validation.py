@@ -20,6 +20,8 @@ from pathlib import Path
 import struct
 from typing import BinaryIO, Optional, Tuple, Union
 
+import pypdfium2 as pdfium
+
 from doc_extractor.config import Settings
 from doc_extractor.exceptions import UnsupportedFileError
 
@@ -265,8 +267,7 @@ def _inspect_tiff_pages(stream: BinaryIO, max_pages: int) -> int:
 
 def _inspect_pdf_pages(stream: BinaryIO, max_pages: int) -> int:
     """
-    Safely inspects a PDF stream to count pages and verify basic PDF structure
-    without rendering. Handles linear / non-linear dictionaries, detects EOF markers,
+    Checks basic PDF structure (size, EOF marker), counts pages without rendering,
     and enforces page limits.
     """
     stream.seek(0, os.SEEK_END)
@@ -287,59 +288,19 @@ def _inspect_pdf_pages(stream: BinaryIO, max_pages: int) -> int:
             details={"reason": "MISSING_PDF_EOF"},
         )
 
-    # Count /Type /Page (excluding /Pages) safely via chunked scan
-    # Note: Stream scan provides robust protection against malformed or truncated page trees
+    # Count pages with PDFium, which reads page trees held in compressed object streams. A raw byte scan
+    # misses those and lets documents pass the page limit. No page is rendered here.
     stream.seek(0)
-    page_count = 0
-    chunk_overlap = 64
-    chunk_size = 64 * 1024
-
-    prev_overlap = b""
-    while True:
-        chunk = stream.read(chunk_size)
-        if not chunk:
-            break
-        data = prev_overlap + chunk
-        
-        # Count occurrences of /Type /Page (with arbitrary whitespace)
-        # Using token scanning
-        idx = 0
-        while True:
-            p_idx = data.find(b"/Page", idx)
-            if p_idx == -1:
-                break
-            # Ensure it is /Page and not /Pages
-            if not data[p_idx:].startswith(b"/Pages"):
-                # Check preceding context: should belong to a dictionary object
-                before = data[max(0, p_idx - 32):p_idx]
-                if b"/Type" in before:
-                    page_count += 1
-            idx = p_idx + 5
-
-        if len(chunk) < chunk_size:
-            break
-        prev_overlap = chunk[-chunk_overlap:]
-
-    if page_count == 0:
-        # Fallback: scan for /Count inside /Pages if /Type /Page was compacted/compressed
-        stream.seek(0)
-        content_sample = stream.read(min(file_size, 256 * 1024))
-        count_idx = content_sample.find(b"/Count ")
-        if count_idx != -1:
-            try:
-                sub = content_sample[count_idx + 7:count_idx + 20]
-                digits = []
-                for b in sub:
-                    if ord(b"0") <= b <= ord(b"9"):
-                        digits.append(chr(b))
-                    elif digits:
-                        break
-                if digits:
-                    page_count = int("".join(digits))
-            except Exception:
-                page_count = 1
-        else:
-            page_count = 1  # Minimum 1 if valid PDF structure
+    try:
+        document = pdfium.PdfDocument(stream.read())
+        try:
+            page_count = len(document)
+        finally:
+            document.close()
+    except pdfium.PdfiumError:
+        # Corrupt or password-protected: no pages to count, and the renderer (same library, no password)
+        # rejects it. Rejecting here would stop the file before the malware scan.
+        page_count = 1
 
     if page_count > max_pages:
         raise UnsupportedFileError(

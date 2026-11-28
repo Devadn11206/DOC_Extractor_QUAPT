@@ -56,8 +56,8 @@ def test_digital_pages_route_to_ocr_plus_text_and_handwriting_to_the_vision_mode
 
 
 def test_alt_engines_offer_the_comparison_specialists():
-    assert set(TABLE["alt_engines"]) == {"ocr_text", "ocr_text_7b"}
-    assert TABLE["alt_engines"]["ocr_text_7b"]["text_model"] == "Qwen/Qwen2.5-7B-Instruct"
+    assert set(TABLE["alt_engines"]) == {"ocr_text"}
+    assert TABLE["alt_engines"]["ocr_text"]["text_model"] == DEFAULT_TEXT_MODEL
     assert app.ENGINE_CHOICES["Follow routing table"] is None
     assert set(filter(None, app.ENGINE_CHOICES.values())) == set(TABLE["alt_engines"])
 
@@ -109,8 +109,8 @@ def test_the_engine_choice_overrides_the_table_and_an_unknown_engine_is_an_error
     chosen: List[Any] = []
     monkeypatch.setattr(RoutedExtractor, "get_adapter",
                         lambda self, route: chosen.append(route) or StubAdapter("ocr_text", "x", False))
-    routed.extract("p.png", DocumentCategory.HANDWRITTEN, "en", engine="ocr_text_7b")
-    assert chosen[0] == TABLE["alt_engines"]["ocr_text_7b"]
+    routed.extract("p.png", DocumentCategory.HANDWRITTEN, "en", engine="ocr_text")
+    assert chosen[0] == TABLE["alt_engines"]["ocr_text"]
     with pytest.raises(ValueError, match="unknown engine"):
         routed.extract("p.png", DocumentCategory.HANDWRITTEN, "en", engine="nope")
 

@@ -82,7 +82,6 @@ logger = logging.getLogger("doc_extractor.processing_service")
 ENGINE_CHOICES: Dict[str, Optional[str]] = {
     "Follow routing table": None,
     "GLM-OCR + Qwen3-4B-Instruct text (experimental)": "ocr_text",
-    "GLM-OCR + Qwen2.5-7B text (experimental, comparison)": "ocr_text_7b",
 }
 
 
@@ -91,7 +90,7 @@ def resolve_engine_choice(engine_choice: Optional[str]) -> Optional[str]:
     Resolves the requested engine choice to an engine key or None (routing table default).
     - None, "", "Follow routing table", "vlm" -> None
     - Explicit valid choices in ENGINE_CHOICES (e.g. "GLM-OCR + Qwen3-4B-Instruct text (experimental)") -> mapped value
-    - Explicitly supported alternative engine keys ("ocr_text", "ocr_text_7b") -> returned as-is
+    - Explicitly supported alternative engine keys ("ocr_text") -> returned as-is
     - Any unrecognized engine choice falls back safely to None (default routing table) with a warning log,
       never raising an unhandled ValueError("unknown engine ...") (F5).
     """
@@ -99,7 +98,7 @@ def resolve_engine_choice(engine_choice: Optional[str]) -> Optional[str]:
         return None
     if engine_choice in ENGINE_CHOICES:
         return ENGINE_CHOICES[engine_choice]
-    if engine_choice in ("ocr_text", "ocr_text_7b"):
+    if engine_choice == "ocr_text":
         return engine_choice
     logger.warning("Unrecognized engine choice %r; falling back to default routing table.", engine_choice)
     return None

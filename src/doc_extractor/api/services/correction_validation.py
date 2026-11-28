@@ -471,13 +471,15 @@ class _DynamicSchema(_Schema):
     def cross_field(
         self, values: Dict[str, Any], envelope: Dict[str, ExtractedField], corrected: Sequence[str]
     ) -> List[CorrectionIssue]:
-        from doc_extractor.rule_evaluator import evaluate_dynamic_rules
+        from doc_extractor.rule_evaluator import RULE_NOT_EVALUATED, evaluate_dynamic_rules
 
         flags: List[FlagItem] = []
         evaluate_dynamic_rules(rules=self._rules, flat_dict=values, fields_envelope=envelope, flags=flags)
         corrected_forms = {_match_form(path): path for path in corrected}
         issues: List[CorrectionIssue] = []
         for flag in flags:                                                   # the flag MESSAGE is dropped: it can quote values
+            if flag.code == RULE_NOT_EVALUATED:      # not a violation: rejecting would leave a reviewer no valid correction
+                continue
             reported = [p for p in flag.fields if isinstance(p, str) and _REPORTABLE_PATH.fullmatch(p)]
             touched = tuple(dict.fromkeys(
                 corrected_forms[_match_form(p)] for p in reported if _match_form(p) in corrected_forms
