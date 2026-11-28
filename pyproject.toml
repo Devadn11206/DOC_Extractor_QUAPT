@@ -75,6 +75,6 @@ pythonpath = ["src"]
 markers = [
     "unit: Unit tests for foundational components",
     "security: Security and guardrail compliance tests",
-    "live_ollama: Live integration test against a real Ollama server; opt-in via RUN_OLLAMA_TESTS=1",
+    "live_vllm: Live integration test against a real vLLM server; opt-in via RUN_VLLM_TESTS=1",
 ]
 

@@ -18,7 +18,11 @@ from doc_extractor.validation_rules import (
 from schema_lifecycle.enums import RuleOnFail
 from schema_lifecycle.metamodel import RuleDefinition
 
+# A rule that applies to an extracted value but cannot be computed. It must never count as a pass.
+RULE_NOT_EVALUATED = "RULE_NOT_EVALUATED"
 
+# The only two-operand form a chronology rule with fewer than two target fields can be read from.
+_SIMPLE_CHRONOLOGY = re.compile(r"^\s*([A-Za-z0-9_\.]+)\s*(?:<=|>=|<|>)\s*([A-Za-z0-9_\.]+)\s*$")
 
 
 def evaluate_dynamic_rules(
@@ -38,7 +42,6 @@ def evaluate_dynamic_rules(
     for rule in rules:
         expr = rule.expression.strip()
         expr_low = expr.lower()
-        err_code = rule.error_code or "RULE_VIOLATION"
         targets = list(rule.target_fields)
 
         # ---------------------------------------------------------------------
@@ -102,12 +105,12 @@ def _evaluate_chronology_rule(
     if len(targets) >= 2:
         field_start, field_end = targets[0], targets[1]
     else:
-        # Fallback: extract identifiers from expression
-        tokens = re.findall(r"[A-Za-z0-9_\.]+", expr)
-        if len(tokens) >= 2:
-            field_start, field_end = tokens[0], tokens[1]
-        else:
+        # Fallback: read the identifiers from a plain "a <= b" expression
+        simple = _SIMPLE_CHRONOLOGY.match(expr)
+        if not simple:
+            _flag_not_evaluated(rule, targets, flat_dict, fields_envelope, flags)
             return
+        field_start, field_end = simple.groups()
 
     # If expression is 'discharge >= admission', invert order
     if ">" in expr and not ("<" in expr):
@@ -121,6 +124,11 @@ def _evaluate_chronology_rule(
 
     iso_start, _ = normalize_date_to_iso(str(raw_start))
     iso_end, _ = normalize_date_to_iso(str(raw_end))
+
+    # normalize_date_to_iso hands back the raw text when it cannot read a date
+    if _is_unreadable_date(iso_start) or _is_unreadable_date(iso_end):
+        _flag_not_evaluated(rule, targets or [field_start, field_end], flat_dict, fields_envelope, flags)
+        return
 
     chron_flag = validate_chronology(iso_start, iso_end)
     if chron_flag:
@@ -146,6 +154,8 @@ def _evaluate_arithmetic_rule(
     total_val: Optional[float] = None
     item_amounts: List[float] = []
 
+    unreadable = False
+
     # Identify total field vs item fields
     total_field = None
     item_fields = []
@@ -164,6 +174,7 @@ def _evaluate_arithmetic_rule(
         if raw_total is not None:
             num, _, _ = normalize_currency_amount(raw_total)
             total_val = num
+            unreadable = num is None
 
     # Collect item amounts, supporting repeating groups (e.g. 'items[].amount' or 'line_items')
     for item_spec in item_fields:
@@ -178,6 +189,8 @@ def _evaluate_arithmetic_rule(
                         num, _, _ = normalize_currency_amount(v)
                         if num is not None:
                             item_amounts.append(num)
+                        else:
+                            unreadable = True
         else:
             clean_spec = item_spec.rstrip(".")
             for k, v in flat_dict.items():
@@ -188,6 +201,13 @@ def _evaluate_arithmetic_rule(
                         num, _, _ = normalize_currency_amount(v)
                         if num is not None:
                             item_amounts.append(num)
+                        else:
+                            unreadable = True
+
+    # A sum with an unreadable part proves nothing either way
+    if unreadable or not targets:
+        _flag_not_evaluated(rule, targets, flat_dict, fields_envelope, flags)
+        return
 
     arith_flag = validate_arithmetic(line_item_amounts=item_amounts, total_amount=total_val, tolerance=0.01)
     if arith_flag:
@@ -217,6 +237,7 @@ def _evaluate_regex_rule(
     try:
         rx = re.compile(pattern)
     except re.error:
+        _flag_not_evaluated(rule, targets, flat_dict, fields_envelope, flags)
         return
 
     for t in targets:
@@ -241,42 +262,76 @@ def _evaluate_comparison_rule(
     """Evaluates simple comparison expression (e.g. 'deposit >= 1000' or 'amount > 0')."""
     match = re.match(r"^\s*([A-Za-z0-9_\.]+)\s*(>=|<=|>|<|==|!=)\s*(.+?)\s*$", expr)
     if not match:
+        _flag_not_evaluated(rule, targets, flat_dict, fields_envelope, flags)
         return
 
     field_name, op, raw_operand = match.groups()
     target_field = targets[0] if targets else field_name
+    null_check = raw_operand.lower() in ("null", "none") and op in ("==", "!=")
 
     val = flat_dict.get(target_field)
     if val is None:
-        # Null check
-        if raw_operand.strip().lower() in ("null", "none"):
-            violated = (op == "!=")
-            if violated:
-                _flag_violation(rule, target_field, fields_envelope, flags, expr)
+        # Only "field != null" is violated by a missing value; otherwise missing values are the required-field check's job
+        if null_check and op == "!=":
+            _flag_violation(rule, target_field, fields_envelope, flags, expr)
+        return
+    if null_check:
+        if op == "==":
+            _flag_violation(rule, target_field, fields_envelope, flags, expr)
         return
 
-    # Try numeric comparison
+    # Numeric comparison
     try:
         val_num = float(val)
         operand_num = float(raw_operand)
-        violated = False
-        if op == ">=":
-            violated = not (val_num >= operand_num)
-        elif op == "<=":
-            violated = not (val_num <= operand_num)
-        elif op == ">":
-            violated = not (val_num > operand_num)
-        elif op == "<":
-            violated = not (val_num < operand_num)
-        elif op == "==":
-            violated = not (abs(val_num - operand_num) < 1e-6)
-        elif op == "!=":
-            violated = not (abs(val_num - operand_num) >= 1e-6)
-
-        if violated:
-            _flag_violation(rule, target_field, fields_envelope, flags, expr)
     except (ValueError, TypeError):
-        pass
+        _flag_not_evaluated(rule, targets or [target_field], flat_dict, fields_envelope, flags)
+        return
+
+    if op == ">=":
+        violated = not (val_num >= operand_num)
+    elif op == "<=":
+        violated = not (val_num <= operand_num)
+    elif op == ">":
+        violated = not (val_num > operand_num)
+    elif op == "<":
+        violated = not (val_num < operand_num)
+    elif op == "==":
+        violated = not (abs(val_num - operand_num) < 1e-6)
+    else:
+        violated = not (abs(val_num - operand_num) >= 1e-6)
+
+    if violated:
+        _flag_violation(rule, target_field, fields_envelope, flags, expr)
+
+
+def _is_unreadable_date(value: Optional[str]) -> bool:
+    return value is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+
+
+def _flag_not_evaluated(
+    rule: RuleDefinition,
+    targets: List[str],
+    flat_dict: Dict[str, Any],
+    fields_envelope: Dict[str, ExtractedField],
+    flags: List[FlagItem],
+) -> None:
+    """Routes to review, whatever ``on_fail`` says. Skipped when none of the rule's fields has a value."""
+    prefixes = [t.split("[]")[0] for t in targets]
+
+    def belongs(key: str) -> bool:
+        return any(key == p or key.startswith(f"{p}.") for p in prefixes)
+
+    if targets and not any(v is not None and belongs(k) for k, v in flat_dict.items()):
+        return
+    flags.append(FlagItem(
+        code=RULE_NOT_EVALUATED,
+        message=f"Rule '{rule.id}' could not be evaluated automatically: {rule.expression}",
+        fields=targets,
+    ))
+    for key, field in fields_envelope.items():
+        if belongs(key):
+            field.review_required = True
 
 
 def _flag_violation(
@@ -291,8 +346,9 @@ def _flag_violation(
     affected = rule.target_fields if rule.target_fields else [target_field]
     flags.append(FlagItem(code=flag_code, message=msg, fields=affected))
 
-    on_fail_action = str(rule.on_fail).lower()
-    if on_fail_action in (RuleOnFail.REVIEW.value, "review", RuleOnFail.REJECT.value, "reject"):
+    # on_fail is a str-Enum: str() on it gives "RuleOnFail.REVIEW", so compare its value
+    on_fail_action = str(getattr(rule.on_fail, "value", rule.on_fail)).lower()
+    if on_fail_action in (RuleOnFail.REVIEW.value, RuleOnFail.REJECT.value):
         for f in affected:
             if f in fields_envelope:
                 fields_envelope[f].review_required = True

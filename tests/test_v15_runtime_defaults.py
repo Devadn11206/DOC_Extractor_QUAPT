@@ -166,7 +166,7 @@ def test_a_single_device_map_counts_only_that_gpu_while_auto_sums_them():
 def test_remote_code_is_never_allowed_for_qwen_and_only_the_documented_exception_is_allowlisted(monkeypatch):
     monkeypatch.delenv(rt.TRUST_REMOTE_CODE_ENV, raising=False)
     for model in (rt.QWEN3_VL_4B_MODEL_ID, rt.QWEN3_VL_8B_MODEL_ID, rt.QWEN2_5_VL_MODEL_ID,
-                  "Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen2.5-7B-Instruct"):
+                  "Qwen/Qwen3-4B-Instruct-2507"):
         assert rt.resolve_trust_remote_code(model) is False
     assert set(rt.TRUST_REMOTE_CODE_ALLOWLIST) == {"zai-org/GLM-OCR"}
     assert "UNVERIFIED" in rt.TRUST_REMOTE_CODE_ALLOWLIST["zai-org/GLM-OCR"]       # the exception is documented

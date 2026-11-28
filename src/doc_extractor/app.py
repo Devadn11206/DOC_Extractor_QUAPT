@@ -40,6 +40,7 @@ if _src_dir not in sys.path:
 
 from PIL import Image, ImageDraw, ImageFont
 
+from doc_extractor import vllm_client
 from doc_extractor.config import Settings, load_settings
 from doc_extractor.contracts_b import MVPDocumentType
 from doc_extractor.contracts_c import CanonicalExtractionEnvelope, FlagItem
@@ -73,7 +74,6 @@ OVERRIDE_REVIEWER_ID = "extraction_ui_user"
 ENGINE_CHOICES = {
     "Follow routing table": None,
     "GLM-OCR + Qwen3-4B-Instruct text (experimental)": "ocr_text",
-    "GLM-OCR + Qwen2.5-7B text (experimental, comparison)": "ocr_text_7b",
 }
 
 try:
@@ -570,7 +570,9 @@ if __name__ == "__main__":
     if gr is None:
         print("Gradio is not installed. Run: pip install gradio")
     else:
-        if os.environ.get("DOC_PRELOAD", "1") == "1":
+        if vllm_client.endpoint("vision"):
+            print("Vision model is served by vLLM: nothing to preload.")
+        elif os.environ.get("DOC_PRELOAD", "1") == "1":
             # Load the models before the UI starts so the first click is not slowed by model loading
             try:
                 _r = get_routed_extractor()

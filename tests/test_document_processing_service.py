@@ -1694,16 +1694,15 @@ def test_unknown_engine_fallback_to_routing_table(tmp_path, caplog):
 
 
 def test_supported_alternative_engine_routing(tmp_path):
-    """F5: Supported alternative engine keys ('ocr_text', 'ocr_text_7b') and UI labels are preserved."""
+    """F5: Supported alternative engine keys ('ocr_text') and UI labels are preserved."""
     service, mod_a, mod_b, routed, mod_c, img1 = _setup_mock_service(tmp_path)
 
     # Verify UI label mappings
     assert resolve_engine_choice("GLM-OCR + Qwen3-4B-Instruct text (experimental)") == "ocr_text"
-    assert resolve_engine_choice("GLM-OCR + Qwen2.5-7B text (experimental, comparison)") == "ocr_text_7b"
 
     # Verify raw keys
     assert resolve_engine_choice("ocr_text") == "ocr_text"
-    assert resolve_engine_choice("ocr_text_7b") == "ocr_text_7b"
+    assert resolve_engine_choice("ocr_text_7b") is None          # removed engine: routing table default
 
     # Process with alternative engine choice
     req = DocumentProcessingRequest(

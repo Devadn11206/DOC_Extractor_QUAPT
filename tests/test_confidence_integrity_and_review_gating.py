@@ -118,9 +118,9 @@ def _module_b_with(storage, token_fn) -> ModuleBPipeline:
 
 
 def _text_extractor(output: Dict[str, Any]) -> SchemaGuidedExtractor:
-    """Text/Ollama-style extractor returning a fixed payload (grounded via Module B OCR)."""
+    """Text-model extractor returning a fixed payload (grounded via Module B OCR)."""
     return SchemaGuidedExtractor(
-        model_name="ollama/qwen2.5:7b-instruct", use_llm=True, allow_fallback=False,
+        model_name="Qwen/Qwen3-4B-Instruct-2507", use_llm=True, allow_fallback=False,
         llm_caller=lambda payload, schema_cls: (output, "req-test"),
     )
 

@@ -471,7 +471,7 @@ def test_canonical_envelope_json_serialization():
         flags=[FlagItem(code="TEST_FLAG", fields=["applicant.full_name"])],
         run=RunMetadata(
             run_id="r_01HZX",
-            model_versions={"parser": "mock-parser", "extractor": "Qwen2.5-7B-Instruct"},
+            model_versions={"parser": "mock-parser", "extractor": "Qwen3-4B-Instruct-2507"},
             prompt_version="1.0.0",
         ),
     )

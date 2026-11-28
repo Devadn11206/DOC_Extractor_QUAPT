@@ -142,7 +142,7 @@ def test_doc03_failed_page_is_reported_and_blocks_approval(temp_storage, monkeyp
 
 
 def test_doc03_ocr_grounded_text_path_uses_measured_ocr_confidence(temp_storage):
-    """Text/Ollama-style path: evidence comes from Module B OCR, so confidence is measured (OCR)."""
+    """Text-model path: evidence comes from Module B OCR, so confidence is measured (OCR)."""
     from doc_extractor.parsing.base import RawOCRToken
 
     name = RawOCRToken(text="Patient Name: RAJESH GUPTA", bbox_preprocessed=(50, 260, 400, 300), confidence=0.96)

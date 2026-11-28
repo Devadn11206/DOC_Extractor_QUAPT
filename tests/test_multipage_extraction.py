@@ -491,7 +491,7 @@ def test_all_pages_failing_raises_and_uses_the_existing_fallback_policy(temp_sto
         _vlm_pipeline().process(run.payload, page_images=run.refs)
 
     fallback = SchemaGuidedExtractor(
-        model_name="ollama/qwen2.5:7b-instruct", use_llm=True, allow_fallback=False,
+        model_name="Qwen/Qwen3-4B-Instruct-2507", use_llm=True, allow_fallback=False,
         llm_caller=lambda payload, schema_cls: ({"applicant": {"full_name": "CASA Application"}}, "req-fb"),
     )
     env = ModuleCPipeline(extractor=_vlm_pipeline().extractor, fallback_extractor=fallback).process(

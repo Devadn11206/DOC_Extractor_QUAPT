@@ -34,7 +34,7 @@
 ### Phase 2 – MVP Release (Gate G1)
 - **3 MVP Document Types (`DOC-01`, `DOC-02`, `DOC-03`):** Governed by `SchemaLifecycleManager` + four-eyes `SchemaApprovalService` (`SCH-004`/`SCH-005`).
 - **Confidence Calibration & G1 Benchmark Sign-off:** Implement calibrated field confidence (`M6 <= 3.0 pts`) enabling safe `auto_approve`; run GPU benchmarks on adjudicated `locked_test` sets (`M1 >= 92%` all / `>= 95%` key fields, `M11 = 0` escapes, `GR-003 <= 0.5%` false-fill) and specialist cost/accuracy evaluation (`FR-EVL-001`).
-- **Review UI, API & Production Security:** Deliver REST API (`API-*`), side-by-side review workspace (`SCR-04`), immutable audit logs (`FR-AUD-001`), live ClamAV (`SEC-009`), durable message broker, distributed Redis idempotency, vLLM/Ollama serving (`ARC-004`/`005`), AES-256 storage encryption (`SEC-005`), PII-safe logging/masking, and zero-egress enforcement (`ARC-001`, `SEC-011`).
+- **Review UI, API & Production Security:** Deliver REST API (`API-*`), side-by-side review workspace (`SCR-04`), immutable audit logs (`FR-AUD-001`), live ClamAV (`SEC-009`), durable message broker, distributed Redis idempotency, vLLM serving (`ARC-004`/`005`), AES-256 storage encryption (`SEC-005`), PII-safe logging/masking, and zero-egress enforcement (`ARC-001`, `SEC-011`).
 
 ### Phase 3 – v1 Release (Gate G2)
 - **7+ Launch Document Types & Unstructured Prose:** Onboard remaining launch types (`DOC-04`–`DOC-08` incl. loans, credit cards, claims, prescriptions, policy wordings) plus unstructured brochures, pamphlets, and leaflets.

@@ -57,3 +57,6 @@ tmp/
 
 # macOS
 .DS_Store
+
+# vLLM server logs and process ids (scripts/serve_vllm.py)
+vllm-logs/

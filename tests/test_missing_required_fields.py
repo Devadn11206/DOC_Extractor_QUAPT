@@ -260,7 +260,7 @@ def test_required_field_inside_an_absent_optional_object_is_still_reported(
 
 
 # ============================================================================
-# 6. Dynamic schemas: text/Ollama-style path and every page missing
+# 6. Dynamic schemas: text-model path and every page missing
 # ============================================================================
 
 def test_dynamic_text_path_with_missing_required_fields_is_kept_and_reviewed(
@@ -275,7 +275,7 @@ def test_dynamic_text_path_with_missing_required_fields_is_kept_and_reviewed(
     adapter = DynamicExtractionAdapter(
         manager=lifecycle_manager,
         extractor=SchemaGuidedExtractor(
-            model_name="ollama/qwen2.5:7b-instruct", use_llm=True, allow_fallback=False, llm_caller=caller
+            model_name="Qwen/Qwen3-4B-Instruct-2507", use_llm=True, allow_fallback=False, llm_caller=caller
         ),
     )
     env = adapter.extract_and_assemble("tenant_alpha", SCHEMA_ID, 1, sample_payload_for_text)
@@ -361,7 +361,7 @@ def test_structured_text_path_missing_required_name_is_flagged_and_reviewed(temp
 
 
 def test_text_path_instructor_response_model_tolerates_absent_required_fields(monkeypatch, temp_storage):
-    """Ollama/litellm path: the structured-output model handed to instructor is the relaxed twin."""
+    """vLLM/litellm path: the structured-output model handed to instructor is the relaxed twin."""
     import instructor
 
     seen: Dict[str, Any] = {}
@@ -379,7 +379,7 @@ def test_text_path_instructor_response_model_tolerates_absent_required_fields(mo
     schema = DynamicSchemaCompiler.compile(_schema_def())
     payload = _run(temp_storage, 1).payload
     extractor = SchemaGuidedExtractor(
-        model_name="ollama/qwen2.5:7b-instruct", use_llm=True, allow_fallback=False
+        model_name="Qwen/Qwen3-4B-Instruct-2507", use_llm=True, allow_fallback=False
     )
     result = extractor.extract_with_provenance(payload, schema_cls=schema)
 

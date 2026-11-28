@@ -1,17 +1,17 @@
 """
-Tests for Local Qwen2.5-7B-Instruct Integration in Module C.
+Tests for vLLM-served Qwen3-4B-Instruct-2507 Integration in Module C.
 
 Validates:
 1. Local model configuration and Settings guardrails (ARC-001, SEC-011).
-2. SchemaGuidedExtractor factories (.for_local_ollama, .from_settings).
-3. Exact Ollama model naming, provider, and LiteLLM/Instructor parameters.
+2. SchemaGuidedExtractor factories (.for_vllm, .from_settings).
+3. Exact vLLM model naming, provider, and LiteLLM/Instructor parameters.
 4. Successful mocked inference for DOC-01, DOC-02, and DOC-03 schemas.
 5. Structured output validation and error handling for malformed model outputs.
 6. Evidence grounding against Module B OCR layout blocks.
 7. Strict no-fallback behavior (LLMExecutionError raised; heuristic never invoked).
 8. Permitted fallback behavior when allow_fallback=True (HEURISTIC_FALLBACK).
 9. ModuleCPipeline integration with local LLM extractor.
-10. Live local probe confirming fail-closed error reporting when Ollama daemon is offline.
+10. Live local probe confirming fail-closed error reporting when vLLM server is offline.
 """
 
 import os
@@ -221,24 +221,24 @@ class TestSettingsAndConfiguration:
 
     def test_default_settings_for_local_llm(self):
         settings = Settings()
-        assert settings.llm_model_name == "ollama/qwen2.5:7b-instruct"
-        assert settings.llm_api_base == "http://localhost:11434"
-        assert settings.llm_provider == "ollama"
+        assert settings.llm_model_name == "Qwen/Qwen3-4B-Instruct-2507"
+        assert settings.llm_api_base == "http://localhost:8000/v1"
+        assert settings.llm_provider == "vllm"
         assert settings.llm_use_inference is False
         assert settings.llm_allow_fallback is False
-        assert settings.llm_timeout_seconds == 30.0
+        assert settings.llm_timeout_seconds == 120.0
         assert settings.allow_external_egress is False
 
     def test_settings_custom_override(self):
         settings = Settings(
-            llm_model_name="ollama/custom-qwen:latest",
+            llm_model_name="custom/qwen-model",
             llm_api_base="http://127.0.0.1:8000",
             llm_provider="vllm",
             llm_use_inference=True,
             llm_allow_fallback=True,
             llm_timeout_seconds=45.0,
         )
-        assert settings.llm_model_name == "ollama/custom-qwen:latest"
+        assert settings.llm_model_name == "custom/qwen-model"
         assert settings.llm_api_base == "http://127.0.0.1:8000"
         assert settings.llm_provider == "vllm"
         assert settings.llm_use_inference is True
@@ -273,38 +273,38 @@ class TestSettingsAndConfiguration:
 class TestSchemaGuidedExtractorConfiguration:
     """Validates extractor factory constructors and parameter resolution."""
 
-    def test_for_local_ollama_factory_defaults(self):
-        extractor = SchemaGuidedExtractor.for_local_ollama()
-        assert extractor.model_name == "ollama/qwen2.5:7b-instruct"
-        assert extractor.provider_name == "ollama"
-        assert extractor.api_base == "http://localhost:11434"
+    def test_for_vllm_factory_defaults(self):
+        extractor = SchemaGuidedExtractor.for_vllm()
+        assert extractor.model_name == "Qwen/Qwen3-4B-Instruct-2507"
+        assert extractor.provider_name == "vllm"
+        assert extractor.api_base == "http://localhost:8000/v1"
         assert extractor.use_llm is True
         assert extractor.allow_fallback is False
-        assert extractor.timeout_seconds == 30.0
+        assert extractor.timeout_seconds == 120.0
 
     def test_from_settings_factory(self):
         settings = Settings(
-            llm_model_name="ollama/qwen2.5:7b-instruct",
-            llm_api_base="http://localhost:11434",
-            llm_provider="ollama",
+            llm_model_name="Qwen/Qwen3-4B-Instruct-2507",
+            llm_api_base="http://localhost:8000/v1",
+            llm_provider="vllm",
             llm_use_inference=True,
             llm_allow_fallback=False,
             llm_timeout_seconds=25.0,
         )
         extractor = SchemaGuidedExtractor.from_settings(settings)
-        assert extractor.model_name == "ollama/qwen2.5:7b-instruct"
-        assert extractor.provider_name == "ollama"
-        assert extractor.api_base == "http://localhost:11434"
+        assert extractor.model_name == "Qwen/Qwen3-4B-Instruct-2507"
+        assert extractor.provider_name == "vllm"
+        assert extractor.api_base == "http://localhost:8000/v1"
         assert extractor.use_llm is True
         assert extractor.allow_fallback is False
         assert extractor.timeout_seconds == 25.0
 
-    def test_model_name_auto_resolution_to_ollama_prefix(self, mock_module_b_doc01_payload, sample_casa_model):
-        """Tests that passing 'Qwen2.5-7B-Instruct' resolves to 'ollama/qwen2.5:7b-instruct'."""
+    def test_model_name_is_routed_to_the_vllm_provider(self, mock_module_b_doc01_payload, sample_casa_model):
+        """The served model id is sent through litellm's hosted_vllm provider."""
         extractor = SchemaGuidedExtractor(
-            model_name="Qwen2.5-7B-Instruct",
-            provider_name="ollama",
-            api_base="http://localhost:11434",
+            model_name="Qwen/Qwen3-4B-Instruct-2507",
+            provider_name="vllm",
+            api_base="http://localhost:8000/v1",
             use_llm=True,
             allow_fallback=False,
         )
@@ -318,11 +318,11 @@ class TestSchemaGuidedExtractorConfiguration:
             res = extractor.extract_with_provenance(mock_module_b_doc01_payload)
 
         call_kwargs = mock_client.chat.completions.create_with_completion.call_args[1]
-        assert call_kwargs["model"] == "ollama/qwen2.5:7b-instruct"
-        assert call_kwargs["custom_llm_provider"] == "ollama"
-        assert call_kwargs["api_base"] == "http://localhost:11434"
+        assert call_kwargs["model"] == "hosted_vllm/Qwen/Qwen3-4B-Instruct-2507"
+        assert call_kwargs["api_key"] == "EMPTY"
+        assert call_kwargs["api_base"] == "http://localhost:8000/v1"
         assert call_kwargs["_skip_mcp_handler"] is True
-        assert res.provenance.provider == "ollama"
+        assert res.provenance.provider == "vllm"
 
 
 # ==============================================================================
@@ -333,11 +333,11 @@ class TestMockedInferenceExecution:
     """Tests successful structured extraction with LiteLLM/Instructor mocking."""
 
     def test_successful_mocked_casa_inference(self, mock_module_b_doc01_payload, sample_casa_model):
-        extractor = SchemaGuidedExtractor.for_local_ollama()
+        extractor = SchemaGuidedExtractor.for_vllm()
 
         mock_client = MagicMock()
         mock_raw_completion = MagicMock()
-        mock_raw_completion.id = "ollama-resp-12345"
+        mock_raw_completion.id = "vllm-resp-12345"
         mock_client.chat.completions.create_with_completion.return_value = (sample_casa_model, mock_raw_completion)
 
         with patch("instructor.from_litellm", return_value=mock_client):
@@ -346,18 +346,18 @@ class TestMockedInferenceExecution:
         assert isinstance(result, ExtractionResult)
         assert result.payload == sample_casa_model
         assert result.provenance.mode == ExecutionMode.GENUINE_LLM
-        assert result.provenance.model_name == "ollama/qwen2.5:7b-instruct"
-        assert result.provenance.provider == "ollama"
+        assert result.provenance.model_name == "Qwen/Qwen3-4B-Instruct-2507"
+        assert result.provenance.provider == "vllm"
         assert result.provenance.fallback_occurred is False
-        assert result.provenance.request_id == "ollama-resp-12345"
+        assert result.provenance.request_id == "vllm-resp-12345"
 
         # Verify arguments passed to instructor/litellm
         mock_client.chat.completions.create_with_completion.assert_called_once()
         call_kwargs = mock_client.chat.completions.create_with_completion.call_args[1]
-        assert call_kwargs["model"] == "ollama/qwen2.5:7b-instruct"
-        assert call_kwargs["api_base"] == "http://localhost:11434"
-        assert call_kwargs["timeout"] == 30.0
-        assert call_kwargs["custom_llm_provider"] == "ollama"
+        assert call_kwargs["model"] == "hosted_vllm/Qwen/Qwen3-4B-Instruct-2507"
+        assert call_kwargs["api_base"] == "http://localhost:8000/v1"
+        assert call_kwargs["timeout"] == 120.0
+        assert call_kwargs["model"].startswith("hosted_vllm/")
         assert call_kwargs["temperature"] == 0.0
         assert call_kwargs["_skip_mcp_handler"] is True
         assert call_kwargs["response_model"] == CASASchema
@@ -369,7 +369,7 @@ class TestMockedInferenceExecution:
             policy_term_years=20,
             nominees=[NomineeDetails(name="AMIT SHARMA", relationship="SPOUSE", share_percentage=100.0)],
         )
-        extractor = SchemaGuidedExtractor.for_local_ollama()
+        extractor = SchemaGuidedExtractor.for_vllm()
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.return_value = (ins_model, None)
@@ -390,7 +390,7 @@ class TestMockedInferenceExecution:
             diagnosis="Acute Bronchitis",
             medications=[MedicationItem(medicine_name="Paracetamol", dosage="500mg", frequency="TDS")],
         )
-        extractor = SchemaGuidedExtractor.for_local_ollama()
+        extractor = SchemaGuidedExtractor.for_vllm()
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.return_value = (dis_model, None)
@@ -417,7 +417,7 @@ class TestStructuredOutputValidationAndErrors:
             "applicant": {"full_name": "ARUN VERMA", "pan_card_number": "ABCDE1234F"},
             "account_details": {"account_type": "SAVINGS"},
         }
-        extractor = SchemaGuidedExtractor.for_local_ollama()
+        extractor = SchemaGuidedExtractor.for_vllm()
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.return_value = (raw_dict, None)
@@ -433,7 +433,7 @@ class TestStructuredOutputValidationAndErrors:
         bad_dict = {
             "applicant": "NotAnObject",  # Should be a dict
         }
-        extractor = SchemaGuidedExtractor.for_local_ollama(allow_fallback=False)
+        extractor = SchemaGuidedExtractor.for_vllm(allow_fallback=False)
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.return_value = (bad_dict, None)
@@ -443,12 +443,12 @@ class TestStructuredOutputValidationAndErrors:
                 extractor.extract_with_provenance(mock_module_b_doc01_payload)
 
         assert exc_info.value.code == "LLM_EXECUTION_FAILED"
-        assert exc_info.value.model_name == "ollama/qwen2.5:7b-instruct"
+        assert exc_info.value.model_name == "Qwen/Qwen3-4B-Instruct-2507"
         assert extractor.last_provenance.fallback_occurred is False
 
     def test_empty_completion_raises_llm_execution_error(self, mock_module_b_doc01_payload):
         """When LLM returns empty/None completion, LLMExecutionError is raised."""
-        extractor = SchemaGuidedExtractor.for_local_ollama(allow_fallback=False)
+        extractor = SchemaGuidedExtractor.for_vllm(allow_fallback=False)
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.return_value = (None, None)
@@ -463,7 +463,7 @@ class TestStructuredOutputValidationAndErrors:
 
     def test_non_schema_object_raises_llm_execution_error(self, mock_module_b_doc01_payload):
         """When LLM returns unexpected object type (e.g. string or list), LLMExecutionError is raised."""
-        extractor = SchemaGuidedExtractor.for_local_ollama(allow_fallback=False)
+        extractor = SchemaGuidedExtractor.for_vllm(allow_fallback=False)
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.return_value = (["unexpected", "list"], None)
@@ -484,10 +484,10 @@ class TestStrictNoFallbackAndFailures:
     """Verifies that timeouts and connection errors fail closed without heuristic fallback."""
 
     def test_timeout_raises_llm_execution_error_without_fallback(self, mock_module_b_doc01_payload):
-        extractor = SchemaGuidedExtractor.for_local_ollama(allow_fallback=False)
+        extractor = SchemaGuidedExtractor.for_vllm(allow_fallback=False)
 
         mock_client = MagicMock()
-        mock_client.chat.completions.create_with_completion.side_effect = TimeoutError("Ollama request timed out after 30s")
+        mock_client.chat.completions.create_with_completion.side_effect = TimeoutError("vLLM request timed out after 30s")
 
         with patch("instructor.from_litellm", return_value=mock_client):
             with patch.object(extractor, "_extract_heuristic") as mock_heuristic:
@@ -503,7 +503,7 @@ class TestStrictNoFallbackAndFailures:
         assert "timed out" in extractor.last_provenance.fallback_reason
 
     def test_connection_refused_raises_llm_execution_error_without_fallback(self, mock_module_b_doc01_payload):
-        extractor = SchemaGuidedExtractor.for_local_ollama(allow_fallback=False)
+        extractor = SchemaGuidedExtractor.for_vllm(allow_fallback=False)
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.side_effect = ConnectionRefusedError("[Errno 61] Connection refused")
@@ -523,7 +523,7 @@ class TestStrictNoFallbackAndFailures:
 
     def test_fallback_enabled_permits_heuristic_execution_when_requested(self, mock_module_b_doc01_payload):
         """When allow_fallback=True is explicitly set, fallback to heuristic is permitted and recorded."""
-        extractor = SchemaGuidedExtractor.for_local_ollama(allow_fallback=True)
+        extractor = SchemaGuidedExtractor.for_vllm(allow_fallback=True)
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.side_effect = RuntimeError("Local model crash")
@@ -539,10 +539,10 @@ class TestStrictNoFallbackAndFailures:
 
     def test_compatibility_extract_llm_strictly_respects_no_fallback_policy(self, mock_module_b_doc01_payload):
         """_extract_llm compatibility method must raise LLMExecutionError and NOT silently fall back."""
-        extractor = SchemaGuidedExtractor.for_local_ollama(allow_fallback=False)
+        extractor = SchemaGuidedExtractor.for_vllm(allow_fallback=False)
 
         mock_client = MagicMock()
-        mock_client.chat.completions.create_with_completion.side_effect = ConnectionRefusedError("Ollama offline")
+        mock_client.chat.completions.create_with_completion.side_effect = ConnectionRefusedError("vLLM offline")
 
         with patch("instructor.from_litellm", return_value=mock_client):
             with patch.object(extractor, "_extract_heuristic") as mock_heuristic:
@@ -554,7 +554,7 @@ class TestStrictNoFallbackAndFailures:
 
     def test_compatibility_extract_llm_allows_fallback_when_configured(self, mock_module_b_doc01_payload):
         """_extract_llm compatibility method falls back to heuristic only when allow_fallback=True."""
-        extractor = SchemaGuidedExtractor.for_local_ollama(allow_fallback=True)
+        extractor = SchemaGuidedExtractor.for_vllm(allow_fallback=True)
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.side_effect = RuntimeError("Model error")
@@ -573,7 +573,7 @@ class TestEvidenceGroundingWithModuleB:
     """Tests that extracted values are grounded against Module B OCR tokens and layout blocks."""
 
     def test_evidence_grounding_matches_module_b_ocr_blocks(self, mock_module_b_doc01_payload, sample_casa_model):
-        extractor = SchemaGuidedExtractor.for_local_ollama()
+        extractor = SchemaGuidedExtractor.for_vllm()
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.return_value = (sample_casa_model, MagicMock(id="id-1"))
@@ -611,7 +611,7 @@ class TestEvidenceGroundingWithModuleB:
             ),
             account_details=AccountDetails(account_type="SAVINGS"),
         )
-        extractor = SchemaGuidedExtractor.for_local_ollama()
+        extractor = SchemaGuidedExtractor.for_vllm()
 
         mock_client = MagicMock()
         mock_client.chat.completions.create_with_completion.return_value = (hallucinated_model, None)
@@ -640,27 +640,27 @@ class TestModuleCPipelineLocalLLMIntegration:
 
     def test_pipeline_with_local_llm_factory(self):
         pipeline = ModuleCPipeline.with_local_llm(
-            model_name="ollama/qwen2.5:7b-instruct",
-            api_base="http://localhost:11434",
+            model_name="Qwen/Qwen3-4B-Instruct-2507",
+            api_base="http://localhost:8000/v1",
             use_llm=True,
             allow_fallback=False,
             timeout_seconds=20.0,
         )
-        assert pipeline.extractor.model_name == "ollama/qwen2.5:7b-instruct"
+        assert pipeline.extractor.model_name == "Qwen/Qwen3-4B-Instruct-2507"
         assert pipeline.extractor.use_llm is True
         assert pipeline.extractor.allow_fallback is False
-        assert pipeline.extractor.api_base == "http://localhost:11434"
+        assert pipeline.extractor.api_base == "http://localhost:8000/v1"
         assert pipeline.extractor.timeout_seconds == 20.0
 
     def test_pipeline_from_settings(self):
         settings = Settings(
-            llm_model_name="ollama/qwen2.5:7b-instruct",
-            llm_api_base="http://localhost:11434",
+            llm_model_name="Qwen/Qwen3-4B-Instruct-2507",
+            llm_api_base="http://localhost:8000/v1",
             llm_use_inference=True,
             llm_allow_fallback=False,
         )
         pipeline = ModuleCPipeline(settings=settings)
-        assert pipeline.extractor.model_name == "ollama/qwen2.5:7b-instruct"
+        assert pipeline.extractor.model_name == "Qwen/Qwen3-4B-Instruct-2507"
         assert pipeline.extractor.use_llm is True
         assert pipeline.extractor.allow_fallback is False
 
@@ -675,11 +675,11 @@ class TestModuleCPipelineLocalLLMIntegration:
         with patch("instructor.from_litellm", return_value=mock_client):
             envelope = pipeline.process(mock_module_b_doc01_payload)
 
-        assert envelope.run.model_versions["extractor"] == "ollama/qwen2.5:7b-instruct"
+        assert envelope.run.model_versions["extractor"] == "Qwen/Qwen3-4B-Instruct-2507"
         assert envelope.run.model_versions["parser"] == "pdfium-text"
         assert envelope.run.provenance is not None
         assert envelope.run.provenance.mode == ExecutionMode.GENUINE_LLM
-        assert envelope.run.provenance.provider == "ollama"
+        assert envelope.run.provenance.provider == "vllm"
         assert envelope.run.provenance.request_id == "qwen-resp-999"
 
     def test_pipeline_unknown_document_routes_to_review_before_llm(self, mock_module_b_doc01_payload):
@@ -704,19 +704,19 @@ class TestModuleCPipelineLocalLLMIntegration:
 
 class TestLiveLocalEndpointBehavior:
     """
-    Verifies actual local socket behavior against the Ollama endpoint.
-    When Ollama daemon is offline, proves strict fail-closed rejection with LLMExecutionError.
+    Verifies actual local socket behavior against the vLLM endpoint.
+    When vLLM server is offline, proves strict fail-closed rejection with LLMExecutionError.
     """
 
-    def test_live_local_ollama_offline_fails_closed_without_fallback(self, mock_module_b_doc01_payload):
+    def test_live_vllm_offline_fails_closed_without_fallback(self, mock_module_b_doc01_payload):
         """
-        Executes a live call to http://localhost:11434 with no mocks.
+        Executes a live call to http://localhost:8000/v1 with no mocks.
         Demonstrates that when the local model daemon is not running, the system fails closed
         with LLMExecutionError and NEVER falls back to heuristic extraction.
         """
-        extractor = SchemaGuidedExtractor.for_local_ollama(
-            model_name="ollama/qwen2.5:7b-instruct",
-            api_base="http://localhost:11434",
+        extractor = SchemaGuidedExtractor.for_vllm(
+            model_name="Qwen/Qwen3-4B-Instruct-2507",
+            api_base="http://localhost:8000/v1",
             use_llm=True,
             allow_fallback=False,
             timeout_seconds=2.0,  # Fast timeout for test
@@ -726,33 +726,33 @@ class TestLiveLocalEndpointBehavior:
             extractor.extract_with_provenance(mock_module_b_doc01_payload)
 
         assert exc_info.value.code == "LLM_EXECUTION_FAILED"
-        assert exc_info.value.model_name == "ollama/qwen2.5:7b-instruct"
+        assert exc_info.value.model_name == "Qwen/Qwen3-4B-Instruct-2507"
 
         prov = extractor.last_provenance
         assert prov is not None
         assert prov.mode == ExecutionMode.GENUINE_LLM
-        assert prov.provider == "ollama"
+        assert prov.provider == "vllm"
         assert prov.fallback_occurred is False
         assert prov.fallback_reason is not None
 
 
-# Live inference verification against a real Ollama server (text model qwen2.5:7b-instruct; this
-# does NOT exercise the Qwen-VL / Transformers multimodal path).
+# Live inference verification against a real vLLM server serving the text model (this does NOT exercise
+# the Qwen-VL multimodal path).
 #
 # Opt-in integration test: skipped by default, so a normal run never depends on an external service.
-# Enable with RUN_OLLAMA_TESTS=1 (optionally OLLAMA_API_BASE=http://host:port). Once enabled, an
-# unreachable server or a failed extraction is a genuine FAILURE - it is never skipped or swallowed.
-#   pytest -m live_ollama            (selects it; still skipped unless RUN_OLLAMA_TESTS=1)
-#   RUN_OLLAMA_TESTS=1 pytest -m live_ollama
-@pytest.mark.live_ollama
+# Enable with RUN_VLLM_TESTS=1 (optionally VLLM_TEXT_API_BASE=http://host:8000/v1, VLLM_API_KEY). Once
+# enabled, an unreachable server or a failed extraction is a genuine FAILURE - never skipped or swallowed.
+#   pytest -m live_vllm            (selects it; still skipped unless RUN_VLLM_TESTS=1)
+#   RUN_VLLM_TESTS=1 pytest -m live_vllm
+@pytest.mark.live_vllm
 @pytest.mark.skipif(
-    os.environ.get("RUN_OLLAMA_TESTS") != "1",
-    reason="Live Ollama integration test is opt-in: set RUN_OLLAMA_TESTS=1 (requires a running Ollama server)",
+    os.environ.get("RUN_VLLM_TESTS") != "1",
+    reason="Live vLLM integration test is opt-in: set RUN_VLLM_TESTS=1 (requires a running vLLM server)",
 )
-def test_live_qwen_smoke_against_local_ollama(mock_module_b_doc01_payload):
-    extractor = SchemaGuidedExtractor.for_local_ollama(
-        model_name="ollama/qwen2.5:7b-instruct",
-        api_base=os.environ.get("OLLAMA_API_BASE", "http://localhost:11434"),
+def test_live_qwen_smoke_against_vllm(mock_module_b_doc01_payload):
+    extractor = SchemaGuidedExtractor.for_vllm(
+        model_name="Qwen/Qwen3-4B-Instruct-2507",
+        api_base=os.environ.get("VLLM_TEXT_API_BASE", "http://localhost:8000/v1"),
         use_llm=True,
         allow_fallback=False,
         timeout_seconds=120.0,

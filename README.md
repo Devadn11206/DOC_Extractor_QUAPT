@@ -24,7 +24,7 @@ flowchart LR
 ```
 
 - **Who does what.** The app owns the per-page routing and model calls (so it can stream the live pipeline-steps panel and turn a sideways page upright); `ModuleCPipeline` owns everything after the model call. No page is read twice and no envelope is built outside `pipeline_c.py` (a test enforces this).
-- **Routing table** (`routing.DEFAULT_ROUTING_TABLE`, override with a JSON file in `DOC_ROUTING_TABLE`): `structured` and `unstructured` use the OCR + text route, `handwritten` uses the vision model; `alt_engines` (`ocr_text`, `ocr_text_7b`) are the specialists the **Engine** selector can switch to for comparison. A hand-filled page is forced to `handwritten` in code from the router's `filled_by` answer. If the routed specialist fails, the default model runs and the fallback is recorded in the provenance.
+- **Routing table** (`routing.DEFAULT_ROUTING_TABLE`, override with a JSON file in `DOC_ROUTING_TABLE`): `structured` and `unstructured` use the OCR + text route, `handwritten` uses the vision model; `alt_engines` (`ocr_text`) are the specialists the **Engine** selector can switch to for comparison. A hand-filled page is forced to `handwritten` in code from the router's `filled_by` answer. If the routed specialist fails, the default model runs and the fallback is recorded in the provenance.
 - **Evidence rule (PRD GR-002 / FR-EXT-004).** A value without a grounded box is forced to `null` and flagged `EVIDENCE_MISSING`. The OCR + text route has no boxes, so its values are *withheld* (`null`) and flagged; the unverified readings are kept in `run.provenance.details.unverified_readings` as a review aid only, never as field values.
 - **Bounding boxes.** One contract everywhere: the model returns `[x1, y1, x2, y2]` (left, top, right, bottom) on a 0-1000 grid relative to the image it saw; Module C maps it with the page's own Module A geometry (`PageImageRef` + `CoordinateTransform`) to `(x0, y0, x1, y1)` pixels of the 200-DPI original page, and the gallery draws exactly those pixels. A page that was turned upright first has its boxes mapped back to the stored page. `PageLayoutOutput.page_image_path` is kept as the Module B path hand-off; the explicit `PageImageRef` is the authoritative geometry source.
 - **Dynamic by default.** The model returns whatever fields are on the page. A fixed schema (DOC-01 to DOC-03) is bound only when the user picks a document type (recorded through Module B's audited reviewer-override path). A filename never binds a type or invents a confidence; the router's own type suggestion is advisory.
@@ -289,7 +289,7 @@ settings = Settings(ocr_backend="pdfium")                                    # n
 settings = load_settings({"app_env": "staging", "max_page_count": 50})   # validated
 ```
 
-and pass them on (for example `ModuleBPipeline(storage, settings=settings)` or `doc_extractor.app.configure_settings(settings)`). Copying `.env.example` to `.env` has no effect. The default LLM setting is the Ollama text model; the multimodal Qwen-VL extractor (`Qwen/Qwen3-VL-4B-Instruct` by default, `DOC_DEFAULT_MODEL` to change it) is selected on `SchemaGuidedExtractor` / the routing table, not through `llm_model_name`. The `DOC_*` variables in "PRD v1.5 routed extraction" are the one exception to "no environment variables": they are read by the Qwen runtime and the demo app.
+and pass them on (for example `ModuleBPipeline(storage, settings=settings)` or `doc_extractor.app.configure_settings(settings)`). Copying `.env.example` to `.env` has no effect. The default LLM setting is the vLLM-served text model; the multimodal Qwen-VL extractor (`Qwen/Qwen3-VL-4B-Instruct` by default, `DOC_DEFAULT_MODEL` to change it) is selected on `SchemaGuidedExtractor` / the routing table, not through `llm_model_name`. The `DOC_*` variables in "PRD v1.5 routed extraction" are the one exception to "no environment variables": they are read by the Qwen runtime and the demo app.
 
 #### Module B OCR backend
 
@@ -379,7 +379,7 @@ The repository includes unit, regression, integration and end-to-end test covera
 
 **Mandatory tests and CI.** Tests that need an optional component skip with a visible reason, so a developer without it still gets a green run. In the CI job that must prove the API and tenant-isolation tests ran, `DOC_FAIL_ON_SKIP=1` turns **any** skip into a failure, including a missing dependency skipped at collection (`tests/skip_policy.py`). `.github/workflows/ci.yml` runs on Python 3.11 and 3.14: a mandatory `api-and-security` job (real `pip install -e ".[dev,api]"`, `scripts/ci/check_api_extra.py`, the strict test run, and a junit re-check of zero skips) and a `full-suite` job where only the optional OCR and live-model tests may skip. Run the same thing locally with `DOC_FAIL_ON_SKIP=1 pytest tests/test_api_*.py tests/test_tenant_isolation.py tests/test_exception_base_identity.py tests/test_packaging_consistency.py tests/test_ci_policy.py`. Without the `api` extra the suite still passes (the API modules skip with a reason; the storage-side tenant-isolation tests always run).
 
-**Earlier result (M5 API foundation before the document and review-task routes; Python 3.11 and 3.14, `api` extra installed, no OCR extra):** 1451 tests collected; 1450 pass, 3 skipped (the opt-in live Ollama test and the two optional-OCR test modules, which skip as a whole). Without the `api` extra: 1075 pass, 18 skipped, 0 failed.
+**Earlier result (M5 API foundation before the document and review-task routes; Python 3.11 and 3.14, `api` extra installed, no OCR extra):** 1451 tests collected; 1450 pass, 3 skipped (the opt-in live model test and the two optional-OCR test modules, which skip as a whole). Without the `api` extra: 1075 pass, 18 skipped, 0 failed.
 
 **Earlier result (Phase 1 on PRD v1.5, before the API foundation):** 915 tests collected. That count predates the removal of the Tesseract backend. The suite runs without a GPU, torch or model weights. The Qwen-VL runtime (`vlm_runtime.py`) and the OCR + text adapter are covered with fakes; real Qwen-VL / GLM-OCR / GPU behaviour is not covered by any automated test.
 
@@ -390,14 +390,18 @@ pytest -rs                   # same, and print why tests were skipped
 pytest --cov=src --cov-branch --cov-report=term-missing   # coverage
 ```
 
-**Opt-in live Ollama test.** `test_live_qwen_smoke_against_local_ollama` (marker `live_ollama`) calls a real Ollama server with the text model `qwen2.5:7b-instruct`; it does **not** exercise the Qwen-VL multimodal path. It is skipped unless explicitly enabled, and once enabled an unavailable server is a genuine failure (never a skip or pass):
+**Opt-in live vLLM test.** `test_live_qwen_smoke_against_vllm` (marker `live_vllm`) calls a real vLLM server with the text model `Qwen/Qwen3-4B-Instruct-2507`; it does **not** exercise the Qwen-VL multimodal path. It is skipped unless explicitly enabled, and once enabled an unavailable server is a genuine failure (never a skip or pass):
 
 ```bash
-RUN_OLLAMA_TESTS=1 pytest -m live_ollama                         # http://localhost:11434
-RUN_OLLAMA_TESTS=1 OLLAMA_API_BASE=http://host:11434 pytest -m live_ollama
+RUN_VLLM_TESTS=1 pytest -m live_vllm                             # http://localhost:8000/v1
+RUN_VLLM_TESTS=1 VLLM_TEXT_API_BASE=https://host/v1 VLLM_API_KEY=... pytest -m live_vllm
 ```
 
 Tests mock the OCR and model layers. Initialization of `ModuleBPipeline(storage)` and the Module B hand-off are tested with no OCR installed.
+
+## Serving the models with vLLM
+
+Set `VLLM_API_BASE`, `VLLM_TEXT_API_BASE`, `VLLM_OCR_API_BASE` and `VLLM_API_KEY` to use models served by vLLM, for example on RunPod: see [docs/runpod.md](docs/runpod.md).
 
 ## Repository documents
 
@@ -409,7 +413,7 @@ Tests mock the OCR and model layers. Initialization of `ModuleBPipeline(storage)
 | `docs/prd-versions/` | Archived PRD revisions (v1.0 original PDF, v1.3, v1.4) and their index. |
 | `docs/kaggle/README.md` | How to run the demo notebook on a Kaggle T4, the `DOC_*` settings and troubleshooting. |
 | `docs/model_cost_evaluation.xlsx` | Model / cost evaluation workbook for the routed specialists. |
-| `src/doc_extractor/notebookbdb318963a.ipynb` | Kaggle demo launchers: they `git pull` the repository, install dependencies, download the models and launch the Gradio demo. They run the code of the branch they clone, **not** this working tree. They install `gradio` explicitly (it is an optional extra here). |
+| `src/doc_extractor/notebookbdb318963a.ipynb` | Kaggle demo launcher (one cell): gets the code, installs dependencies, starts the vLLM servers and launches the Gradio demo. They run the code of the branch they clone, **not** this working tree. They install `gradio` explicitly (it is an optional extra here). |
 | `notebooks/*.ipynb`, `notebooks/doc01_support/` | Earlier Colab notebooks for the standalone DOC-01 CASA reader (`casa_reader.py` / `casa_form.py`); legacy, separate from the `ModuleCPipeline` path. |
 | `casa_reader.py`, `casa_form.py`, `insurance_form.py` (`src/doc_extractor/`) | Legacy rule-based form readers. They are not used by the canonical pipeline. `casa_reader.py` additionally imports `rapidocr_onnxruntime`, `torch` and `transformers` lazily; these are intentionally not declared dependencies. |
 
@@ -420,7 +424,7 @@ Tests mock the OCR and model layers. Initialization of `ModuleBPipeline(storage)
 This project is under active development. The current codebase implements **Module A**, **Module B**, and **Module C**. Known open gaps and architecture prerequisites include:
 
 - **Module B OCR Runtime**: Module B selects its parser from `Settings.ocr_backend` (default: the explicit no-OCR pass-through; PDFium text is opt-in, see "Module B OCR backend"). With the default, rule-based classification has no content evidence (`UNKNOWN`, review required) and OCR-grounded evidence is unavailable; the vision model supplies boxes instead. Cross-process worker integration with isolated OCR engines (e.g. PaddleOCR) is not implemented.
-- **Local Model Serving Cluster**: Module C supports pluggable LLM extraction (LiteLLM/Instructor) and deterministic extraction heuristics; production deployment on-premise requires containerized vLLM/Ollama services with GPU acceleration per PRD ARC-004/ARC-005.
+- **Local Model Serving Cluster**: Module C supports pluggable LLM extraction (LiteLLM/Instructor) and deterministic extraction heuristics; production deployment on-premise requires containerized vLLM services with GPU acceleration per PRD ARC-004/ARC-005.
 - **Durable Message Broker**: Inter-module queues currently provide an in-memory adapter (`LocalMemoryQueueAdapter`); production deployment requires connecting a persistent broker (e.g. RabbitMQ or Redis Streams).
 - **Distributed Idempotency & Locking**: Current concurrency locking is process-local; multi-replica horizontal clustering requires a shared distributed cache (e.g. Redis).
 - **Antivirus Daemon**: Production environments require configuring a live ClamAV daemon socket rather than the development mock scanner.

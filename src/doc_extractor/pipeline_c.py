@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 import re
 from pydantic import BaseModel
 
+from doc_extractor.config import DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL
 from doc_extractor.contracts_b import ModuleBOutputPayload
 from doc_extractor.contracts_c import (
     CanonicalExtractionEnvelope,
@@ -73,7 +74,7 @@ class ModuleCPipeline:
     ):
         """
         ``extractor`` is the primary extractor: multimodal (Qwen-VL, reads Module A page
-        images) or text (Ollama/litellm/heuristic, reads Module B markdown) behind the same
+        images) or text (vLLM/heuristic, reads Module B markdown) behind the same
         ``extract_with_provenance`` interface. ``fallback_extractor`` is tried when the primary
         raises (FR-RTE-003); the result's provenance then records the fallback.
         """
@@ -90,15 +91,15 @@ class ModuleCPipeline:
     @classmethod
     def with_local_llm(
         cls,
-        model_name: str = "ollama/qwen2.5:7b-instruct",
-        api_base: str = "http://localhost:11434",
+        model_name: str = DEFAULT_LLM_MODEL,
+        api_base: str = DEFAULT_LLM_API_BASE,
         use_llm: bool = True,
         allow_fallback: bool = False,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 120.0,
         prompt_version: str = "1.0.0",
     ) -> "ModuleCPipeline":
-        """Factory creating a ModuleCPipeline configured for local Ollama Qwen2.5-7B-Instruct."""
-        extractor = SchemaGuidedExtractor.for_local_ollama(
+        """Factory creating a ModuleCPipeline for a vLLM-served text model."""
+        extractor = SchemaGuidedExtractor.for_vllm(
             model_name=model_name,
             api_base=api_base,
             use_llm=use_llm,

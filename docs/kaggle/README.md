@@ -12,22 +12,13 @@ In the notebook's right-hand panel, open **Session options**:
 
 If you change any of these after a run, restart the session (**Run > Restart**) so the old GPU memory is cleared.
 
-## 2. Run the cells in order
+## 2. Run the cell
 
-The notebook has four code cells. Run them top to bottom.
+The notebook has one code cell. It clones branch `fix/qwen3-only-and-validation-bugs` of `Devadn11206/DOC_Extractor_QUAPT`, installs what is missing, starts three vLLM servers, checks them, and launches the app. See [vllm.md](vllm.md) for what each step does and how to fix a server that does not start. Set `USE_VLLM = False` in the cell to load the models inside the app instead.
 
-| Cell | What it does | Time (first run) |
-| --- | --- | --- |
-| 1. Get code | Clones the repo the first time, or runs `git pull` after that. Prints the latest commit. | under 1 min |
-| 2. Install | Installs the Python packages (`uv`, `transformers`, `gradio`, and others). | a few minutes |
-| 3. Download models | Downloads the model weights. Qwen3-VL-4B is required. GLM-OCR, Qwen3-4B-Instruct and Qwen2.5-7B are optional, and the cell skips any that fail. | 10 to 20 min (about 20 GB) |
-| 4. Launch | Frees port 7860, then starts the app. | the app itself loads the model at startup, 1 to 2 min |
+When the app is ready, the cell prints a line like `Running on public URL: https://....gradio.live`. Open that link, and use synthetic documents: the link is public.
 
-When the app is ready, cell 4 prints a line like `Running on public URL: https://....gradio.live`. Open that link.
-
-**Cell 1 prints the commit.** Check it matches the latest commit on GitHub. If it doesn't, the pull failed.
-
-After any code change pushed to GitHub, you only need to re-run cells 1 and 4. Cells 2 and 3 only need re-running after a new session.
+**The cell prints the commit.** Check it matches the latest commit of that branch on GitHub.
 
 ## 3. Using the app
 
@@ -47,7 +38,7 @@ The first classification is slower, because it's the first time the model is use
 
 ## 4. Settings you can change
 
-Set these with `%env` in cell 4, before `!python app.py`:
+Set these with `os.environ` in the code cell, before the app is launched:
 
 | Variable | Default | What it does |
 | --- | --- | --- |

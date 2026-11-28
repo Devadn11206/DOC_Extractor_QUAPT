@@ -62,7 +62,7 @@ def test_the_api_selection_matches_real_files_and_meets_the_minimum_test_count()
 def test_only_live_model_tests_may_skip_in_the_full_job():
     text = steps_text(FULL_JOB)
     allowed = set(re.findall(r"--allow-skip (\S+)", text))
-    assert allowed == {"test_live_qwen_smoke_against_local_ollama"}
+    assert allowed == {"test_live_qwen_smoke_against_vllm"}
     assert "DOC_FAIL_ON_SKIP" not in str(FULL_JOB.get("env", {}))       # optional tests are allowed to skip there
     assert not any("api" in a for a in allowed)
 

@@ -109,7 +109,7 @@ jobs:
         if: always()
         run: >
           python scripts/ci/assert_junit.py junit-full.xml --min-tests 1400
-          --allow-skip test_live_qwen_smoke_against_local_ollama
+          --allow-skip test_live_qwen_smoke_against_vllm
 
       - name: Upload the junit report
         if: always()

@@ -113,7 +113,7 @@ def test_genuine_llm_execution_with_mocked_provider_response(doc_01_payload, val
         return valid_casa_model, "chatcmpl-test-response-123"
 
     extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=True,
         provider_name="litellm",
@@ -126,7 +126,7 @@ def test_genuine_llm_execution_with_mocked_provider_response(doc_01_payload, val
     assert isinstance(result, ExtractionResult)
     assert result.payload == valid_casa_model
     assert result.provenance.mode == ExecutionMode.GENUINE_LLM
-    assert result.provenance.model_name == "Qwen2.5-7B-Instruct"
+    assert result.provenance.model_name == "Qwen3-4B-Instruct-2507"
     assert result.provenance.provider == "litellm"
     assert result.provenance.prompt_version == "1.0.0"
     assert result.provenance.fallback_occurred is False
@@ -148,7 +148,7 @@ def test_genuine_llm_via_instructor_mocking(doc_01_payload, valid_casa_model, mo
     monkeypatch.setattr(instructor, "from_litellm", lambda completion_fn, *args, **kwargs: mock_client)
 
     extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=True,
     )
@@ -157,7 +157,7 @@ def test_genuine_llm_via_instructor_mocking(doc_01_payload, valid_casa_model, mo
 
     assert result.provenance.mode == ExecutionMode.GENUINE_LLM
     assert result.provenance.request_id == "litellm-call-999"
-    assert result.provenance.provider == "litellm"
+    assert result.provenance.provider == "vllm"
     assert result.provenance.is_genuine_llm() is True
     assert result.payload == valid_casa_model
 
@@ -186,7 +186,7 @@ def test_llm_failure_with_fallback_enabled(doc_01_payload):
         raise ConnectionError("Upstream LLM endpoint connection timed out")
 
     extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=True,
         llm_caller=failing_caller,
@@ -210,7 +210,7 @@ def test_llm_failure_with_fallback_disabled(doc_01_payload):
         raise ConnectionError("Network unreachable")
 
     extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=False,
         llm_caller=failing_caller,
@@ -221,7 +221,7 @@ def test_llm_failure_with_fallback_disabled(doc_01_payload):
             extractor.extract_with_provenance(doc_01_payload)
         mock_heur.assert_not_called()
 
-    assert exc_info.value.model_name == "Qwen2.5-7B-Instruct"
+    assert exc_info.value.model_name == "Qwen3-4B-Instruct-2507"
     assert "Network unreachable" in str(exc_info.value)
     assert extractor.last_provenance is not None
     assert extractor.last_provenance.fallback_occurred is False
@@ -236,7 +236,7 @@ def test_response_validation_failure_with_fallback_disabled(doc_01_payload):
         return {"applicant": "not-an-object", "account_details": 123}, "req_invalid"
 
     extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=False,
         llm_caller=invalid_data_caller,
@@ -245,7 +245,7 @@ def test_response_validation_failure_with_fallback_disabled(doc_01_payload):
     with pytest.raises(LLMExecutionError) as exc_info:
         extractor.extract_with_provenance(doc_01_payload)
 
-    assert exc_info.value.model_name == "Qwen2.5-7B-Instruct"
+    assert exc_info.value.model_name == "Qwen3-4B-Instruct-2507"
     assert extractor.last_provenance is not None
     assert extractor.last_provenance.fallback_occurred is False
 
@@ -256,7 +256,7 @@ def test_response_validation_failure_with_fallback_enabled(doc_01_payload):
         return {"applicant": "not-an-object"}, "req_invalid"
 
     extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=True,
         llm_caller=invalid_data_caller,
@@ -373,7 +373,7 @@ def test_benchmark_integrity_helpers():
     # 1. Genuine LLM
     genuine = ExecutionProvenance(
         mode=ExecutionMode.GENUINE_LLM,
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         provider="litellm",
         fallback_occurred=False,
     )
@@ -404,7 +404,7 @@ def test_benchmark_integrity_helpers():
     # 4. Heuristic Fallback
     fallback = ExecutionProvenance(
         mode=ExecutionMode.HEURISTIC_FALLBACK,
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         fallback_occurred=True,
         fallback_reason="Timeout",
     )
@@ -430,7 +430,7 @@ def test_pipeline_c_provenance_integration(doc_01_payload, valid_casa_model):
 
     # Pipeline with Genuine LLM extractor
     extractor_llm = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=True,
         llm_caller=mock_llm_caller,
@@ -495,7 +495,7 @@ def test_concurrent_execution_provenance_isolation(valid_casa_model):
 
     # Shared extractor and pipeline across threads
     shared_extractor = SchemaGuidedExtractor(
-        model_name="Qwen2.5-7B-Instruct",
+        model_name="Qwen3-4B-Instruct-2507",
         use_llm=True,
         allow_fallback=True,
         llm_caller=slow_llm_caller,

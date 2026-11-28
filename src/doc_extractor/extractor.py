@@ -6,7 +6,6 @@ Supports 1-Stage Multimodal extraction with Qwen2.5-VL / Qwen3-VL as well as
 grammar-guided LLM and deterministic extraction.
 """
 
-import base64
 from decimal import Decimal
 import json
 import logging
@@ -18,6 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, U
 import urllib.request
 from pydantic import BaseModel
 
+from doc_extractor import vllm_client
+from doc_extractor.config import DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL
 from doc_extractor.contracts_b import BoundingBox, ModuleBOutputPayload, PageLayoutOutput
 from doc_extractor.contracts_c import (
     ExecutionMode,
@@ -599,7 +600,7 @@ class SchemaGuidedExtractor:
         """
         ``multimodal`` selects whether this extractor reads Module A page images directly
         (Qwen-VL, PRD v1.3/v1.5) when page images are supplied. ``None`` infers it from the model:
-        VLM model names (e.g. 'Qwen/Qwen3-VL-4B-Instruct') are multimodal; Ollama/text models
+        VLM model names (e.g. 'Qwen/Qwen3-VL-4B-Instruct') are multimodal; text models
         are not and keep extracting from Module B markdown.
 
         Local Qwen-VL runtime (see ``doc_extractor.vlm_runtime``): ``precision`` is ``"auto"`` (BF16
@@ -617,7 +618,7 @@ class SchemaGuidedExtractor:
         self.multimodal = (
             multimodal
             if multimodal is not None
-            else self._infer_multimodal(model_name, provider_name, api_base)
+            else self._infer_multimodal(model_name)
         )
         self.use_llm = use_llm
         self.allow_fallback = allow_fallback
@@ -649,33 +650,27 @@ class SchemaGuidedExtractor:
         self._local.last_provenance = None
 
     @staticmethod
-    def _infer_multimodal(
-        model_name: Optional[str],
-        provider_name: Optional[str],
-        api_base: Optional[str],
-    ) -> bool:
+    def _infer_multimodal(model_name: Optional[str]) -> bool:
         name = (model_name or "").lower()
-        if provider_name == "ollama" or name.startswith("ollama/") or (api_base and "11434" in str(api_base)):
-            return False
         return "-vl-" in name or name.endswith("-vl")
 
     @classmethod
-    def for_local_ollama(
+    def for_vllm(
         cls,
-        model_name: str = "ollama/qwen2.5:7b-instruct",
-        api_base: str = "http://localhost:11434",
+        model_name: str = DEFAULT_LLM_MODEL,
+        api_base: str = DEFAULT_LLM_API_BASE,
         use_llm: bool = True,
         allow_fallback: bool = False,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 120.0,
         prompt_version: str = "1.0.0",
     ) -> "SchemaGuidedExtractor":
-        """Factory creating a SchemaGuidedExtractor configured for local Ollama Qwen2.5-7B-Instruct."""
+        """Factory creating a SchemaGuidedExtractor for a model served by vLLM (local or RunPod)."""
         return cls(
             model_name=model_name,
             use_llm=use_llm,
             allow_fallback=allow_fallback,
             prompt_version=prompt_version,
-            provider_name="ollama",
+            provider_name="vllm",
             api_base=api_base,
             timeout_seconds=timeout_seconds,
         )
@@ -684,12 +679,12 @@ class SchemaGuidedExtractor:
     def from_settings(cls, settings: Any) -> "SchemaGuidedExtractor":
         """Factory creating a SchemaGuidedExtractor from Settings."""
         return cls(
-            model_name=getattr(settings, "llm_model_name", "ollama/qwen2.5:7b-instruct"),
+            model_name=getattr(settings, "llm_model_name", DEFAULT_LLM_MODEL),
             use_llm=getattr(settings, "llm_use_inference", True),
             allow_fallback=getattr(settings, "llm_allow_fallback", False),
-            provider_name=getattr(settings, "llm_provider", "ollama"),
-            api_base=getattr(settings, "llm_api_base", "http://localhost:11434"),
-            timeout_seconds=getattr(settings, "llm_timeout_seconds", 30.0),
+            provider_name=getattr(settings, "llm_provider", "vllm"),
+            api_base=getattr(settings, "llm_api_base", DEFAULT_LLM_API_BASE),
+            timeout_seconds=getattr(settings, "llm_timeout_seconds", 120.0),
         )
 
     @property
@@ -727,7 +722,7 @@ class SchemaGuidedExtractor:
 
         ``page_images`` are the explicit Module A page-image references. A multimodal
         extractor (Qwen-VL) reads them directly and returns per-field grounding; text-only
-        extractors (Ollama/litellm, heuristics) ignore them and use Module B markdown.
+        extractors (vLLM text models, heuristics) ignore them and use Module B markdown.
         """
         self.last_provenance = None
 
@@ -752,14 +747,7 @@ class SchemaGuidedExtractor:
 
         # 2. Genuine LLM requested
         if self.use_llm:
-            provider = self.provider_name or (
-                "ollama"
-                if (
-                    self.model_name.startswith("ollama/")
-                    or (self.api_base and "11434" in str(self.api_base))
-                )
-                else "litellm"
-            )
+            provider = self.provider_name or "vllm"
             try:
                 grounding: Dict[str, FieldGrounding] = {}
                 request_id: Optional[str] = None
@@ -839,7 +827,7 @@ class SchemaGuidedExtractor:
         payload: ModuleBOutputPayload,
         schema_cls: Type[BaseModel],
     ) -> Tuple[BaseModel, Optional[str]]:
-        """Executes LLM extraction via custom caller, vLLM / Qwen-VL, or litellm."""
+        """Executes LLM extraction via custom caller, Qwen-VL, or a vLLM-served text model."""
         if self.llm_caller is not None:
             res = self.llm_caller(payload, schema_cls)
             if isinstance(res, tuple) and len(res) == 2:
@@ -868,23 +856,20 @@ class SchemaGuidedExtractor:
             raw_dict, _ = self.extract_page_image(first_img, schema_cls)
             return schema_cls.model_validate(_flat_to_nested(raw_dict)), None
 
-        # Text LLM path via instructor / litellm (Ollama or other text models). The grounded
-        # multimodal path is _extract_vlm_internal, which receives explicit Module A page-image
-        # references.
+        # Text LLM path via instructor / litellm against a vLLM server. The grounded multimodal path is
+        # _extract_vlm_internal, which receives explicit Module A page-image references.
         import instructor
         import litellm
 
         resolved_model = self.model_name
-        is_ollama = (
-            self.provider_name == "ollama"
-            or resolved_model.startswith("ollama/")
-            or (self.api_base and "11434" in str(self.api_base))
-        )
-        if is_ollama and not resolved_model.startswith("ollama/"):
-            if resolved_model in ("Qwen2.5-7B-Instruct", "qwen2.5-7b-instruct"):
-                resolved_model = "ollama/qwen2.5:7b-instruct"
-            else:
-                resolved_model = f"ollama/{resolved_model}"
+        is_vllm = self.provider_name in (None, "vllm")
+        api_base = self.api_base
+        if is_vllm:
+            api_base = vllm_client.check_endpoint(
+                self.api_base or vllm_client.endpoint("text") or DEFAULT_LLM_API_BASE, vllm_client.api_key()
+            )
+            if not resolved_model.startswith("hosted_vllm/"):
+                resolved_model = f"hosted_vllm/{resolved_model}"
 
         system_message = (
             "You are a schema-constrained document extraction engine. "
@@ -895,9 +880,8 @@ class SchemaGuidedExtractor:
             "Return strictly valid JSON matching the schema."
         )
 
-        response_mode = (
-            instructor.Mode.JSON if is_ollama else instructor.Mode.TOOLS
-        )
+        # JSON mode needs no tool-call parser on the vLLM server
+        response_mode = instructor.Mode.JSON if is_vllm else instructor.Mode.TOOLS
         client = instructor.from_litellm(
             litellm.completion,
             mode=response_mode,
@@ -917,12 +901,13 @@ class SchemaGuidedExtractor:
             "temperature": 0.0,
             "_skip_mcp_handler": True,
         }
-        if self.api_base:
-            call_kwargs["api_base"] = self.api_base
+        if api_base:
+            call_kwargs["api_base"] = api_base
         if self.timeout_seconds:
             call_kwargs["timeout"] = self.timeout_seconds
-        if is_ollama:
-            call_kwargs["custom_llm_provider"] = "ollama"
+        if is_vllm:
+            # An explicit key: litellm must never pick up some other provider's key from the environment
+            call_kwargs["api_key"] = vllm_client.api_key() or "EMPTY"
 
         completion_res = client.chat.completions.create_with_completion(**call_kwargs)
 
@@ -1116,10 +1101,6 @@ class SchemaGuidedExtractor:
             "Read every handwritten and printed value directly from the image; use null for anything not visible."
         )
 
-        vllm_api_base = os.environ.get("OPENAI_API_BASE") or os.environ.get("VLLM_API_BASE")
-        if vllm_api_base:
-            return self._extract_via_vllm_api(image_input, schema_cls, vllm_api_base, system_prompt=system_prompt)
-
         self._local.score_fields = True        # FR-CNF-001: ask _generate_from_image for token probabilities
         try:
             output_text = self._generate_from_image(image_input, system_prompt, user_text, self.max_new_tokens)
@@ -1132,7 +1113,7 @@ class SchemaGuidedExtractor:
         prov = ExecutionProvenance(
             mode=ExecutionMode.GENUINE_LLM,
             model_name=self.model_name,
-            provider="transformers_qwen_vl",
+            provider="vllm_openai_api" if self._vllm_vision_base() else "transformers_qwen_vl",
             prompt_version=self.prompt_version,
             fallback_occurred=False,
         )
@@ -1178,6 +1159,11 @@ class SchemaGuidedExtractor:
         again (``do_resize=False``). Boxes the model returns are relative to the image it saw, so they
         stay valid for the Module A geometry (see ``vlm_grounding``).
         """
+        api_base = self._vllm_vision_base()
+        if api_base:
+            return self._generate_via_vllm(
+                api_base, image_input, system_prompt, user_text, max_new_tokens, max_pixels or self.max_pixels
+            )
         model, processor = self._load_model()
         family = vlm_runtime.resolve_family(self.model_name)
         if max_pixels is not None:
@@ -1265,64 +1251,40 @@ class SchemaGuidedExtractor:
         free_gpu_memory()  # gc + torch.cuda.empty_cache() once after every generation
         return text_out
 
-    def _extract_via_vllm_api(
+    def _vllm_vision_base(self) -> Optional[str]:
+        """The vLLM server that reads page images, or None to run Qwen-VL in-process."""
+        if self.provider_name == "vllm" and self.api_base and self.multimodal:
+            return self.api_base
+        return vllm_client.endpoint("vision")
+
+    def _generate_via_vllm(
         self,
-        image_input: Union[str, Path, bytes],
-        schema_cls: Optional[Type[BaseModel]],
         api_base: str,
-        system_prompt: Optional[str] = None,
-    ) -> Tuple[Dict[str, Any], ExecutionProvenance]:
-        """Calls vLLM OpenAI-compatible vision completions endpoint."""
-        if isinstance(image_input, (str, Path)):
-            with open(image_input, "rb") as f:
-                b64_img = base64.b64encode(f.read()).decode("utf-8")
-        else:
-            b64_img = base64.b64encode(image_input).decode("utf-8")
+        image_input: Union[str, Path, bytes],
+        system_prompt: str,
+        user_text: str,
+        max_new_tokens: int,
+        max_pixels: int,
+    ) -> str:
+        """The same single-page generation as the in-process path, sent to vLLM."""
+        if isinstance(image_input, bytes):
+            import io
 
-        prompt = system_prompt or self._build_system_prompt(schema_cls)
-        req_body = {
-            "model": self.model_name,
-            "messages": [
-                {"role": "system", "content": prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_img}"}},
-                        {"type": "text", "text": "Extract all fields from this document page."},
-                    ],
-                },
-            ],
-            "temperature": self.temperature,
-            "max_tokens": self.max_new_tokens,
-            "logprobs": True,
-        }
-
-        url = f"{api_base.rstrip('/')}/chat/completions"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(req_body).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer dummy"},
+            image_input = io.BytesIO(image_input)
+        image = load_capped_image(image_input, max_pixels)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [vllm_client.image_part(image), {"type": "text", "text": user_text}]},
+        ]
+        score_fields = bool(getattr(self._local, "score_fields", False))
+        self._local.last_token_spans = ("", [])
+        text, spans = vllm_client.chat(
+            api_base, self.model_name, messages, max_new_tokens,
+            temperature=self.temperature, logprobs=score_fields,
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
-            lp_content = ((data["choices"][0].get("logprobs") or {}).get("content")) or []
-
-        cleaned = re.sub(r"^```json\s*", "", content.strip(), flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned.strip())
-        if not cleaned:
-            raise ValueError("empty model response")
-        raw_dict = json.loads(cleaned)
-
-        prov = ExecutionProvenance(
-            mode=ExecutionMode.GENUINE_LLM,
-            model_name=self.model_name,
-            provider="vllm_openai_api",
-            prompt_version=self.prompt_version,
-            fallback_occurred=False,
-        )
-        self.last_provenance = prov
-        return raw_dict, prov
+        if score_fields:
+            self._local.last_token_spans = (text, spans)
+        return text
 
     def _load_model(self):
         """
