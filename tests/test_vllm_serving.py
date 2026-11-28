@@ -232,3 +232,11 @@ def test_the_text_server_context_fits_the_longest_request_the_engine_makes():
     text = launcher.plan(launcher.parse_args([]), 2)[1]
     assert text.max_model_len >= OCRTextAdapter().max_json_tokens + 8000
 
+
+def test_the_end_of_answer_token_does_not_discard_the_probabilities():
+    """The shape a real vLLM 0.34 server returned: the last scored token is not in the text."""
+    pieces = ['{"', "a", '":', " ", "1", "}", "<|im_end|>"]
+    tokens = [{"token": p, "bytes": list(p.encode()), "logprob": 0.0} for p in pieces]
+    spans = vllm_client._token_spans('{"a": 1}', tokens)
+    assert len(spans) == 6 and spans[-1][1] == len('{"a": 1}')
+

@@ -10,6 +10,7 @@
 - Start with a 24 GB GPU and 4-bit loading for the two Qwen models, as the in-process engine does. This sizing is unmeasured. Without quantisation the three sets of weights alone need roughly 19 GB.
 - On a card without native bfloat16 (for example a T4), add `--dtype float16` to each command.
 - Expose HTTP ports `8000`, `8001` and `8002`.
+- Install the versions that ran on Kaggle: `vllm==0.34.0 vllm-bnb-plugin==0.0.3` (vLLM 0.28 and later need the plugin for `bitsandbytes`).
 - Use a recent vLLM release. GLM-OCR support is newer than Qwen3 support; check its [vLLM recipe](https://docs.vllm.ai/projects/recipes/en/latest/GLM/GLM-OCR.html) for the required vLLM and Transformers versions.
 
 ## 2. Servers

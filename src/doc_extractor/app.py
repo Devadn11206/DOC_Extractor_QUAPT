@@ -41,6 +41,7 @@ if _src_dir not in sys.path:
 from PIL import Image, ImageDraw, ImageFont
 
 from doc_extractor import vllm_client
+from doc_extractor.adapters import DEFAULT_OCR_MODEL, DEFAULT_TEXT_MODEL
 from doc_extractor.config import Settings, load_settings
 from doc_extractor.contracts_b import MVPDocumentType
 from doc_extractor.contracts_c import CanonicalExtractionEnvelope, FlagItem
@@ -510,6 +511,57 @@ def _process_core(
         return
 
 
+def read_document_text(json_text: str, settings: Optional[Settings] = None) -> Tuple[str, Optional[str]]:
+    """
+    OCR of every page of the processed document, whichever route read its fields. Returns (text, download path).
+
+    Only page images that Module A stored for the document are read, so a file that was rejected is never OCR'd.
+    The text is shown to the user only: it is not evidence and is not added to the JSON envelope.
+    """
+    try:
+        envelope = json.loads(json_text or "{}")
+        document_id = envelope.get("document_id")
+    except (ValueError, AttributeError):
+        document_id = None
+    if not document_id:
+        return "No text: the document was not processed (see the status box).", None
+
+    try:
+        settings = settings if settings is not None else get_settings()
+        storage = get_pipelines(settings)[0].storage
+        pages = sorted(storage.list_page_images(document_id), key=lambda a: Path(a.file_path).name)
+        if MAX_PAGES > 0:
+            pages = pages[:MAX_PAGES]
+        details = envelope.get("run", {}).get("provenance", {}).get("details", {})
+        rotations = {r.get("page"): _safe_rotation(r.get("rotation")) for r in details.get("routing", [])}
+        reader = get_routed_extractor().get_adapter(
+            {"adapter": "ocr_text", "ocr_model": DEFAULT_OCR_MODEL, "text_model": DEFAULT_TEXT_MODEL}
+        )
+    except Exception as exc:
+        return f"OCR could not start: {exc}", None
+    if not pages:
+        return "No page images are stored for this document.", None
+
+    blocks = []
+    for number, artifact in enumerate(pages, start=1):
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(artifact.file_path)
+                if rotations.get(number):
+                    with Image.open(path) as image:
+                        path = Path(folder) / "page.png"
+                        image.rotate(-rotations[number], expand=True).save(path)
+                text = reader.read_text(str(path)) or "(no text found)"
+        except Exception as exc:     # one unreadable page must not hide the others
+            text = f"(OCR failed on this page: {exc})"
+        blocks.append(f"===== Page {number} =====\n{text}")
+
+    full_text = "\n\n".join(blocks)
+    out = Path(tempfile.gettempdir()) / f"{document_id}.txt"
+    out.write_text(full_text, encoding="utf-8")
+    return full_text, str(out)
+
+
 def create_demo(settings: Optional[Settings] = None) -> "gr.Blocks":
     """Constructs Gradio UI layout (FR-DEMO-001..006). ``settings`` configures every module it runs."""
     if settings is not None:
@@ -556,12 +608,16 @@ def create_demo(settings: Optional[Settings] = None) -> "gr.Blocks":
                 with gr.Tab("Canonical JSON Output"):
                     output_json = gr.Code(label="Extracted JSON Envelope", language="json")
                     json_file = gr.File(label="Download JSON")
+                with gr.Tab("OCR Text"):
+                    ocr_text = gr.Textbox(label="Full text of every page (filled in after extraction)",
+                                          lines=25, interactive=False)
+                    ocr_file = gr.File(label="Download text")
 
         submit_btn.click(
             fn=process_document,
             inputs=[input_file, category_dd, doc_type_dd, subtype_dd, language_dd, engine_dd],
             outputs=[output_image, status_box, output_json, classification_md, json_file, steps_md],
-        )
+        ).then(fn=read_document_text, inputs=[output_json], outputs=[ocr_text, ocr_file])
 
     return demo
 

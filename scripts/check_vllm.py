@@ -64,6 +64,11 @@ def main() -> int:
         synthetic_page(page)
         adapter = OCRTextAdapter()
 
+        def confidence_of(field: dict) -> float:
+            if field.get("confidence") is None:
+                raise ValueError("no confidence score: the server's token probabilities could not be used")
+            return field["confidence"]
+
         def expect_name(text: str) -> str:
             if NAME.split()[0] not in text.upper():
                 raise ValueError(f"expected the applicant name, got {text[:200]!r}")
@@ -76,7 +81,7 @@ def main() -> int:
                 raw, _ = extractor.extract_page_image(page, None, system_prompt=PROMPT)
                 field = raw.get("applicant_name") or {}
                 expect_name(str(field.get("value")))
-                return f"confidence={field.get('confidence')} bbox={field.get('bbox')}"
+                return f"confidence={confidence_of(field)} bbox={field.get('bbox')}"
 
             results.append(step(f"vision extraction [{DEFAULT_MODEL}]", read))
             results.append(step("vision classification",
@@ -88,7 +93,7 @@ def main() -> int:
                 raw = adapter.text_to_fields(f"Applicant Name: {NAME}", PROMPT)
                 field = raw.get("applicant_name") or {}
                 expect_name(str(field.get("value")))
-                return f"confidence={field.get('confidence')}"
+                return f"confidence={confidence_of(field)}"
 
             results.append(step(f"text to JSON [{DEFAULT_TEXT_MODEL}]", to_fields))
 
