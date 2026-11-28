@@ -716,7 +716,8 @@ class _FakeGradio:
         def __init__(self, *a, **k): pass
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def click(self, *a, **k): return None
+        def click(self, *a, **k): return self      # real Gradio returns a chainable event
+        def then(self, *a, **k): return self
 
     def __getattr__(self, name):
         return self._Any
@@ -1117,3 +1118,29 @@ def test_module_c_early_return_paths_respect_total_document_pages():
         f"NO_SCHEMA_BOUND path without total_document_pages: expected page_count=1 "
         f"(from len(payload.pages)), got {env_no_schema_no_total.document_metadata.page_count}"
     )
+
+
+def test_the_app_shows_the_text_of_every_page_whatever_route_read_the_fields(temp_storage, tmp_path, monkeypatch):
+    FakeVLM().install(monkeypatch)
+    _wire_app(monkeypatch, temp_storage)
+    (_, _, json_text, _, _, _), _ = _run_app(_write_tiff(tmp_path, 2), "Handwritten", app.AUTO, app.AUTO, "English")
+    seen = []
+
+    def read_text(self, path):
+        seen.append(path)
+        if len(seen) == 2:
+            raise RuntimeError("unreadable")
+        return "FIRST PAGE TEXT"
+
+    monkeypatch.setattr("doc_extractor.adapters.OCRTextAdapter.read_text", read_text)
+    text, download = app.read_document_text(json_text)
+
+    assert "===== Page 1 =====\nFIRST PAGE TEXT" in text and "===== Page 2 =====\n(OCR failed" in text
+    assert Path(download).read_text(encoding="utf-8") == text
+
+
+@pytest.mark.parametrize("json_text", ["", "{}", '{"error": "x"}', "not json"])
+def test_no_ocr_runs_for_a_document_that_was_not_processed(json_text):
+    text, download = app.read_document_text(json_text)
+    assert text.startswith("No text") and download is None
+
