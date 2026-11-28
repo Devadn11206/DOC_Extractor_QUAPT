@@ -165,4 +165,7 @@ def _token_spans(text: str, tokens: List[Dict[str, Any]]) -> Spans:
         probability = min(1.0, math.exp(logprob)) if isinstance(logprob, (int, float)) else 0.0
         spans.append((start, end, probability))
         start = end
-    return spans if seen.decode("utf-8", errors="ignore") == text else []
+    # vLLM also scores the end-of-answer token (e.g. <|im_end|>), which is not part of the text
+    if not seen.decode("utf-8", errors="ignore").startswith(text):
+        return []
+    return [(a, min(b, len(text)), p) for a, b, p in spans if a < len(text)]

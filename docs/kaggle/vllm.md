@@ -1,6 +1,6 @@
 # Testing vLLM on Kaggle
 
-**Not yet run on Kaggle.** The engine code is tested against a stand-in server. This first run is the real test.
+On Kaggle T4 x2, vLLM 0.34.0 with `vllm-bnb-plugin` 0.0.3 started all three servers and passed the synthetic-page check. Accuracy and speed on real forms are not measured. vLLM 0.28 and later need that plugin for `bitsandbytes`.
 
 Everything runs inside the notebook, over `127.0.0.1`: no public address and no API key are needed. Use synthetic documents.
 
@@ -30,7 +30,7 @@ vLLM pins its own PyTorch, which can break the notebook's packages, so keep it s
 
 ```python
 !uv venv --python 3.12 /kaggle/tmp/vllm-env
-!uv pip install -p /kaggle/tmp/vllm-env/bin/python --torch-backend=auto vllm bitsandbytes
+!uv pip install -p /kaggle/tmp/vllm-env/bin/python --torch-backend=auto vllm==0.34.0 vllm-bnb-plugin==0.0.3
 ```
 
 ## 5. Start the servers
