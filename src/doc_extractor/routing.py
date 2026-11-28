@@ -195,8 +195,10 @@ def build_generic_prompt(category: DocumentCategory, subtype: Optional[str] = No
         sub = f" Document sub-type: {subtype}." if subtype and subtype != "other" else ""
         task = (
             "This is free-layout printed material (brochure, pamphlet, menu card, invitation card, policy wording)."
-            f"{sub} Extract the key facts it states: title, organisation or issuer, dates, contact details, "
-            "prices or amounts, items or offers, and any other clearly stated facts."
+            f"{sub} Extract every clearly stated fact as its own field, named in snake_case after what it is "
+            "(for example title, organisation, date, phone, price, question, accepted_answer, score). "
+            "Use only names that have a value: never return a field whose value is null. Any document with "
+            "readable text has facts to extract."
         )
     return f"""You are a high-precision document reading engine. Document language: {language}.
 
