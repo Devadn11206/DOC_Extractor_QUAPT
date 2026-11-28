@@ -15,11 +15,21 @@ A laptop without an NVIDIA GPU cannot run the models at a usable speed, so use o
 
 After step 2 (get the code), run this in the project folder. It installs everything, asks for the server addresses and key once (saved in `server.env`, never uploaded), checks the server and opens the app:
 
+**Mac** (Terminal):
+
+```bash
+bash run_app.sh
+```
+
+**Windows** (PowerShell):
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File run_app.ps1
 ```
 
-The steps below do the same thing by hand.
+Run the same command again after filling in `server.env`, and every time after that.
+
+The steps below do the same thing by hand on Windows. On a Mac, use `bash run_app.sh`.
 
 ## 1. Install uv (once)
 
